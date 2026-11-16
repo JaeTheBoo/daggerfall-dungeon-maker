@@ -66,7 +66,8 @@ pub fn pick_object(
                 intersect_model(object, model_id, library, ray, options.ignore_back_faces)
             }
             SceneObjectKind::Flat { texture, .. } if options.include_flats => {
-                let size = library.billboard_world_size(texture).unwrap_or(Vec2::ONE);
+                let size =
+                    library.billboard_world_size(texture).unwrap_or(Vec2::ONE) * object.billboard_scale();
                 intersect_billboard(ray, object.position, size, options.camera_right)
             }
             SceneObjectKind::Light { .. } if options.include_lights => {
@@ -112,14 +113,17 @@ pub fn intersect_mesh(
     ray: &Ray,
     ignore_back_faces: bool,
 ) -> Option<f32> {
-    // Work in model space. The transform is rigid, so distances are preserved.
+    // Work in model space. The direction is not normalised again, so a scaled
+    // object's distances along the ray stay the world's.
     let world_to_model = object.model_matrix().inverse();
     let local_ray = Ray {
         origin: world_to_model.transform_point3(ray.origin),
         direction: world_to_model.transform_vector3(ray.direction),
     };
 
-    intersect_sphere(&local_ray, mesh.bounds_center(), mesh.bounding_radius())?;
+    // The sphere test needs a unit direction; it only rules the model out.
+    let unit_ray = Ray { origin: local_ray.origin, direction: local_ray.direction.try_normalize()? };
+    intersect_sphere(&unit_ray, mesh.bounds_center(), mesh.bounding_radius())?;
 
     let mut closest: Option<f32> = None;
     for submesh in &mesh.submeshes {

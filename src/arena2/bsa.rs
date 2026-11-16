@@ -121,6 +121,12 @@ impl BsaArchive {
         Some(self.record_data(&self.entries[index]))
     }
 
+    /// Where the record called `name` (case-insensitive) starts in the archive.
+    pub fn record_offset_by_name(&self, name: &str) -> Option<usize> {
+        let index = *self.index_by_name.get(&name.to_ascii_uppercase())?;
+        Some(self.entries[index].offset)
+    }
+
     /// Returns the raw bytes of the record with numeric identifier `id`.
     pub fn record_by_id(&self, id: u32) -> Option<&[u8]> {
         let index = *self.index_by_id.get(&id)?;

@@ -19,6 +19,11 @@
 //! Only a `.dfmod` runs the script: with the files used loose, those dungeons
 //! play the game's music instead.
 //!
+//! Cells cannot store an object's size. An export for a `.dfmod` leaves its
+//! scaled objects out of their cells, and a script puts them back at their
+//! size ([`scale_script`]); an export of loose files keeps them in their cells
+//! at their usual size.
+//!
 //! It also writes the mod's manifest, `<name>.dfmod.json`. The files are
 //! laid out as [`unity`] builds them into a `.dfmod`. The JSON follows the
 //! layout of Daggerfall Unity's `DFLocation` and `DFBlock` structures (see
@@ -26,6 +31,7 @@
 
 pub mod json;
 pub mod music_script;
+pub mod scale_script;
 pub mod sky_script;
 pub mod unity;
 
@@ -34,9 +40,11 @@ use std::path::{Path, PathBuf};
 
 use crate::arena2::{
     region_name, world_to_native, Arena2Library, DungeonDefinition, MapPixel, WorldMap,
-    NATIVE_ROTATION_UNITS_PER_DEGREE, REGION_NAMES, WORLD_SCALE,
+    NATIVE_ROTATION_UNITS_PER_DEGREE, RDB_BLOCK_SIDE, REGION_NAMES, WORLD_SCALE,
 };
-use crate::project::{ItemId, ModDetails, Project, ProjectDungeon, ProjectRoom};
+use crate::doors::{dungeon_switched_off, DoorCell};
+use crate::dungeon_textures::DungeonIdentity;
+use crate::project::{ItemId, ModDetails, Project, ProjectDungeon, ProjectDungeonRoom, ProjectRoom};
 use crate::scene::{Scene, SceneObject, SceneObjectKind, ADDED_OBJECTS_GROUP};
 
 /// Folder inside the mod that holds the world data files. Daggerfall Unity
@@ -92,6 +100,8 @@ pub struct ExportedDungeon {
     pub custom_music: Option<String>,
     /// The image of its sky, if it has one.
     pub skybox: Option<String>,
+    /// How many scaled objects the script puts in it (left out of its cells).
+    pub scaled_objects: usize,
 }
 
 /// A file copied into the mod as it is, such as a dungeon's music.
@@ -153,6 +163,11 @@ pub struct DungeonCheck {
     pub custom_music: bool,
     /// Whether it shows a skybox, which only a `.dfmod` can do.
     pub skybox: bool,
+    /// How many of its cells' objects are scaled (and can be), which only a `.dfmod` can show.
+    pub scaled_objects: usize,
+    /// What the game does differently from what the editor shows, which does
+    /// not stop the export: doors it switches off, for example.
+    pub notes: Vec<String>,
 }
 
 impl DungeonCheck {
@@ -169,6 +184,7 @@ impl DungeonCheck {
 pub fn check_project(project: &Project, library: &mut Arena2Library) -> Vec<DungeonCheck> {
     let world = library.world_map();
     let dungeons = library.dungeons();
+    let model_tags = library.model_tags();
     let placed = project.placed_dungeons(None);
     project
         .dungeons()
@@ -177,7 +193,9 @@ pub fn check_project(project: &Project, library: &mut Arena2Library) -> Vec<Dung
             let others: Vec<(&str, MapPixel)> = project.placed_dungeons(Some(dungeon.id));
             let is_placed = dungeon.location.map_pixel.is_some();
             let mut problems = Vec::new();
+            let mut notes = Vec::new();
             if is_placed {
+                notes = dungeon_notes(project, dungeon, library, &dungeons, &model_tags);
                 problems = dungeon.location.problems(world.as_deref(), &others);
                 problems.extend(dungeon_problems(project, dungeon, library, world.as_deref(), &dungeons));
                 problems.extend(name_problems(dungeon, world.as_deref(), &placed));
@@ -199,7 +217,260 @@ pub fn check_project(project: &Project, library: &mut Arena2Library) -> Vec<Dung
                 replaces: dungeon.location.replaces.as_ref().map(|replaced| replaced.label()),
                 custom_music: dungeon.location.custom_music,
                 skybox: dungeon.location.skybox,
+                scaled_objects: used_project_rooms(project, dungeon)
+                    .iter()
+                    .map(|room| scaled_objects(&room.objects, &model_tags).len())
+                    .sum(),
+                notes,
             }
+        })
+        .collect()
+}
+
+/// What the game does with `dungeon` that the export cannot change, as notes for the user.
+fn dungeon_notes(
+    project: &Project,
+    dungeon: &ProjectDungeon,
+    library: &mut Arena2Library,
+    definitions: &[DungeonDefinition],
+    model_tags: &HashMap<u32, String>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    let cells = dungeon_cells(&dungeon.rooms, project, library);
+    let door_cells: Vec<DoorCell<'_>> = cells
+        .iter()
+        .map(|(placement, objects)| DoorCell {
+            objects,
+            origin: cell_origin(placement),
+            is_start: placement.is_starting_block,
+        })
+        .collect();
+    let off = dungeon_switched_off(&door_cells, model_tags, library);
+    if !off.is_empty() {
+        let mut cell_names: Vec<String> = off
+            .iter()
+            .map(|&(cell, _)| {
+                let placement = cells[cell].0;
+                match placement.room.and_then(|room_id| project.room(room_id)) {
+                    Some(room) => room.name.clone(),
+                    None => placement.block_name.clone(),
+                }
+            })
+            .collect();
+        cell_names.dedup();
+        notes.push(format!(
+            "Daggerfall Unity switches off {} door(s) within {} m of another door, as it does in Daggerfall's              own dungeons (in {}); the dungeon view tints them red",
+            off.len(),
+            crate::doors::OVERLAP_DISTANCE,
+            cell_names.join(", ")
+        ));
+    }
+    if let FoyerDoors::Lost(reason) = foyer_doors(project, dungeon, library, definitions) {
+        notes.push(reason);
+    }
+    notes
+}
+
+/// Each cell of a dungeon laid out as `layout`, in its order, with its
+/// objects as the game lays them out (only the start cell keeps exit doors).
+/// Cells whose objects cannot be read are left out.
+pub fn dungeon_cells<'layout>(
+    layout: &'layout [ProjectDungeonRoom],
+    project: &Project,
+    library: &mut Arena2Library,
+) -> Vec<(&'layout ProjectDungeonRoom, Vec<SceneObject>)> {
+    layout
+        .iter()
+        .filter_map(|placement| {
+            let mut objects = match placement.room.and_then(|room_id| project.room(room_id)) {
+                Some(room) => room.objects.clone(),
+                None => Scene::from_rdb_block(&library.rdb_block(&placement.block_name).ok()?).objects,
+            };
+            if !placement.is_starting_block {
+                objects.retain(|object| !object.is_exit_door());
+            }
+            Some((placement, objects))
+        })
+        .collect()
+}
+
+/// Where the corner of `placement`'s cell is in the dungeon.
+pub fn cell_origin(placement: &ProjectDungeonRoom) -> glam::Vec3 {
+    glam::Vec3::new(placement.grid_x as f32 * RDB_BLOCK_SIDE, 0.0, placement.grid_z as f32 * RDB_BLOCK_SIDE)
+}
+
+/// Castle Daggerfall's map id.
+pub const CASTLE_DAGGERFALL_MAP_ID: i32 = 1_291_010_263;
+/// The ids (block position plus the door's offset in its block) of Castle
+/// Daggerfall's two magically held foyer doors. Daggerfall Unity lets a player
+/// who teleported into the castle open them, so they are not locked in the
+/// throne room (`DaggerfallAction.CastleDaggerfallMagicDoorsSpecialOpenHack`),
+/// and finds them by these ids.
+const FOYER_DOOR_IDS: [i64; 2] = [29_331_574, 29_331_622];
+
+/// Positions an exported project cell keeps so its objects have ids the game knows.
+#[derive(Debug, Clone, Default)]
+struct KeptIds {
+    block_position: i64,
+    positions: HashMap<usize, i32>,
+}
+
+/// How Castle Daggerfall's foyer doors fare in a project dungeon.
+enum FoyerDoors {
+    /// The dungeon does not replace Castle Daggerfall, or uses the foyer's own cell.
+    Untouched,
+    /// They are in the project cell `room`, which keeps their ids.
+    InCell { room: ItemId, ids: KeptIds },
+    /// They cannot keep their ids, for this reason.
+    Lost(String),
+}
+
+/// Finds Castle Daggerfall's foyer doors in `dungeon`, if it replaces the castle.
+fn foyer_doors(
+    project: &Project,
+    dungeon: &ProjectDungeon,
+    library: &mut Arena2Library,
+    definitions: &[DungeonDefinition],
+) -> FoyerDoors {
+    let Some(replaced) = &dungeon.location.replaces else { return FoyerDoors::Untouched };
+    let castle = definitions.iter().find(|definition| {
+        replaced.is(definition)
+            && definition.classic.is_some_and(|classic| classic.map_id == CASTLE_DAGGERFALL_MAP_ID)
+    });
+    let Some(castle) = castle else { return FoyerDoors::Untouched };
+    // The doors in the castle's own cells: their cell, offset, model and place.
+    let mut doors = Vec::new();
+    for placement in &castle.blocks {
+        let Some(block_position) = library.block_position(&placement.block_name) else { continue };
+        let Ok(block) = library.rdb_block(&placement.block_name) else { continue };
+        for object in &block.objects {
+            if !FOYER_DOOR_IDS.contains(&(block_position + i64::from(object.offset))) {
+                continue;
+            }
+            if let crate::arena2::RdbObjectKind::Model(model) = &object.kind {
+                doors.push((
+                    placement.block_name.clone(),
+                    block_position,
+                    object.offset,
+                    model.model_id,
+                    object.position,
+                ));
+            }
+        }
+    }
+    let Some((block_name, block_position, ..)) = doors.first().cloned() else { return FoyerDoors::Untouched };
+    if doors.len() != FOYER_DOOR_IDS.len() {
+        return FoyerDoors::Untouched;
+    }
+    let uses_own_cell = dungeon
+        .rooms
+        .iter()
+        .any(|placement| placement.room.is_none() && placement.block_name.eq_ignore_ascii_case(&block_name));
+    if uses_own_cell {
+        return FoyerDoors::Untouched;
+    }
+    let explanation = format!(
+        "Daggerfall Unity lets a player who teleports into Castle Daggerfall open the two magically held doors in \
+         its foyer, so they are not locked in the throne room. It finds the doors (model {} in {block_name}) by \
+         their ids",
+        doors[0].3
+    );
+    let record_size = library.block_record_size(&block_name).unwrap_or(0);
+    for placement in &dungeon.rooms {
+        let Some(room) = placement.room.and_then(|room_id| project.room(room_id)) else { continue };
+        let found: Vec<Option<usize>> = doors
+            .iter()
+            .map(|&(_, _, _, model_id, position)| {
+                room.objects.iter().position(|object| {
+                    matches!(object.kind, SceneObjectKind::Model { model_id: id, .. } if id == model_id)
+                        && world_to_native(object.position) == position
+                })
+            })
+            .collect();
+        if found.iter().any(Option::is_none) {
+            continue;
+        }
+        // The cell's other objects must stay below the original cell's ids,
+        // or they could take the ids of objects in the next block.
+        if object_position(room.objects.len()) as usize >= record_size {
+            return FoyerDoors::Lost(format!(
+                "{explanation}, which your cell {} cannot keep: it has too many objects ({}). The fix will not work",
+                room.name,
+                room.objects.len()
+            ));
+        }
+        let positions = found.iter().zip(&doors).map(|(index, door)| (index.unwrap_or(0), door.2)).collect();
+        return FoyerDoors::InCell { room: room.id, ids: KeptIds { block_position, positions } };
+    }
+    FoyerDoors::Lost(format!(
+        "{explanation}, and here they are no longer where they were (moved, removed or in another cell), so the fix \
+         will not work"
+    ))
+}
+
+/// The location ids an export gives the project's new dungeons (placed, and
+/// replacing none), by dungeon: picked from each one's map pixel in the
+/// project's order, skipping ids already taken, so a dungeon keeps its id
+/// whichever dungeons are exported with it. `taken` are Daggerfall's own.
+pub fn new_location_ids(project: &Project, taken: &HashSet<u16>) -> HashMap<ItemId, u16> {
+    let mut used = taken.clone();
+    project
+        .dungeons()
+        .into_iter()
+        .filter(|dungeon| dungeon.location.replaces.is_none())
+        .filter_map(|dungeon| Some((dungeon.id, new_location_id(dungeon.location.map_pixel?, &mut used)?)))
+        .collect()
+}
+
+/// What Daggerfall Unity picks the textures of the project dungeon `dungeon`
+/// from, as an export gives it; `None` while it is not placed on the map.
+/// `new_ids` are from [`new_location_ids`].
+pub fn dungeon_identity(
+    dungeon: &ProjectDungeon,
+    definitions: &[DungeonDefinition],
+    world: Option<&WorldMap>,
+    new_ids: &HashMap<ItemId, u16>,
+) -> Option<DungeonIdentity> {
+    let pixel = dungeon.location.map_pixel?;
+    let climate = world.and_then(|world| world.climate_at(pixel));
+    match &dungeon.location.replaces {
+        Some(replaced) => {
+            let classic = definitions.iter().find(|definition| replaced.is(definition))?.classic?;
+            Some(DungeonIdentity {
+                map_id: classic.map_id,
+                dungeon_location_id: classic.dungeon_location_id,
+                climate,
+            })
+        }
+        None => {
+            let location_id = *new_ids.get(&dungeon.id)?;
+            Some(DungeonIdentity {
+                map_id: json::new_map_id(pixel),
+                dungeon_location_id: location_id + 1,
+                climate,
+            })
+        }
+    }
+}
+
+/// What Daggerfall Unity picks the textures of Daggerfall's own dungeon `definition` from.
+pub fn daggerfall_dungeon_identity(
+    definition: &DungeonDefinition,
+    world: Option<&WorldMap>,
+) -> Option<DungeonIdentity> {
+    let classic = definition.classic?;
+    Some(DungeonIdentity {
+        map_id: classic.map_id,
+        dungeon_location_id: classic.dungeon_location_id,
+        climate: definition.map_pixel.and_then(|pixel| world?.climate_at(pixel)),
+    })
+}
+
+/// Indexes of the objects in `objects` that are scaled and can be scaled in the game.
+pub fn scaled_objects(objects: &[SceneObject], model_tags: &HashMap<u32, String>) -> Vec<usize> {
+    (0..objects.len())
+        .filter(|&index| {
+            objects[index].scale.is_some() && Scene::scale_blocker(objects, index, model_tags).is_none()
         })
         .collect()
 }
@@ -394,6 +665,10 @@ fn used_project_rooms<'project>(
 
 /// Makes the mod's files from the `selected` project dungeons.
 ///
+/// With `for_dfmod`, scaled objects are left out of their cells and a script
+/// puts them back at their size, which only a `.dfmod` can run; without it
+/// they stay in their cells, at their usual size, for loose files.
+///
 /// Fails if one of them is not placed or has problems (see
 /// [`check_project`]), or if none is selected.
 pub fn build_mod(
@@ -402,6 +677,7 @@ pub fn build_mod(
     details: &ModDetails,
     fallback_title: &str,
     selected: &[ItemId],
+    for_dfmod: bool,
 ) -> Result<ModFiles, String> {
     let checks: Vec<DungeonCheck> =
         check_project(project, library).into_iter().filter(|check| selected.contains(&check.id)).collect();
@@ -424,7 +700,14 @@ pub fn build_mod(
     let world = library.world_map().ok_or("MAPS.BSA was not found, so the world map cannot be read")?;
     let definitions = library.dungeons();
     let model_tags = library.model_tags();
-    let mut used_location_ids = library.location_ids();
+    let new_ids = new_location_ids(project, &library.location_ids());
+    // Project cells that keep ids the game knows objects by.
+    let mut kept_ids: HashMap<ItemId, KeptIds> = HashMap::new();
+    for dungeon in &ready {
+        if let FoyerDoors::InCell { room, ids } = foyer_doors(project, dungeon, library, &definitions) {
+            kept_ids.insert(room, ids);
+        }
+    }
 
     let title = match details.title.trim() {
         "" => fallback_title.trim().to_string(),
@@ -435,6 +718,8 @@ pub fn build_mod(
 
     // New block names for the project cells, stable as long as the cells keep their ids.
     let mut block_names: HashMap<ItemId, String> = HashMap::new();
+    // The scaled objects left out of each project cell, for the script.
+    let mut scaled_by_room: HashMap<ItemId, Vec<SceneObject>> = HashMap::new();
     let mut taken_names = HashSet::new();
     let mut cells = Vec::new();
     let mut files = Vec::new();
@@ -444,8 +729,19 @@ pub fn build_mod(
                 continue;
             }
             let block_name = new_block_name(room, library, &mut taken_names);
+            let scaled = if for_dfmod { scaled_objects(&room.objects, &model_tags) } else { Vec::new() };
+            if !scaled.is_empty() {
+                scaled_by_room
+                    .insert(room.id, scaled.iter().map(|&index| room.objects[index].clone()).collect());
+            }
+            // The other objects keep their positions, as in a loose export.
+            let kept = kept_ids.remove(&room.id).unwrap_or_default();
+            let options =
+                json::CellOptions { left_out: scaled.into_iter().collect(), positions: kept.positions };
+            let position =
+                if kept.block_position != 0 { kept.block_position } else { block_position(room.id) };
             let block =
-                json::Block::from_cell(&block_name, block_position(room.id), &room.objects, &model_tags);
+                json::Block::from_cell_with(&block_name, position, &room.objects, &model_tags, &options);
             files.push(ExportedFile {
                 path: format!("{WORLD_DATA_FOLDER}/{block_name}.json"),
                 contents: to_json(&block),
@@ -460,6 +756,8 @@ pub fn build_mod(
     let mut copied_files = Vec::new();
     let mut music_entries = Vec::new();
     let mut sky_entries = Vec::new();
+    let mut scaled_dungeons = Vec::new();
+    let mut scaled_entries = Vec::new();
     for dungeon in &ready {
         let pixel = dungeon.location.map_pixel.ok_or("a dungeon lost its place")?;
         let replaced = match &dungeon.location.replaces {
@@ -486,9 +784,7 @@ pub fn build_mod(
         let classic = replaced.and_then(|definition| definition.classic.as_ref());
         let location_id = match classic {
             Some(classic) => classic.location_id,
-            None => {
-                new_location_id(pixel, &mut used_location_ids).ok_or("there are no free location ids left")?
-            }
+            None => *new_ids.get(&dungeon.id).ok_or("there are no free location ids left")?,
         };
         // The song: the one chosen, or else the replaced dungeon's (a new
         // dungeon gets one picked from its location id, so they differ).
@@ -585,6 +881,39 @@ pub fn build_mod(
                 image_name: format!("{stem}.{extension}"),
             });
         }
+        // Its scaled objects, which the script puts in each cell they belong to.
+        let scaled_before = scaled_entries.len();
+        for placement in &dungeon.rooms {
+            let Some(room_id) = placement.room else { continue };
+            let (Some(objects), Some(block_name)) = (scaled_by_room.get(&room_id), block_names.get(&room_id))
+            else {
+                continue;
+            };
+            scaled_entries.extend(objects.iter().filter_map(|object| {
+                let shape = match object.kind {
+                    SceneObjectKind::Model { model_id, .. } => scale_script::ScaledShape::Model(model_id),
+                    SceneObjectKind::Flat { texture, .. } => {
+                        scale_script::ScaledShape::Flat { archive: texture.archive, record: texture.record }
+                    }
+                    SceneObjectKind::Light { .. } => return None,
+                };
+                Some(scale_script::ScaledObject {
+                    dungeon: scaled_dungeons.len(),
+                    block_name: block_name.clone(),
+                    grid_x: placement.grid_x,
+                    grid_z: placement.grid_z,
+                    shape,
+                    position: object.position,
+                    rotation: object.rotation(),
+                    scale: object.scale_or_one(),
+                })
+            }));
+        }
+        let scaled_count = scaled_entries.len() - scaled_before;
+        if scaled_count > 0 {
+            scaled_dungeons
+                .push(scale_script::ScaledDungeon { region_index, location_name: name.to_string() });
+        }
         exported.push(ExportedDungeon {
             name: dungeon.name.clone(),
             region_index,
@@ -592,6 +921,7 @@ pub fn build_mod(
             replaces: replaced.map(|definition| definition.name.clone()),
             custom_music: custom_music.map(|source| source.display().to_string()),
             skybox: skybox.map(|source| source.display().to_string()),
+            scaled_objects: scaled_count,
         });
     }
     if !music_entries.is_empty() {
@@ -604,6 +934,12 @@ pub fn build_mod(
         files.push(ExportedFile {
             path: format!("{file_name}DungeonSky.cs.txt"),
             contents: sky_script::sky_script(&file_name, &sky_entries),
+        });
+    }
+    if !scaled_entries.is_empty() {
+        files.push(ExportedFile {
+            path: format!("{file_name}ScaledObjects.cs.txt"),
+            contents: scale_script::scale_script(&file_name, &scaled_dungeons, &scaled_entries),
         });
     }
 
@@ -707,7 +1043,21 @@ fn readme_text(mod_files: &ModFiles) -> String {
         if let Some(sky) = &dungeon.skybox {
             text.push_str(&format!(", with a skybox ({sky}; only in the .dfmod)"));
         }
+        if dungeon.scaled_objects > 0 {
+            text.push_str(&format!(
+                ", with {} scaled object(s) that only the .dfmod puts in place",
+                dungeon.scaled_objects
+            ));
+        }
         text.push('\n');
+    }
+    if mod_files.dungeons.iter().any(|dungeon| dungeon.scaled_objects > 0) {
+        text.push_str(
+            "\nThis export was made for a .dfmod: its scaled objects are left out of the cells in \
+             WorldData, and the .dfmod's script puts them back at their size. Used loose, these files \
+             lack those objects; export with \"Files only\" for loose files, which keeps them at their \
+             usual size.\n",
+        );
     }
     if !mod_files.cells.is_empty() {
         text.push_str("\nCells:\n");
@@ -840,7 +1190,7 @@ pub(crate) fn native_radius(radius: f32) -> u16 {
 
 /// The object groups of a cell, as RDB blocks store them: the cell's own
 /// lists in order, then one more for the objects the user added.
-pub(crate) fn object_groups(objects: &[SceneObject]) -> Vec<Vec<usize>> {
+pub fn object_groups(objects: &[SceneObject]) -> Vec<Vec<usize>> {
     let own_groups = objects
         .iter()
         .filter(|object| object.group_index != ADDED_OBJECTS_GROUP)
@@ -914,6 +1264,7 @@ mod tests {
             rotation_degrees: glam::Vec3::ZERO,
             visible: true,
             next: None,
+            scale: None,
         };
         let objects = [object(1), object(ADDED_OBJECTS_GROUP), object(0)];
         assert_eq!(object_groups(&objects), vec![vec![2], vec![0], vec![1]]);

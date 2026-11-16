@@ -23,6 +23,21 @@ const WATER_LEVEL_STEP: i32 = 8;
 /// Record of the editor marker that the game replaces with a random enemy.
 pub const RANDOM_ENEMY_MARKER_RECORD: u8 = 15;
 
+/// Texture archive of fixed treasure piles, which the game fills with loot.
+pub const FIXED_TREASURE_TEXTURE_ARCHIVE: u16 = 216;
+
+/// Model tags of the doors Daggerfall Unity lays out as action doors.
+pub const ACTION_DOOR_TAGS: [&str; 4] = ["DOR", "DDR", "NEW", "CAV"];
+/// The red brick door, which Daggerfall Unity never makes an action door,
+/// although Daggerfall's cells tag it as one.
+pub const RED_BRICK_DOOR_MODEL_ID: u32 = 72100;
+/// Tapestries and banners, which Daggerfall Unity gives no collision so the
+/// player cannot get stuck behind them.
+pub const TAPESTRY_MODEL_IDS: std::ops::RangeInclusive<u32> = 42500..=42571;
+
+/// Smallest and largest scale an object can have, along each axis.
+pub const SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.05..=20.0;
+
 /// Record of the editor marker that the game replaces with the enemy stored in it.
 pub const FIXED_ENEMY_MARKER_RECORD: u8 = 16;
 /// Enemy id that switches a fixed enemy marker off.
@@ -261,6 +276,9 @@ pub const AXES: [(u8, &str); 7] =
 
 /// Action type that opens (and unlocks) a door, which then swings open.
 pub const OPEN_DOOR_ACTION: u8 = 0x12;
+/// Action types that move their object along an axis, and that turn it.
+const MOVE_ACTION: u8 = 0x01;
+const ROTATE_ACTION: u8 = 0x08;
 /// How a door swings open: degrees around its own vertical axis, over this many seconds.
 pub const DOOR_OPEN_DEGREES: f32 = -90.0;
 pub const DOOR_OPEN_SECONDS: f32 = 1.5;
@@ -343,6 +361,39 @@ impl ObjectAction {
             }
             _ => None,
         }
+    }
+
+    /// How the action moves a model tagged `model_tag` (its tag in
+    /// Daggerfall's cells, such as `WHE`), as Daggerfall Unity plays it.
+    ///
+    /// Daggerfall Unity does not always follow the stored axis. Wheels
+    /// (`WHE`, for example in Direnni Tower) always spin a full turn around
+    /// their own Y axis, their axle, and coffin lids (`LID`) always turn 90°
+    /// around their own −Z axis, whatever their action says. And it reads a
+    /// few single objects' unusual axis values its own way: a trap (`TRP`)
+    /// with axis 13, and the turning crossing (`C0E`, axis 12) and portcullis
+    /// (`C0X`, axis 11) in Orsinium's traps corridor.
+    pub fn model_motion(&self, model_tag: Option<&str>) -> Option<ActionMotion> {
+        let mut action = *self;
+        match (action.action_type, action.axis, model_tag) {
+            (ROTATE_ACTION, 13, Some("TRP")) => {
+                action.axis = 2;
+                action.magnitude = 400;
+            }
+            (ROTATE_ACTION, 12, Some("C0E")) => {
+                action.axis = 3;
+                action.duration = 0;
+            }
+            (MOVE_ACTION, 11, Some("C0X")) => action.axis = 3,
+            _ => {}
+        }
+        let mut motion = action.motion()?;
+        match model_tag {
+            Some("WHE") => motion.rotation_degrees = Vec3::new(0.0, -360.0, 0.0),
+            Some("LID") => motion.rotation_degrees = Vec3::new(0.0, 0.0, -90.0),
+            _ => {}
+        }
+        Some(motion)
     }
 }
 
@@ -464,9 +515,65 @@ pub struct SceneObject {
     pub visible: bool,
     /// The object this one's action triggers next, if any.
     pub next: Option<ObjectId>,
+    /// Its size along its own X, Y and Z axes, if it is scaled (1 is its
+    /// usual size). Flats use X for their width and Y for their height. Only a
+    /// `.dfmod` can show it in the game; see [`SceneObject::scale_blocker`].
+    pub scale: Option<Vec3>,
 }
 
 impl SceneObject {
+    /// Its scale: [`SceneObject::scale`], or 1 along each axis when it has none.
+    pub fn scale_or_one(&self) -> Vec3 {
+        self.scale.unwrap_or(Vec3::ONE)
+    }
+
+    /// How much its billboard is stretched, across and up, if it is a flat.
+    pub fn billboard_scale(&self) -> glam::Vec2 {
+        self.scale_or_one().truncate()
+    }
+
+    /// Why the object cannot be scaled in the game, if it cannot. Daggerfall
+    /// Unity gives these objects their own behaviour as it lays a cell out,
+    /// which a scaled copy (see [`crate::export::scale_script`]) would lose.
+    /// `linked` says whether another object's action links to this one, and
+    /// `model_tag` is a model's tag in Daggerfall's cells.
+    pub fn scale_blocker(&self, linked: bool, model_tag: Option<&str>) -> Option<&'static str> {
+        match &self.kind {
+            SceneObjectKind::Light { .. } => return Some("Lights cannot be scaled"),
+            SceneObjectKind::Model { model_id, .. } => {
+                if *model_id == EXIT_DOOR_MODEL_ID {
+                    return Some("The exit door cannot be scaled");
+                }
+                if *model_id != RED_BRICK_DOOR_MODEL_ID
+                    && model_tag.is_some_and(|tag| ACTION_DOOR_TAGS.contains(&tag))
+                {
+                    return Some("Doors cannot be scaled: the game makes them open and close");
+                }
+            }
+            SceneObjectKind::Flat { texture, data } => {
+                if texture.archive == MARKER_TEXTURE_ARCHIVE {
+                    return Some("Markers cannot be scaled");
+                }
+                if texture.archive == FIXED_TREASURE_TEXTURE_ARCHIVE {
+                    return Some("Treasure cannot be scaled: the game turns it into loot");
+                }
+                if crate::catalog::PEOPLE_FLAT_ARCHIVES.contains(&texture.archive) {
+                    return Some("People cannot be scaled: the game makes them NPCs that quests can use");
+                }
+                if data.action != 0 {
+                    return Some("Flats with an action cannot be scaled");
+                }
+            }
+        }
+        if self.has_action() {
+            return Some("Objects with an action cannot be scaled");
+        }
+        if self.next.is_some() || linked {
+            return Some("Objects linked to other objects' actions cannot be scaled");
+        }
+        None
+    }
+
     /// Whether the object can have an action: models and flats, but not lights.
     pub fn can_have_action(&self) -> bool {
         !matches!(self.kind, SceneObjectKind::Light { .. })
@@ -520,9 +627,9 @@ impl SceneObject {
         self.rotation_degrees = Vec3::new(round(x), round(y), round(z));
     }
 
-    /// Local-to-world transform of the object.
+    /// Local-to-world transform of the object, with its scale.
     pub fn model_matrix(&self) -> Mat4 {
-        Mat4::from_rotation_translation(self.rotation(), self.position)
+        Mat4::from_scale_rotation_translation(self.scale_or_one(), self.rotation(), self.position)
     }
 
     /// Returns `true` for the door model that leads out of a dungeon.
@@ -666,11 +773,31 @@ impl Scene {
                     rotation_degrees,
                     visible: true,
                     next,
+                    scale: None,
                 }
             })
             .collect();
 
         Self { block_name: block.name.clone(), objects }
+    }
+
+    /// Why `objects[index]` cannot be scaled in the game, if it cannot (see
+    /// [`SceneObject::scale_blocker`]). `model_tags` are Daggerfall's tags for models.
+    pub fn scale_blocker(
+        objects: &[SceneObject],
+        index: usize,
+        model_tags: &std::collections::HashMap<u32, String>,
+    ) -> Option<&'static str> {
+        let object = objects.get(index)?;
+        let linked = objects
+            .iter()
+            .enumerate()
+            .any(|(other, linking)| other != index && linking.next == Some(object.id));
+        let tag = match object.kind {
+            SceneObjectKind::Model { model_id, .. } => model_tags.get(&model_id).map(String::as_str),
+            _ => None,
+        };
+        object.scale_blocker(linked, tag)
     }
 
     /// An id no object in the cell uses yet, for a new object.
@@ -819,6 +946,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scaling_sizes_the_model_and_skips_objects_the_game_handles() {
+        let model = |model_id: u32| SceneObject {
+            id: 1,
+            name: String::new(),
+            group_index: 0,
+            kind: SceneObjectKind::Model { model_id, data: ModelData::default() },
+            position: Vec3::new(1.0, 2.0, 3.0),
+            rotation_degrees: Vec3::new(0.0, 90.0, 0.0),
+            visible: true,
+            next: None,
+            scale: Some(Vec3::new(2.0, 3.0, 4.0)),
+        };
+        let plain = model(1234);
+        // Scaled along its own axes, then turned, then moved.
+        let corner = plain.model_matrix().transform_point3(Vec3::new(1.0, 1.0, 1.0));
+        let expected = plain.position + plain.rotation() * Vec3::new(2.0, 3.0, 4.0);
+        assert!(corner.abs_diff_eq(expected, 1e-5), "{corner:?}");
+        assert_eq!(plain.scale_blocker(false, Some("WAL")), None);
+        assert!(plain.scale_blocker(true, None).is_some(), "linked to");
+        assert!(plain.scale_blocker(false, Some("DOR")).is_some(), "a door");
+        assert!(model(EXIT_DOOR_MODEL_ID).scale_blocker(false, None).is_some());
+        let mut with_action = model(1234);
+        with_action.kind = SceneObjectKind::Model {
+            model_id: 1234,
+            data: ModelData { action: Some(ObjectAction::default()), ..ModelData::default() },
+        };
+        assert!(with_action.scale_blocker(false, None).is_some());
+        let flat = |archive: u16| SceneObject {
+            kind: SceneObjectKind::Flat { texture: TextureKey::new(archive, 0), data: FlatData::default() },
+            ..model(0)
+        };
+        assert_eq!(flat(210).scale_blocker(false, None), None);
+        assert_eq!(flat(210).billboard_scale(), glam::Vec2::new(2.0, 3.0));
+        assert!(flat(MARKER_TEXTURE_ARCHIVE).scale_blocker(false, None).is_some());
+        assert!(flat(FIXED_TREASURE_TEXTURE_ARCHIVE).scale_blocker(false, None).is_some());
+        assert!(flat(334).scale_blocker(false, None).is_some(), "a person");
+        // The red brick door is tagged as a door but is not one to the game.
+        assert_eq!(model(RED_BRICK_DOOR_MODEL_ID).scale_blocker(false, Some("DOR")), None);
+        // Scene-wide, another object's link counts.
+        let mut linking = model(1234);
+        linking.id = 2;
+        linking.next = Some(1);
+        let objects = [model(1234), linking];
+        assert!(Scene::scale_blocker(&objects, 0, &std::collections::HashMap::new()).is_some());
+    }
+
+    #[test]
     fn rotation_matches_daggerfall_unity_order() {
         let object = SceneObject {
             name: String::new(),
@@ -829,6 +1003,7 @@ mod tests {
             visible: true,
             id: 0,
             next: None,
+            scale: None,
         };
         let radians = object.rotation_degrees * (std::f32::consts::PI / 180.0);
         let expected = Mat4::from_translation(object.position)
@@ -852,6 +1027,7 @@ mod tests {
             visible: true,
             id: 0,
             next: None,
+            scale: None,
         };
         // The game ignores the high byte.
         let orc = marker(0x3507, 0, 0).fixed_enemy().unwrap();
@@ -879,6 +1055,7 @@ mod tests {
             visible: true,
             id: 0,
             next: None,
+            scale: None,
         };
         let mage = FixedEnemy { mobile_id: 128, passive: true, gender: EnemyGender::Female };
         object.set_fixed_enemy(mage);
@@ -910,6 +1087,7 @@ mod tests {
             visible: true,
             id: 0,
             next: None,
+            scale: None,
         };
         // A water byte of 5 puts the water 40 native units (1 m) up.
         let deep = flat(RANDOM_ENEMY_MARKER_RECORD, 0, 0.5);
@@ -937,6 +1115,7 @@ mod tests {
             rotation_degrees: Vec3::ZERO,
             visible: true,
             next: Some(7),
+            scale: None,
         };
         let mut good = vec![light(4), light(9)];
         Scene::ensure_object_ids(&mut good);
@@ -973,6 +1152,22 @@ mod tests {
         // Doors, teleports and traps do not move their object.
         assert_eq!(action(OPEN_DOOR_ACTION, 0, 0, 0).motion(), None);
         assert_eq!(action(0x0E, 0, 0, 0).motion(), None);
+        // The wheel (61032) in N0000002 says a full turn around −Z, but
+        // Daggerfall Unity spins wheels around their own Y axis, their axle.
+        let wheel = action(0x08, 5, 40, 2048);
+        assert_eq!(wheel.motion().unwrap().rotation_degrees, Vec3::new(0.0, 0.0, -360.0));
+        let spin = wheel.model_motion(Some("WHE")).unwrap();
+        assert_eq!((spin.rotation_degrees, spin.seconds), (Vec3::new(0.0, -360.0, 0.0), 2.0));
+        assert_eq!(wheel.model_motion(Some("C0Z")), wheel.motion(), "other models follow their axis");
+        assert_eq!(action(0x08, 1, 20, 512).model_motion(Some("LID")).unwrap().rotation_degrees.z, -90.0);
+        // Single objects whose odd axis values Daggerfall Unity reads its own way.
+        let trap = action(0x08, 13, 20, 392).model_motion(Some("TRP")).unwrap();
+        assert!((trap.rotation_degrees.x - 400.0 / NATIVE_ROTATION_UNITS_PER_DEGREE).abs() < 1e-4);
+        assert_eq!(action(0x08, 13, 20, 392).model_motion(Some("C0Z")), None);
+        let crossing = action(0x08, 12, 30, 512).model_motion(Some("C0E")).unwrap();
+        assert_eq!((crossing.rotation_degrees.y, crossing.seconds), (-90.0, 0.0));
+        let portcullis = action(0x01, 11, 30, 160).model_motion(Some("C0X")).unwrap();
+        assert_eq!(portcullis.translation, Vec3::new(0.0, -4.0, 0.0));
 
         let object = SceneObject {
             id: 1,
@@ -983,6 +1178,7 @@ mod tests {
             rotation_degrees: Vec3::new(0.0, 90.0, 0.0),
             visible: true,
             next: None,
+            scale: None,
         };
         let halfway = object.moved_by(&lift, 0.5);
         assert_eq!(halfway.position, Vec3::new(0.0, 1.6, 0.0));
@@ -1001,6 +1197,7 @@ mod tests {
             rotation_degrees: Vec3::ZERO,
             visible: true,
             next,
+            scale: None,
         };
         let rotate = Some(ObjectAction { action_type: 0x08, axis: 4, duration: 20, magnitude: 512 });
         // Lever (10) -> object with no action (20) -> moving wall (30) -> lever again (loop).
@@ -1029,6 +1226,7 @@ mod tests {
             rotation_degrees: Vec3::new(0.0, rotation_y, 0.0),
             visible: true,
             next: None,
+            scale: None,
         };
         let box_2m = Some((Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 2.0, 1.0)));
         assert_eq!(object(10.0, 0.0).distance_outside_cell(None), 0.0);
@@ -1052,6 +1250,7 @@ mod tests {
             visible: true,
             id: 0,
             next: None,
+            scale: None,
         };
         let mut scene = Scene {
             block_name: "N0000000.RDB".to_string(),

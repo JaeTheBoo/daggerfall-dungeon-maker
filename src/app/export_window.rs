@@ -189,7 +189,8 @@ impl ExportWindow {
             project.mod_details.guid = new_guid(project_title);
         }
         let selected = self.selected();
-        let result = build_mod(project, library, &project.mod_details, project_title, &selected);
+        let for_dfmod = self.settings.dfmod != DfmodBuild::None;
+        let result = build_mod(project, library, &project.mod_details, project_title, &selected, for_dfmod);
         self.checks = Some(check_project(project, library));
         let mod_files = match result {
             Ok(mod_files) => mod_files,
@@ -359,6 +360,16 @@ impl ExportWindow {
                         for problem in &check.problems {
                             ui.label(egui::RichText::new(format!("      {problem}")).color(bad));
                         }
+                        // What the game does differently, which does not stop the export.
+                        for note in &check.notes {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("      ⚠ {note}"))
+                                        .color(ui.visuals().warn_fg_color),
+                                )
+                                .wrap(),
+                            );
+                        }
                     }
                 }
             },
@@ -385,6 +396,14 @@ impl ExportWindow {
             .flatten()
             .filter(|check| check.skybox && selected.contains(&check.id))
             .map(|check| check.name.clone())
+            .collect();
+        // And those with scaled objects, which loose files cannot scale.
+        let scaled: Vec<String> = self
+            .checks
+            .iter()
+            .flatten()
+            .filter(|check| check.scaled_objects > 0 && selected.contains(&check.id))
+            .map(|check| format!("{} ({})", check.name, check.scaled_objects))
             .collect();
         let settings = &mut self.settings;
         ui.horizontal(|ui| {
@@ -429,6 +448,16 @@ impl ExportWindow {
                         "⚠ Skyboxes do not work in loose files: {} will show black behind the dungeon, as \
                          Daggerfall's dungeons do. Build a .dfmod with Unity to show the skybox.",
                         skyboxes.join(", ")
+                    ))
+                    .color(ui.visuals().warn_fg_color),
+                );
+            }
+            if !scaled.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "⚠ Scaled objects do not export in loose files, only in a .dfmod: the scaled objects \
+                         in {} will be at their usual size. Build a .dfmod with Unity to scale them.",
+                        scaled.join(", ")
                     ))
                     .color(ui.visuals().warn_fg_color),
                 );

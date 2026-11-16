@@ -191,6 +191,7 @@ mod tests {
             visible: true,
             id,
             next,
+            scale: None,
         }
     }
 
@@ -207,6 +208,7 @@ mod tests {
             visible: true,
             id,
             next: None,
+            scale: None,
         }
     }
 

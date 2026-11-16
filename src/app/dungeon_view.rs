@@ -26,6 +26,8 @@ use super::world_map::{occupant, MapChoice, MapPickRequest, WorldMapPicker};
 use crate::arena2::{Arena2Library, DungeonDefinition, LocationType, MapPixel, WorldMap, RDB_BLOCK_SIDE};
 use crate::camera::OrbitCamera;
 use crate::custom_names::CustomNames;
+use crate::doors::{dungeon_switched_off, DoorCell, OVERLAP_DISTANCE};
+use crate::dungeon_textures::{DungeonIdentity, DungeonTextures};
 use crate::encounters::DungeonType;
 use crate::music::{DungeonSong, MusicPlayer, DUNGEON_SONGS};
 use crate::picking::{intersect_horizontal_plane, pick_object, PickOptions};
@@ -177,6 +179,14 @@ pub struct DungeonView {
     show_skybox: bool,
     /// Whether the dungeon has a skybox to draw.
     has_skybox: bool,
+    /// What the game picks the dungeon's textures from, if known (see [`Self::set_identity`]).
+    identity: Option<DungeonIdentity>,
+    /// The textures it is drawn with, as last worked out.
+    textures: Option<DungeonTextures>,
+    /// Objects of the combined scene that are doors the game switches off, and
+    /// whether they must be found again because the cells changed.
+    switched_off_doors: Vec<usize>,
+    doors_stale: bool,
 }
 
 /// Colours of the box dragged to select cells.
@@ -292,6 +302,10 @@ impl DungeonView {
             merge_request: None,
             show_skybox: true,
             has_skybox: false,
+            identity: None,
+            textures: None,
+            switched_off_doors: Vec::new(),
+            doors_stale: true,
         };
         view.rebuild_combined_scene();
         view.frame_dungeon(library);
@@ -772,12 +786,22 @@ impl DungeonView {
                     ui.label("Cells").on_hover_text("Number of cells (RDB blocks) the dungeon is built from.");
                     ui.label(self.rooms.len().to_string());
                     ui.end_row();
+
+                    ui.label("Textures").on_hover_text(
+                        "The wall and floor textures Daggerfall Unity gives the dungeon, which the views show \
+                         (View > Dungeon textures). The game picks them from the dungeon's ids and the climate \
+                         where it is, as its RandomDungeonTextures setting says.",
+                    );
+                    let (text, hover) = texture_summary(self.textures, self.identity.is_some());
+                    ui.label(text).on_hover_text(hover);
+                    ui.end_row();
                 });
 
                 self.show_location(ui, details, &mut action);
 
                 ui.add_space(8.0);
                 self.show_unclosed_warning(ui, details);
+                self.show_switched_off_warning(ui, details);
                 ui.add_space(4.0);
                 ui.strong("Cells").on_hover_text("Every cell in the dungeon. Hover one to highlight it in the view, double-click to open it.");
                 ui.label(egui::RichText::new("Hover to highlight, double-click to edit").weak());
@@ -1242,6 +1266,11 @@ impl DungeonView {
         skybox: Option<&std::path::Path>,
     ) -> Option<usize> {
         self.has_skybox = skybox.is_some();
+        self.textures = resources.dungeon_textures(self.identity.as_ref());
+        if self.doors_stale {
+            self.doors_stale = false;
+            self.find_switched_off_doors(resources.library);
+        }
         let rect = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
         // When the camera moves, what is under a still pointer changes too.
@@ -1306,6 +1335,8 @@ impl DungeonView {
             snap_grid_spacing: None,
             size_in_pixels: size_in_pixels(ui, rect),
             sky,
+            dungeon_textures: self.textures,
+            warned_objects: &self.switched_off_doors,
         };
         paint_scene(ui, rect, resources, &mut self.target, &request);
         if let Some(start) = self.selection_box_start {
@@ -1603,6 +1634,65 @@ impl DungeonView {
         }
     }
 
+    /// Sets what the game picks the dungeon's textures from (`None` while the
+    /// dungeon is not placed on the map, which leaves the standard textures).
+    pub fn set_identity(&mut self, identity: Option<DungeonIdentity>) {
+        self.identity = identity;
+    }
+
+    /// Finds the doors Daggerfall Unity switches off (see [`crate::doors`]).
+    fn find_switched_off_doors(&mut self, library: &mut Arena2Library) {
+        let model_tags = library.model_tags();
+        let cells: Vec<DoorCell<'_>> = self
+            .rooms
+            .iter()
+            .map(|room| DoorCell {
+                objects: &room.scene.objects,
+                origin: room.origin,
+                is_start: room.is_starting_block,
+            })
+            .collect();
+        let off = dungeon_switched_off(&cells, &model_tags, library);
+        // Rooms' objects follow one another in the combined scene.
+        let mut first_of_room = Vec::with_capacity(self.rooms.len());
+        let mut count = 0;
+        for room in &self.rooms {
+            first_of_room.push(count);
+            count += room.scene.objects.len();
+        }
+        self.switched_off_doors = off.into_iter().map(|(room, index)| first_of_room[room] + index).collect();
+    }
+
+    /// Says which doors the game switches off, if any.
+    fn show_switched_off_warning(&self, ui: &mut egui::Ui, details: &DungeonDetails<'_>) {
+        if self.switched_off_doors.is_empty() {
+            return;
+        }
+        let mut cells: Vec<String> = Vec::new();
+        for &index in &self.switched_off_doors {
+            let Some(room) =
+                self.combined_scene.objects.get(index).and_then(|object| self.rooms.get(object.group_index))
+            else {
+                continue;
+            };
+            let name = match room.project_room.and_then(|room_id| details.project.room(room_id)) {
+                Some(project_room) => project_room.name.clone(),
+                None => details.custom_names.room_label(&room.block_name),
+            };
+            if !cells.contains(&name) {
+                cells.push(name);
+            }
+        }
+        let count = self.switched_off_doors.len();
+        let doors = if count == 1 { "1 door".to_string() } else { format!("{count} doors") };
+        ui.colored_label(WARNING_COLOR, format!("⚠ The game switches off {doors}")).on_hover_text(format!(
+            "Daggerfall Unity switches off an action door within {OVERLAP_DISTANCE} m of another door (or of the \
+             exit door), keeping the first in the dungeon's order. These are tinted red in the view \
+             (View > Switched-off doors). In: {}",
+            cells.join(", ")
+        ));
+    }
+
     /// Rebuilds the world space scene and outlines from the per-room scenes.
     fn rebuild_combined_scene(&mut self) {
         let objects = self
@@ -1622,6 +1712,7 @@ impl DungeonView {
             .collect();
         self.combined_scene = Scene { block_name: self.name.clone(), objects };
         self.unclosed_stale = true;
+        self.doors_stale = true;
         self.room_outlines =
             self.rooms.iter().map(|room| RoomOutline { origin: room.origin, highlighted: false }).collect();
         self.water_planes = self
@@ -1731,6 +1822,33 @@ fn merge_button(ui: &mut egui::Ui, count: usize) -> bool {
 }
 
 /// World position of the minimum corner of grid spot (`grid_x`, `grid_z`).
+/// What the Textures row says: a short text and an explanation.
+fn texture_summary(textures: Option<DungeonTextures>, known: bool) -> (String, String) {
+    match textures {
+        Some(textures) => {
+            let archives: Vec<String> = textures.table.iter().map(u16::to_string).collect();
+            (
+                format!("As in the game: {}", archives.join(", ")),
+                format!(
+                    "Daggerfall's standard dungeon textures 119, 120, 122, 123, 124 and 168 become {} in this \
+                     dungeon",
+                    archives.join(", ")
+                ),
+            )
+        }
+        None if known => (
+            "Standard".to_string(),
+            "The views show Daggerfall's standard dungeon textures (View > Dungeon textures)".to_string(),
+        ),
+        None => (
+            "Standard (place the dungeon to see the game's)".to_string(),
+            "The game picks a dungeon's textures from its ids and the climate where it is, so the dungeon \
+             must be placed on the world map first"
+                .to_string(),
+        ),
+    }
+}
+
 fn grid_origin(grid_x: i32, grid_z: i32) -> Vec3 {
     Vec3::new(grid_x as f32 * RDB_BLOCK_SIDE, 0.0, grid_z as f32 * RDB_BLOCK_SIDE)
 }

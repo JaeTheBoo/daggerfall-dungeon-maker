@@ -17,6 +17,7 @@ use super::project_panel::OpenedItem;
 use super::viewport_tools::EditorResources;
 use crate::arena2::{Arena2Library, DoorKind, RDB_BLOCK_SIDE};
 use crate::camera::OrbitCamera;
+use crate::dungeon_textures::DungeonIdentity;
 use crate::encounters::{enemy_chances, DungeonType, EncounterTable, EnemyChance};
 use crate::render::{RoomOutline, ViewSettings, ViewportTarget};
 use crate::scene::{
@@ -151,6 +152,10 @@ pub struct RoomEditor {
     context_request: Option<Option<OpenedItem>>,
     /// The selected dungeon's other cells, placed around this one, and their outlines.
     dungeon_context: Option<DungeonContext>,
+    /// What the game picks the selected dungeon's textures from, if known.
+    dungeon_identity: Option<DungeonIdentity>,
+    /// The cell's doors (object indexes) the game switches off, refreshed every frame.
+    switched_off_doors: Vec<usize>,
 }
 
 /// The cells around the edited one in a dungeon, shown faded for context.
@@ -165,6 +170,25 @@ pub struct DungeonContext {
     pub outlines: Vec<RoomOutline>,
     /// The surrounding cells.
     pub cells: Vec<ContextCell>,
+    /// Their doors, for finding the doors the game switches off.
+    pub doors: ContextDoors,
+}
+
+/// The doors of the cells around the edited one, for finding the doors
+/// Daggerfall Unity switches off (see [`crate::doors`]). Positions are in the
+/// dungeon's coordinates.
+#[derive(Debug, Clone, Default)]
+pub struct ContextDoors {
+    /// Where the edited cell's corner is in the dungeon.
+    pub origin: Vec3,
+    /// Whether the edited cell is the dungeon's start cell.
+    pub is_start: bool,
+    /// The exit door's point in the game's list, when the start is another cell.
+    pub exit: Option<Vec3>,
+    /// The other cells' action doors in the game's order: those of the cells
+    /// before the edited one in the dungeon's layout, and those after it.
+    pub before: Vec<Vec3>,
+    pub after: Vec<Vec3>,
 }
 
 /// One cell shown faded around the edited one.
@@ -271,6 +295,8 @@ impl RoomEditor {
             outside_cell: Vec::new(),
             context_request: None,
             dungeon_context: None,
+            dungeon_identity: None,
+            switched_off_doors: Vec::new(),
         };
         editor.frame_room(library);
         if let Some((minimum, _)) = editor.scene.bounds(library) {
@@ -342,7 +368,8 @@ impl RoomEditor {
         match self.scene.objects.get(index)?.kind {
             SceneObjectKind::Model { model_id, data } => {
                 let action = data.action?;
-                if let Some(motion) = action.motion() {
+                let tags = library.model_tags();
+                if let Some(motion) = action.model_motion(tags.get(&model_id).map(String::as_str)) {
                     Some(motion)
                 } else if action.action_type == OPEN_DOOR_ACTION
                     && library.model(model_id).and_then(|mesh| mesh.door_kind()) == Some(DoorKind::Building)
@@ -441,6 +468,41 @@ impl RoomEditor {
     /// Sets the cells shown faded around this one, or removes them.
     pub fn set_dungeon_context(&mut self, context: Option<DungeonContext>) {
         self.dungeon_context = context;
+    }
+
+    /// The dungeon whose cells are shown around this one, if any.
+    pub fn context_dungeon(&self) -> Option<&OpenedItem> {
+        self.dungeon_context.as_ref().map(|context| &context.dungeon)
+    }
+
+    /// Sets what the game picks the textures of the dungeon around the cell
+    /// from; the cell is drawn with them (`None` for the standard ones).
+    pub fn set_dungeon_identity(&mut self, identity: Option<DungeonIdentity>) {
+        self.dungeon_identity = identity;
+    }
+
+    /// The cell's doors the game switches off, among the selected dungeon's
+    /// cells (or, without one, among the cell's own doors).
+    fn find_switched_off_doors(&self, library: &mut Arena2Library) -> Vec<usize> {
+        let model_tags = library.model_tags();
+        let objects = &self.scene.objects;
+        let own = crate::doors::action_doors_in_order(objects, &model_tags);
+        if own.is_empty() {
+            return Vec::new();
+        }
+        let empty = ContextDoors::default();
+        let doors = self.dungeon_context.as_ref().map_or(&empty, |context| &context.doors);
+        let exit = match doors.is_start {
+            true => crate::doors::exit_door_point(objects, library),
+            false => doors.exit,
+        };
+        let list = doors
+            .before
+            .iter()
+            .map(|&position| (None, position))
+            .chain(own.iter().map(|&index| (Some(index), doors.origin + objects[index].position)))
+            .chain(doors.after.iter().map(|&position| (None, position)));
+        crate::doors::switched_off(exit, list.collect::<Vec<_>>()).into_iter().flatten().collect()
     }
 
     /// Selects `dungeon` under "Used in" (or clears the selection) and asks for its cells.
@@ -1070,4 +1132,7 @@ pub fn view_settings_menu(ui: &mut egui::Ui, settings: &mut ViewSettings) {
     ui.checkbox(&mut settings.show_lights, "Lights");
     ui.checkbox(&mut settings.show_action_links, "Action links")
         .on_hover_text("Red lines from each object to the object its action triggers");
+    ui.checkbox(&mut settings.show_switched_off_doors, "Switched-off doors").on_hover_text(
+        "Tints red the doors Daggerfall Unity switches off because they are within 1.4 m of another door",
+    );
 }

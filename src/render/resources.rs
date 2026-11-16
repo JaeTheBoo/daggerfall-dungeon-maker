@@ -26,6 +26,8 @@ pub struct GpuTexture {
 
 /// The part of a [`GpuModel`] drawn with one texture.
 pub struct GpuSubMesh {
+    /// The model's own texture for this part, which its texture coordinates are made for.
+    pub key: TextureKey,
     /// Texture used by this range of indices.
     pub texture: Rc<GpuTexture>,
     /// Range within the model's index buffer.
@@ -209,7 +211,11 @@ pub fn upload_model(
         }));
         indices.extend(submesh.indices.iter().map(|index| index + first_vertex));
 
-        submeshes.push(GpuSubMesh { texture, index_range: first_index..indices.len() as u32 });
+        submeshes.push(GpuSubMesh {
+            key: submesh.texture,
+            texture,
+            index_range: first_index..indices.len() as u32,
+        });
     }
 
     let label = format!("model {}", mesh.model_id);

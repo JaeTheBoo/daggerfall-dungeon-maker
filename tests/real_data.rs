@@ -474,7 +474,7 @@ fn exports_a_project_dungeon_as_a_new_location() {
     assert!(checks[0].is_ready(), "{:?}", checks[0].problems);
     let details = ModDetails { title: "Export Test".to_string(), ..ModDetails::default() };
     let mod_files =
-        build_mod(&project, &mut library, &details, "Fallback", &[dungeon_id]).expect("the mod builds");
+        build_mod(&project, &mut library, &details, "Fallback", &[dungeon_id], true).expect("the mod builds");
     let paths: Vec<&str> = mod_files.files.iter().map(|file| file.path.as_str()).collect();
     println!("{paths:#?}");
     assert_eq!(mod_files.file_name, "Export_Test");
@@ -507,6 +507,71 @@ fn exports_a_project_dungeon_as_a_new_location() {
     let all_written = mod_files.files.iter().all(|file| written(&file.path)) && written("README.txt");
     std::fs::remove_dir_all(&folder).unwrap();
     assert!(all_written);
+
+    // A scaled plain model: a .dfmod export leaves it out of the cell and has a
+    // script put it back at its size; loose files keep it in the cell.
+    let tags = library.model_tags();
+    let model_count = |files: &daggerfall_dungeon_maker::export::ModFiles| {
+        let block =
+            files.files.iter().find(|file| file.path == format!("WorldData/{block_name}.json")).unwrap();
+        let block: serde_json::Value = serde_json::from_str(&block.contents).unwrap();
+        block["RdbBlock"]["ObjectRootList"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|root| root["RdbObjects"].as_array())
+            .flatten()
+            .filter(|object| object["Type"] == "Model")
+            .count()
+    };
+    let unscaled_models = model_count(&mod_files);
+    let room = project.room_mut(room_id).expect("the room is there");
+    let index = (0..room.objects.len())
+        .find(|&index| {
+            matches!(room.objects[index].kind, daggerfall_dungeon_maker::scene::SceneObjectKind::Model { .. })
+                && Scene::scale_blocker(&room.objects, index, &tags).is_none()
+        })
+        .expect("a model that can be scaled");
+    room.objects[index].scale = Some(glam::Vec3::new(2.0, 0.5, 1.5));
+    let checks = check_project(&project, &mut library);
+    assert_eq!(checks[0].scaled_objects, 1);
+    let scaled =
+        build_mod(&project, &mut library, &details, "Fallback", &[dungeon_id], true).expect("the mod builds");
+    assert_eq!(model_count(&scaled), unscaled_models - 1);
+    assert_eq!(scaled.dungeons[0].scaled_objects, 1);
+    let script = scaled
+        .files
+        .iter()
+        .find(|file| file.path == "Export_TestScaledObjects.cs.txt")
+        .expect("the scale script");
+    assert!(script.contents.contains(&format!("{{ \"{block_name}\" }}")), "{}", script.contents);
+    assert!(script.contents.contains("Scales = { 2f, 0.5f, 1.5f }"), "{}", script.contents);
+    let loose = build_mod(&project, &mut library, &details, "Fallback", &[dungeon_id], false)
+        .expect("the mod builds");
+    assert_eq!(model_count(&loose), unscaled_models);
+    // Every other object keeps its position (saved games know objects by it).
+    let positions = |files: &daggerfall_dungeon_maker::export::ModFiles| {
+        let block =
+            files.files.iter().find(|file| file.path == format!("WorldData/{block_name}.json")).unwrap();
+        let block: serde_json::Value = serde_json::from_str(&block.contents).unwrap();
+        block["RdbBlock"]["ObjectRootList"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|root| root["RdbObjects"].as_array())
+            .flatten()
+            .map(|object| {
+                let place = [&object["XPos"], &object["YPos"], &object["ZPos"]].map(|value| value.as_i64());
+                (object["Position"].as_i64().unwrap(), place)
+            })
+            .collect::<std::collections::HashMap<_, _>>()
+    };
+    let (all, kept) = (positions(&loose), positions(&scaled));
+    assert_eq!(kept.len() + 1, all.len());
+    assert!(kept.iter().all(|(position, place)| all.get(position) == Some(place)), "positions moved");
+    assert!(!loose.files.iter().any(|file| file.path.ends_with("ScaledObjects.cs.txt")));
+    let room = project.room_mut(room_id).expect("the room is there");
+    room.objects[index].scale = None;
 
     // Its name may not repeat a location of its region.
     project.dungeon_mut(dungeon_id).unwrap().name = original.name.clone();
@@ -563,7 +628,7 @@ fn exports_a_dungeon_replacing_one_of_daggerfalls() {
 
     let checks = check_project(&project, &mut library);
     assert!(checks[0].is_ready(), "{:?}", checks[0].problems);
-    let mod_files = build_mod(&project, &mut library, &ModDetails::default(), "Replace", &[dungeon_id])
+    let mod_files = build_mod(&project, &mut library, &ModDetails::default(), "Replace", &[dungeon_id], true)
         .expect("the mod builds");
     let path = format!("WorldData/location-{}-{}.json", original.region_index, classic.location_index);
     let file = mod_files.files.iter().find(|file| file.path == path).expect("the replacement file");
@@ -582,8 +647,9 @@ fn exports_a_dungeon_replacing_one_of_daggerfalls() {
     let location = &mut project.dungeon_mut(dungeon_id).unwrap().location;
     location.custom_music = true;
     location.custom_music_file = music.display().to_string();
-    let with_music = build_mod(&project, &mut library, &ModDetails::default(), "Replace", &[dungeon_id])
-        .expect("the mod builds");
+    let with_music =
+        build_mod(&project, &mut library, &ModDetails::default(), "Replace", &[dungeon_id], true)
+            .expect("the mod builds");
     assert_eq!(with_music.copied_files.len(), 1);
     assert_eq!(with_music.copied_files[0].path, "Music/replace_music_0.ogg");
     let script =
@@ -609,7 +675,7 @@ fn exports_a_dungeon_replacing_one_of_daggerfalls() {
     let location = &mut project.dungeon_mut(dungeon_id).unwrap().location;
     location.skybox = true;
     location.skybox_file = sky.display().to_string();
-    let with_sky = build_mod(&project, &mut library, &ModDetails::default(), "Replace", &[dungeon_id])
+    let with_sky = build_mod(&project, &mut library, &ModDetails::default(), "Replace", &[dungeon_id], true)
         .expect("the mod builds");
     assert_eq!(with_sky.copied_files.len(), 1);
     assert_eq!(with_sky.copied_files[0].path, "Sky/replace_sky_0.png");
@@ -651,6 +717,134 @@ fn exports_a_dungeon_replacing_one_of_daggerfalls() {
 }
 
 #[test]
+fn a_castle_daggerfall_copy_keeps_its_foyer_doors_ids() {
+    use daggerfall_dungeon_maker::export::{build_mod, check_project, CASTLE_DAGGERFALL_MAP_ID};
+    use daggerfall_dungeon_maker::project::{
+        DungeonLocation, DungeonReference, ModDetails, Project, ProjectDungeonRoom, ProjectEntry, ProjectRoom,
+    };
+    use daggerfall_dungeon_maker::scene::Scene;
+    let Some(mut library) = open_library() else { return };
+
+    let dungeons = library.dungeons();
+    let castle = dungeons
+        .iter()
+        .find(|dungeon| dungeon.classic.is_some_and(|classic| classic.map_id == CASTLE_DAGGERFALL_MAP_ID))
+        .expect("Castle Daggerfall");
+    // Its start cell, S0000160, holds the two magically held foyer doors.
+    let start = castle.blocks.iter().find(|block| block.is_starting_block).unwrap();
+    assert_eq!(start.block_name, "S0000160.RDB");
+    let mut project = Project::default();
+    let room_id = project.new_id();
+    let scene = Scene::from_rdb_block(&library.rdb_block(&start.block_name).unwrap());
+    project.add(
+        ProjectEntry::Room(ProjectRoom {
+            id: room_id,
+            name: "My foyer".to_string(),
+            based_on: Some(start.block_name.clone()),
+            objects: scene.objects,
+        }),
+        None,
+    );
+    let dungeon_id = project.add_empty_dungeon("My Castle");
+    let dungeon = project.dungeon_mut(dungeon_id).unwrap();
+    dungeon.dungeon_type = castle.dungeon_type;
+    dungeon.rooms = ProjectDungeonRoom::layout_of(castle);
+    for room in &mut dungeon.rooms {
+        if room.is_starting_block {
+            room.room = Some(room_id);
+        }
+    }
+    dungeon.location = DungeonLocation {
+        map_pixel: castle.map_pixel,
+        replaces: Some(DungeonReference::to(castle)),
+        ..DungeonLocation::copied_from(castle)
+    };
+    let checks = check_project(&project, &mut library);
+    assert!(checks[0].is_ready(), "{:?}", checks[0].problems);
+    assert!(!checks[0].notes.iter().any(|note| note.contains("foyer")), "{:?}", checks[0].notes);
+
+    // The copy keeps S0000160's block position and the doors' offsets, so the
+    // game's ids for them (block position plus offset) stay 29331574 and 29331622.
+    let mod_files = build_mod(&project, &mut library, &ModDetails::default(), "Castle", &[dungeon_id], false)
+        .expect("the mod builds");
+    let block_name = &mod_files.cells[0].block_name;
+    let block =
+        mod_files.files.iter().find(|file| file.path == format!("WorldData/{block_name}.json")).unwrap();
+    let block: serde_json::Value = serde_json::from_str(&block.contents).unwrap();
+    let block_position = block["Position"].as_i64().unwrap();
+    assert_eq!(Some(block_position), library.block_position("S0000160.RDB"));
+    let ids: Vec<i64> = block["RdbBlock"]["ObjectRootList"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|root| root["RdbObjects"].as_array())
+        .flatten()
+        .map(|object| block_position + object["Position"].as_i64().unwrap())
+        .collect();
+    assert!(ids.contains(&29_331_574) && ids.contains(&29_331_622));
+    let unique: std::collections::HashSet<&i64> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "every object keeps its own id");
+
+    // Moved, the doors cannot be found, and the export says the fix will not work.
+    let room = project.room_mut(room_id).unwrap();
+    for object in &mut room.objects {
+        if matches!(
+            object.kind,
+            daggerfall_dungeon_maker::scene::SceneObjectKind::Model { model_id: 55004, .. }
+        ) {
+            object.position.x += 1.0;
+        }
+    }
+    let checks = check_project(&project, &mut library);
+    assert!(checks[0].notes.iter().any(|note| note.contains("foyer")), "{:?}", checks[0].notes);
+}
+
+#[test]
+fn finds_doors_the_game_switches_off_and_dungeon_textures() {
+    use daggerfall_dungeon_maker::doors::{dungeon_switched_off, DoorCell};
+    use daggerfall_dungeon_maker::dungeon_textures::{uses_dungeon_textures, DungeonTextures, TextureMode};
+    use daggerfall_dungeon_maker::export::{cell_origin, daggerfall_dungeon_identity, dungeon_cells};
+    use daggerfall_dungeon_maker::project::{Project, ProjectDungeonRoom};
+    let Some(mut library) = open_library() else { return };
+
+    let dungeons = library.dungeons();
+    let world = library.world_map();
+    let tags = library.model_tags();
+    let tower = dungeons.iter().find(|dungeon| dungeon.name == "Bechur Tower").expect("Bechur Tower");
+    let layout = ProjectDungeonRoom::layout_of(tower);
+    let project = Project::default();
+    let cells = dungeon_cells(&layout, &project, &mut library);
+    let door_cells: Vec<DoorCell<'_>> = cells
+        .iter()
+        .map(|(placement, objects)| DoorCell {
+            objects,
+            origin: cell_origin(placement),
+            is_start: placement.is_starting_block,
+        })
+        .collect();
+    let off = dungeon_switched_off(&door_cells, &tags, &mut library);
+    assert_eq!(off.len(), 5, "{off:?}");
+
+    // Its textures are Daggerfall's classic ones for its ids and climate, and
+    // every texture its models swap to is in the game data.
+    let identity = daggerfall_dungeon_identity(tower, world.as_deref()).expect("its ids");
+    let textures = DungeonTextures::for_dungeon(&identity, TextureMode::Classic);
+    assert_ne!(textures.table, daggerfall_dungeon_maker::dungeon_textures::STANDARD_TABLE);
+    for (_, objects) in &cells {
+        for object in objects.iter().filter(|object| uses_dungeon_textures(object)) {
+            let daggerfall_dungeon_maker::scene::SceneObjectKind::Model { model_id, .. } = object.kind else {
+                continue;
+            };
+            let Some(mesh) = library.model(model_id) else { continue };
+            for submesh in &mesh.submeshes {
+                let key = textures.apply(submesh.texture);
+                assert!(library.texture_image(key).is_some(), "{key} for model {model_id}");
+            }
+        }
+    }
+}
+
+#[test]
 fn finds_openings_that_lead_to_empty_space() {
     use std::collections::HashMap;
 
@@ -673,6 +867,7 @@ fn finds_openings_that_lead_to_empty_space() {
         rotation_degrees: glam::Vec3::ZERO,
         visible: true,
         next: None,
+        scale: None,
     };
     let found = unclosed_faces(std::slice::from_ref(&corridor), |_| true, &mut library, &mut cache);
     let normals: Vec<glam::Vec3> = found.iter().map(|face| face.face.normal.round()).collect();

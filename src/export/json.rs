@@ -5,7 +5,7 @@
 //! Only the fields it uses are written; the rest keep their defaults. Enum
 //! values are written by name, as FullSerializer writes them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -150,6 +150,25 @@ pub struct LightResource {
     pub radius: u16,
 }
 
+/// The map id of a new location at `pixel`, made from the pixel.
+pub fn new_map_id(pixel: MapPixel) -> i32 {
+    pixel.y * 1000 + pixel.x
+}
+
+/// How [`Block::from_cell_with`] writes a cell.
+#[derive(Debug, Clone, Default)]
+pub struct CellOptions {
+    /// Indexes of objects to leave out. The others keep the positions they
+    /// have with every object there: Daggerfall Unity knows objects in saved
+    /// games (opened doors, taken treasure, quest markers) by their position,
+    /// so leaving one out must not move the rest.
+    pub left_out: HashSet<usize>,
+    /// Positions for some objects (by index) in place of the usual ones, so
+    /// they keep ids the game already knows them by. They must differ from
+    /// every usual position (the usual ones are multiples of 16).
+    pub positions: HashMap<usize, i32>,
+}
+
 impl Block {
     /// The block called `name` made from a cell's `objects`.
     ///
@@ -162,12 +181,31 @@ impl Block {
         objects: &[SceneObject],
         tags: &HashMap<u32, String>,
     ) -> Self {
-        let position_of_id: HashMap<u32, i32> =
-            objects.iter().enumerate().map(|(index, object)| (object.id, object_position(index))).collect();
+        Self::from_cell_with(name, position, objects, tags, &CellOptions::default())
+    }
+
+    /// Like [`Block::from_cell`], with `options`: objects left out, and
+    /// positions given to some objects instead of the usual ones.
+    pub fn from_cell_with(
+        name: &str,
+        position: i64,
+        objects: &[SceneObject],
+        tags: &HashMap<u32, String>,
+        options: &CellOptions,
+    ) -> Self {
+        let left_out = &options.left_out;
+        let object_position =
+            |index: usize| options.positions.get(&index).copied().unwrap_or_else(|| object_position(index));
+        let position_of_id: HashMap<u32, i32> = objects
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !left_out.contains(index))
+            .map(|(index, object)| (object.id, object_position(index)))
+            .collect();
         // Which model's action sets each object off, for its "previous" link.
         let mut previous: HashMap<i32, i32> = HashMap::new();
         for (index, object) in objects.iter().enumerate() {
-            if !object.has_action() {
+            if !object.has_action() || left_out.contains(&index) {
                 continue;
             }
             if let Some(target) = object.next.and_then(|id| position_of_id.get(&id)) {
@@ -191,7 +229,8 @@ impl Block {
         let mut roots = Vec::new();
         for group in object_groups(objects) {
             let mut list = Vec::with_capacity(group.len());
-            for (index_in_list, &index) in group.iter().enumerate() {
+            let kept = group.iter().filter(|index| !left_out.contains(index));
+            for (index_in_list, &index) in kept.enumerate() {
                 let object = &objects[index];
                 let own_position = object_position(index);
                 let next = object.next.and_then(|id| position_of_id.get(&id)).copied().unwrap_or(-1);
@@ -469,7 +508,7 @@ impl Location {
             exterior,
             blocks,
         } = dungeon;
-        let pixel_id = pixel.y * 1000 + pixel.x;
+        let pixel_id = new_map_id(pixel);
         let (map_id, longitude, latitude, key, x, y) = match replaces {
             Some(classic) => (
                 classic.map_id,
@@ -726,6 +765,7 @@ mod tests {
             rotation_degrees: Vec3::new(0.0, 90.0, 0.0),
             visible: true,
             next: None,
+            scale: None,
         }
     }
 

@@ -974,6 +974,9 @@ struct ObjectFile {
     /// Id of the object this one's action triggers next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     next: Option<ObjectId>,
+    /// Its scale along its X, Y and Z axes; absent when it is not scaled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scale: Option<[f32; 3]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1157,6 +1160,7 @@ impl ObjectFile {
             position: object.position.to_array(),
             rotation: object.rotation_degrees.to_array(),
             visible: object.visible,
+            scale: object.scale.map(|scale| scale.to_array()),
         }
     }
 
@@ -1193,6 +1197,7 @@ impl ObjectFile {
             position: Vec3::from_array(self.position),
             rotation_degrees: Vec3::from_array(self.rotation),
             visible: self.visible,
+            scale: self.scale.map(Vec3::from_array),
         }
     }
 }
@@ -1219,6 +1224,7 @@ mod tests {
                 visible: true,
                 id: 1,
                 next: Some(3),
+                scale: None,
             },
             SceneObject {
                 name: "Torch".to_string(),
@@ -1232,6 +1238,7 @@ mod tests {
                 visible: false,
                 id: 2,
                 next: None,
+                scale: Some(Vec3::new(2.0, 0.5, 1.0)),
             },
             SceneObject {
                 name: "Light".to_string(),
@@ -1242,6 +1249,7 @@ mod tests {
                 visible: true,
                 id: 3,
                 next: None,
+                scale: None,
             },
         ]
     }

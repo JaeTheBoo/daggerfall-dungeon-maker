@@ -424,6 +424,8 @@ impl EntrancePicker {
                 snap_grid_spacing: None,
                 size_in_pixels: size_in_pixels(ui, rect),
                 sky: None,
+                dungeon_textures: None,
+                warned_objects: &[],
             };
             paint_scene(ui, rect, resources, &mut self.target, &request);
         });
@@ -511,6 +513,7 @@ fn preview_object(
         rotation_degrees,
         visible: true,
         next: None,
+        scale: None,
     }
 }
 

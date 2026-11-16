@@ -9,6 +9,7 @@ use crate::camera::OrbitCamera;
 use crate::catalog::AssetCatalog;
 use crate::connectors::{is_on_cell_edge, unclosed_faces, OpenFace, UnclosedFace};
 use crate::custom_names::CustomNames;
+use crate::dungeon_textures::{DungeonIdentity, DungeonTextures, TextureMode, TextureSetting};
 use crate::render::{FrameRequest, SceneRenderer, ViewportTarget};
 use crate::scene::SceneObject;
 
@@ -27,6 +28,44 @@ pub struct EditorResources<'resources> {
     pub catalog: &'resources AssetCatalog,
     /// The user's own names for rooms and models, editable from any editor.
     pub custom_names: &'resources mut CustomNames,
+    /// Which textures dungeons are drawn with (View > Dungeon textures).
+    pub texture_setting: &'resources mut TextureSetting,
+    /// The texture mode in Daggerfall Unity's own settings, if they were found.
+    pub game_texture_mode: Option<TextureMode>,
+}
+
+impl EditorResources<'_> {
+    /// The textures a dungeon that the game knows as `identity` is drawn with,
+    /// or `None` for the standard ones (also when the dungeon is not placed).
+    pub fn dungeon_textures(&self, identity: Option<&DungeonIdentity>) -> Option<DungeonTextures> {
+        let mode = self.texture_setting.mode(self.game_texture_mode)?;
+        Some(DungeonTextures::for_dungeon(identity?, mode))
+    }
+}
+
+/// The View > Dungeon textures menu: which textures dungeons are drawn with.
+pub fn dungeon_texture_menu(ui: &mut egui::Ui, setting: &mut TextureSetting, game_mode: Option<TextureMode>) {
+    ui.menu_button("Dungeon textures", |ui| {
+        let game = match game_mode {
+            Some(mode) => format!("As in Daggerfall Unity ({}, your setting)", mode.label()),
+            None => "As in Daggerfall Unity (classic; your settings were not found)".to_string(),
+        };
+        ui.radio_value(setting, TextureSetting::AsInGame, game).on_hover_text(
+            "The textures the game gives each dungeon, picked as the RandomDungeonTextures setting in              Daggerfall Unity's settings.ini says",
+        );
+        ui.radio_value(setting, TextureSetting::Standard, "Standard")
+            .on_hover_text("Daggerfall's standard dungeon textures, the same in every dungeon");
+        ui.separator();
+        for mode in TextureMode::ALL {
+            let label = format!("{} ({})", mode.label(), mode.setting());
+            let response = ui.radio_value(setting, TextureSetting::Mode(mode), label);
+            if mode.is_approximate() {
+                response.on_hover_text(
+                    "Picked with Unity's random numbers, which the editor imitates; the game's may differ",
+                );
+            }
+        }
+    });
 }
 
 /// Maps between world space and a viewport rectangle on screen.

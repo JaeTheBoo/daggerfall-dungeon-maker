@@ -36,7 +36,7 @@ const ANIMAL_FLAT_ARCHIVE: u16 = 201;
 /// Texture archive holding fixed treasure flats.
 const TREASURE_FLAT_ARCHIVE: u16 = 216;
 /// Texture archives holding people (NPC) flats.
-const PEOPLE_FLAT_ARCHIVES: [u16; 13] = [175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 334, 346, 357];
+pub const PEOPLE_FLAT_ARCHIVES: [u16; 13] = [175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 334, 346, 357];
 
 /// Known editor marker records in archive 199 and what the game uses them for.
 const MARKER_NAMES: [(u8, &str); 8] = [

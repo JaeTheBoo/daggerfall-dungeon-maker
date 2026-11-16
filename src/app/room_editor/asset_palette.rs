@@ -128,6 +128,7 @@ impl PlaceableAsset {
             position,
             rotation_degrees,
             visible: true,
+            scale: None,
         }
     }
 }

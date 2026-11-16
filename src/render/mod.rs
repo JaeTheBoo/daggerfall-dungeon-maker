@@ -47,6 +47,9 @@ const BACKGROUND_COLOR: wgpu::Color = wgpu::Color { r: 0.035, g: 0.04, b: 0.05, 
 const SELECTION_HIGHLIGHT: [f32; 4] = [1.0, 0.55, 0.1, 0.35];
 /// Highlight applied to the object under the mouse.
 const HOVER_HIGHLIGHT: [f32; 4] = [0.4, 0.7, 1.0, 0.18];
+/// Highlight applied to objects the game will not show as the editor does,
+/// such as doors it switches off.
+const WARNING_HIGHLIGHT: [f32; 4] = [1.0, 0.15, 0.1, 0.45];
 /// Tint of the surrounding cells shown around a cell for context: mostly the
 /// background colour, so they look faded.
 const CONTEXT_FADE: [f32; 4] = [0.035, 0.04, 0.05, 0.7];
@@ -81,6 +84,8 @@ pub struct ViewSettings {
     pub show_lights: bool,
     /// Lines from each object to the object its action triggers.
     pub show_action_links: bool,
+    /// Doors the game switches off because they overlap another door, tinted red.
+    pub show_switched_off_doors: bool,
 }
 
 impl Default for ViewSettings {
@@ -94,6 +99,7 @@ impl Default for ViewSettings {
             show_markers: true,
             show_lights: true,
             show_action_links: true,
+            show_switched_off_doors: true,
         }
     }
 }
@@ -158,6 +164,12 @@ pub struct FrameRequest<'frame> {
     pub size_in_pixels: [u32; 2],
     /// A skybox image (a 360° panorama) drawn behind everything, if any.
     pub sky: Option<&'frame std::path::Path>,
+    /// The textures of the dungeon the scene is in, which replace the standard
+    /// dungeon textures of its models (and of the context scene's), as in the game.
+    pub dungeon_textures: Option<crate::dungeon_textures::DungeonTextures>,
+    /// Objects of the scene tinted red as a warning, such as doors the game
+    /// switches off (when [`ViewSettings::show_switched_off_doors`] is on).
+    pub warned_objects: &'frame [usize],
 }
 
 /// The image one viewport is rendered into, plus the egui texture that displays it.
@@ -275,6 +287,8 @@ impl RenderTarget {
 struct ModelBatch {
     model_id: u32,
     instances: Range<u32>,
+    /// Textures in place of the model's own, one per part, for a dungeon's textures.
+    textures: Option<Vec<Rc<GpuTexture>>>,
 }
 
 /// A run of billboard instances that share one texture.
@@ -551,8 +565,9 @@ impl SceneRenderer {
                 };
                 pass.set_vertex_buffer(0, model.vertex_buffer.slice(..));
                 pass.set_index_buffer(model.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                for submesh in &model.submeshes {
-                    pass.set_bind_group(1, &submesh.texture.bind_group, &[]);
+                for (part, submesh) in model.submeshes.iter().enumerate() {
+                    let texture = batch.textures.as_ref().and_then(|textures| textures.get(part));
+                    pass.set_bind_group(1, &texture.unwrap_or(&submesh.texture).bind_group, &[]);
                     pass.draw_indexed(submesh.index_range.clone(), 0, batch.instances.clone());
                 }
             }
@@ -601,9 +616,12 @@ impl SceneRenderer {
         request: &FrameRequest<'_>,
     ) -> (Vec<ModelBatch>, Vec<BillboardBatch>) {
         let settings = request.settings;
+        let warn = settings.show_switched_off_doors;
         let highlight_for = |index: usize, object: &SceneObject| {
             if request.is_selected(index, object) {
                 SELECTION_HIGHLIGHT
+            } else if warn && request.warned_objects.contains(&index) {
+                WARNING_HIGHLIGHT
             } else if request.is_group_highlighted(object) {
                 ROOM_HIGHLIGHT
             } else if request.hovered_objects.contains(&index) {
@@ -615,7 +633,12 @@ impl SceneRenderer {
             }
         };
 
-        let mut model_instances_by_id: BTreeMap<u32, Vec<ModelInstance>> = BTreeMap::new();
+        // By model, and whether it is drawn with the dungeon's textures.
+        let mut model_instances_by_id: BTreeMap<(u32, bool), Vec<ModelInstance>> = BTreeMap::new();
+        let dungeon_textures = request.dungeon_textures;
+        let themed = |object: &SceneObject| {
+            dungeon_textures.is_some() && crate::dungeon_textures::uses_dungeon_textures(object)
+        };
         let mut billboard_instances_by_texture: BTreeMap<TextureKey, Vec<BillboardInstance>> =
             BTreeMap::new();
 
@@ -639,17 +662,17 @@ impl SceneRenderer {
         for (object, highlight) in drawable_objects {
             match object.kind {
                 SceneObjectKind::Model { model_id, .. } if settings.show_models => {
-                    model_instances_by_id.entry(model_id).or_default().push(ModelInstance {
-                        model_matrix: object.model_matrix().to_cols_array_2d(),
-                        highlight,
-                    });
+                    model_instances_by_id.entry((model_id, themed(object))).or_default().push(
+                        ModelInstance { model_matrix: object.model_matrix().to_cols_array_2d(), highlight },
+                    );
                 }
                 SceneObjectKind::Flat { texture, .. } => {
                     let shown = if object.is_marker() { settings.show_markers } else { settings.show_flats };
                     if !shown {
                         continue;
                     }
-                    let size = library.billboard_world_size(texture).unwrap_or(Vec2::ONE);
+                    let size =
+                        library.billboard_world_size(texture).unwrap_or(Vec2::ONE) * object.billboard_scale();
                     billboard_instances_by_texture.entry(texture).or_default().push(BillboardInstance {
                         center: object.position.to_array(),
                         size: size.to_array(),
@@ -663,13 +686,34 @@ impl SceneRenderer {
         // Models: upload any new ones and concatenate instances into one buffer.
         let mut model_instances = Vec::new();
         let mut model_batches = Vec::new();
-        for (model_id, instances) in model_instances_by_id {
+        for ((model_id, themed), instances) in model_instances_by_id {
             if !self.ensure_model(device, queue, library, model_id) {
                 continue;
             }
+            // The dungeon's textures in place of the model's own, part by part.
+            let textures = match (themed, dungeon_textures) {
+                (true, Some(dungeon_textures)) => {
+                    let keys: Vec<TextureKey> = self
+                        .models
+                        .get(&model_id)
+                        .and_then(Option::as_ref)
+                        .map(|model| model.submeshes.iter().map(|submesh| submesh.key).collect())
+                        .unwrap_or_default();
+                    Some(
+                        keys.into_iter()
+                            .map(|key| self.texture(device, queue, library, dungeon_textures.apply(key)))
+                            .collect(),
+                    )
+                }
+                _ => None,
+            };
             let start = model_instances.len() as u32;
             model_instances.extend(instances);
-            model_batches.push(ModelBatch { model_id, instances: start..model_instances.len() as u32 });
+            model_batches.push(ModelBatch {
+                model_id,
+                instances: start..model_instances.len() as u32,
+                textures,
+            });
         }
         self.model_instance_buffer.write(device, queue, bytemuck::cast_slice(&model_instances));
 

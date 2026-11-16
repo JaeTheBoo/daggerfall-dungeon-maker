@@ -13,6 +13,8 @@
 //! * [`export`] turns the project into a Daggerfall Unity mod.
 //! * [`music`] chooses a dungeon's music and plays songs to preview them.
 //! * [`connectors`] finds the open faces where dungeon pieces join, for snapping.
+//! * [`dungeon_textures`] picks the wall and floor textures Daggerfall Unity gives a dungeon.
+//! * [`doors`] finds the doors Daggerfall Unity switches off because they overlap another.
 //! * [`camera`] and [`picking`] provide viewport navigation and selection.
 //! * [`render`] draws a scene with wgpu into an offscreen texture.
 //! * [`app`] is the egui application: menus, dialogs, panels and the viewport.
@@ -23,6 +25,8 @@ pub mod camera;
 pub mod catalog;
 pub mod connectors;
 pub mod custom_names;
+pub mod doors;
+pub mod dungeon_textures;
 pub mod encounters;
 pub mod export;
 pub mod merge;

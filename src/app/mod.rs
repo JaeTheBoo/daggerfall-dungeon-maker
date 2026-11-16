@@ -31,6 +31,7 @@ use crate::arena2::{Arena2Library, DungeonDefinition, RDB_BLOCK_SIDE};
 use crate::catalog::AssetCatalog;
 use crate::connectors::OpeningsLeftOpen;
 use crate::custom_names::CustomNames;
+use crate::dungeon_textures::{DungeonIdentity, TextureMode, TextureSetting};
 use crate::project::{
     DungeonLocation, ItemId, Project, ProjectDungeon, ProjectDungeonRoom, ProjectEntry, ProjectRoom,
     PROJECT_FILE_EXTENSION,
@@ -43,7 +44,7 @@ use dungeon_view::{DungeonDetails, DungeonPropertiesAction, DungeonView, Locatio
 use export_window::{ExportRequest, ExportWindow};
 use project_panel::{OpenedItem, PanelAction, ProjectPanel};
 use room_browser::RoomBrowser;
-use room_editor::{ContextCell, DungeonContext, RoomEditor, UsedInEntry};
+use room_editor::{ContextCell, ContextDoors, DungeonContext, RoomEditor, UsedInEntry};
 use viewport_tools::EditorResources;
 
 /// Storage key under which the chosen ARENA2 folder is remembered between runs.
@@ -58,6 +59,8 @@ const EXPORT_SETTINGS_STORAGE_KEY: &str = "export_settings";
 const PANEL_VIEW_STORAGE_KEY: &str = "project_panel_view";
 /// Storage key under which the last project file is remembered, to reopen it on the next run.
 const PROJECT_FILE_STORAGE_KEY: &str = "project_file";
+/// Storage key of which textures dungeons are drawn with.
+const DUNGEON_TEXTURES_STORAGE_KEY: &str = "dungeon_textures";
 /// How long the pointer must rest on something before its explanation appears.
 const TOOLTIP_DELAY_SECONDS: f32 = 0.5;
 /// Name shown in window titles.
@@ -146,6 +149,9 @@ struct StoredOpenings {
     openings: OpeningsLeftOpen,
 }
 
+/// A new project dungeon and its map pixel, which its location id is picked from.
+type NewDungeonPlace = (ItemId, Option<crate::arena2::MapPixel>);
+
 /// The dungeon maker application.
 pub struct DungeonMakerApp {
     /// Loaded game data; `None` until the user has chosen an ARENA2 folder.
@@ -195,6 +201,13 @@ pub struct DungeonMakerApp {
     show_controls_window: bool,
     /// Title last sent to the main window, to avoid resending it every frame.
     window_title: String,
+    /// Which textures dungeons are drawn with (View > Dungeon textures), saved with the settings.
+    texture_setting: TextureSetting,
+    /// The texture mode in Daggerfall Unity's own settings, read at startup.
+    game_texture_mode: Option<TextureMode>,
+    /// The location ids an export gives the project's new dungeons, with what
+    /// they were worked out from (each new dungeon and its map pixel).
+    new_location_ids: Option<(Vec<NewDungeonPlace>, HashMap<ItemId, u16>)>,
 }
 
 impl DungeonMakerApp {
@@ -270,6 +283,12 @@ impl DungeonMakerApp {
             error_message: None,
             show_controls_window: false,
             window_title: String::new(),
+            texture_setting: creation_context
+                .storage
+                .and_then(|storage| eframe::get_value(storage, DUNGEON_TEXTURES_STORAGE_KEY))
+                .unwrap_or_default(),
+            game_texture_mode: crate::dungeon_textures::game_texture_mode(),
+            new_location_ids: None,
         };
 
         if app.renderer.is_none() {
@@ -669,6 +688,12 @@ impl DungeonMakerApp {
         let mut objects = Vec::new();
         let mut outlines = vec![RoomOutline { origin: Vec3::ZERO, highlighted: false }];
         let mut cells = Vec::new();
+        let model_tags = library.model_tags();
+        let mut doors = ContextDoors {
+            origin: crate::export::cell_origin(here),
+            is_start: here.is_starting_block,
+            ..ContextDoors::default()
+        };
         for (index, placement) in layout.iter().enumerate() {
             if index == here_index {
                 continue;
@@ -681,6 +706,18 @@ impl DungeonMakerApp {
             let Ok((scene, _)) = dungeon_view::load_room_scene(placement, &self.project, library) else {
                 continue;
             };
+            // Its doors, in the game's order, for the doors the game switches off.
+            let origin = crate::export::cell_origin(placement);
+            let cell_doors = crate::doors::action_doors_in_order(&scene.objects, &model_tags)
+                .into_iter()
+                .map(|door| origin + scene.objects[door].position);
+            match index < here_index {
+                true => doors.before.extend(cell_doors),
+                false => doors.after.extend(cell_doors),
+            }
+            if placement.is_starting_block {
+                doors.exit = crate::doors::exit_door_point(&scene.objects, library);
+            }
             let cell_index = cells.len();
             objects.extend(scene.objects.into_iter().map(|mut object| {
                 object.position += offset;
@@ -699,7 +736,38 @@ impl DungeonMakerApp {
             scene: Scene { block_name: String::new(), objects },
             outlines,
             cells,
+            doors,
         })
+    }
+
+    /// What Daggerfall Unity picks `dungeon`'s textures from, as an export
+    /// gives it; `None` for rooms and for project dungeons not yet placed.
+    fn dungeon_identity(&mut self, dungeon: &OpenedItem) -> Option<DungeonIdentity> {
+        let library = self.library.as_mut()?;
+        let world = library.world_map();
+        match dungeon {
+            OpenedItem::DaggerfallDungeon(index) => {
+                crate::export::daggerfall_dungeon_identity(library.dungeons().get(*index)?, world.as_deref())
+            }
+            OpenedItem::Project(id) => {
+                // New dungeons' location ids depend on every new dungeon's place; work them out again only then.
+                let key: Vec<NewDungeonPlace> = self
+                    .project
+                    .dungeons()
+                    .into_iter()
+                    .filter(|dungeon| dungeon.location.replaces.is_none())
+                    .map(|dungeon| (dungeon.id, dungeon.location.map_pixel))
+                    .collect();
+                if self.new_location_ids.as_ref().is_none_or(|(cached, _)| *cached != key) {
+                    let ids = crate::export::new_location_ids(&self.project, &library.location_ids());
+                    self.new_location_ids = Some((key, ids));
+                }
+                let ids = &self.new_location_ids.as_ref()?.1;
+                let dungeon = self.project.dungeon(*id)?;
+                crate::export::dungeon_identity(dungeon, &library.dungeons(), world.as_deref(), ids)
+            }
+            OpenedItem::DaggerfallRoom(_) => None,
+        }
     }
 
     /// The rooms of `dungeon`, in layout order.
@@ -1233,6 +1301,14 @@ impl DungeonMakerApp {
                         }
                         _ => {}
                     }
+                    if matches!(self.workspace, Workspace::Room(_) | Workspace::Dungeon(_)) {
+                        ui.separator();
+                        viewport_tools::dungeon_texture_menu(
+                            ui,
+                            &mut self.texture_setting,
+                            self.game_texture_mode,
+                        );
+                    }
                 });
                 ui.menu_button("Help", |ui| {
                     if ui.button("Viewport controls").clicked() {
@@ -1357,6 +1433,13 @@ impl DungeonMakerApp {
 
     /// Draws the main window's workspace.
     fn show_workspace(&mut self, context: &egui::Context) {
+        // The dungeon shown (or selected around the cell), whose textures it is drawn with.
+        let shown_dungeon = match &self.workspace {
+            Workspace::Dungeon(_) => self.opened_item.clone(),
+            Workspace::Room(editor) => editor.context_dungeon().cloned(),
+            _ => None,
+        };
+        let identity = shown_dungeon.and_then(|dungeon| self.dungeon_identity(&dungeon));
         let mut main_used_in = self.main_used_in();
         let mut open_request = None;
         let mut context_request = None;
@@ -1375,6 +1458,8 @@ impl DungeonMakerApp {
             renderer: self.renderer.as_mut(),
             catalog: &self.catalog,
             custom_names: &mut self.custom_names,
+            texture_setting: &mut self.texture_setting,
+            game_texture_mode: self.game_texture_mode,
         };
 
         let mut room_to_open = None;
@@ -1386,6 +1471,7 @@ impl DungeonMakerApp {
         match &mut self.workspace {
             Workspace::Room(editor) => {
                 editor.set_used_in(std::mem::take(&mut main_used_in));
+                editor.set_dungeon_identity(identity);
                 editor.show(context, &mut resources);
                 open_request = editor.take_open_request();
                 context_request =
@@ -1399,6 +1485,7 @@ impl DungeonMakerApp {
                 }
             }
             Workspace::Dungeon(view) => {
+                view.set_identity(identity);
                 let open_dungeon = match self.opened_item {
                     Some(OpenedItem::Project(id)) => self.project.dungeon(id),
                     _ => None,
@@ -1857,6 +1944,16 @@ impl DungeonMakerApp {
         let mut open_request = None;
         let mut context_requests = Vec::new();
         let mut cell_open_request = None;
+        // The dungeon selected around each window's cell, whose textures it is drawn with.
+        let shown_dungeons: Vec<Option<OpenedItem>> =
+            self.room_windows.iter().map(|window| window.editor.context_dungeon().cloned()).collect();
+        let identities: Vec<Option<DungeonIdentity>> = shown_dungeons
+            .into_iter()
+            .map(|dungeon| dungeon.and_then(|dungeon| self.dungeon_identity(&dungeon)))
+            .collect();
+        for (window, identity) in self.room_windows.iter_mut().zip(identities) {
+            window.editor.set_dungeon_identity(identity);
+        }
         let Some(library) = self.library.as_mut() else { return };
         let mut resources = EditorResources {
             library,
@@ -1864,6 +1961,8 @@ impl DungeonMakerApp {
             renderer: self.renderer.as_mut(),
             catalog: &self.catalog,
             custom_names: &mut self.custom_names,
+            texture_setting: &mut self.texture_setting,
+            game_texture_mode: self.game_texture_mode,
         };
 
         let prompt = self.copy_prompt;
@@ -2172,6 +2271,7 @@ impl eframe::App for DungeonMakerApp {
         eframe::set_value(storage, CUSTOM_NAMES_STORAGE_KEY, &self.custom_names);
         eframe::set_value(storage, PANEL_VIEW_STORAGE_KEY, &self.project_panel.view);
         eframe::set_value(storage, EXPORT_SETTINGS_STORAGE_KEY, &self.export_window.settings);
+        eframe::set_value(storage, DUNGEON_TEXTURES_STORAGE_KEY, &self.texture_setting);
         if let Some(openings) = &self.stored_openings {
             eframe::set_value(storage, OPENINGS_STORAGE_KEY, openings);
         }
@@ -2264,7 +2364,15 @@ fn show_room_window_contents(
     egui::TopBottomPanel::top(editor_id.with("menu_bar")).show(context, |ui| {
         egui::menu::bar(ui, |ui| {
             ui.menu_button("Edit", |ui| window.editor.edit_menu(ui));
-            ui.menu_button("View", |ui| window.editor.view_menu(ui, resources.library));
+            ui.menu_button("View", |ui| {
+                window.editor.view_menu(ui, resources.library);
+                ui.separator();
+                viewport_tools::dungeon_texture_menu(
+                    ui,
+                    resources.texture_setting,
+                    resources.game_texture_mode,
+                );
+            });
             ui.menu_button("Help", |ui| {
                 if ui.button("Viewport controls").clicked() {
                     window.show_controls_window = true;

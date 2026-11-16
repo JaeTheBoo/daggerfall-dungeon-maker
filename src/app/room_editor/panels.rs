@@ -14,12 +14,16 @@ use crate::arena2::{world_to_native, RDB_BLOCK_SIDE, WORLD_SCALE};
 use crate::catalog::{flat_description, AssetCatalog};
 use crate::custom_names::CustomNames;
 use crate::encounters::{EncounterTable, Enemy};
+use crate::scene::Scene;
 use crate::scene::{
     action_type_name, axis_name, group_label, trigger_name, EnemyGender, FixedEnemy, FlatData, ObjectAction,
     ObjectId, SceneObject, SceneObjectKind, ACTION_TYPES, ADDED_OBJECTS_GROUP, FIXED_ENEMY_MARKER_RECORD,
-    NO_ENEMY_ID, OUTSIDE_CELL_TOLERANCE, RANDOM_ENEMY_MARKER_RECORD, STARTING_LOCKS, START_MARKER_RECORD,
-    TRIGGER_TYPES,
+    NO_ENEMY_ID, OUTSIDE_CELL_TOLERANCE, RANDOM_ENEMY_MARKER_RECORD, SCALE_RANGE, STARTING_LOCKS,
+    START_MARKER_RECORD, TRIGGER_TYPES,
 };
+
+/// Drag speed of scale fields, per pixel.
+const SCALE_DRAG_SPEED: f32 = 0.01;
 
 /// Drag speed of position fields, in world units per pixel.
 const POSITION_DRAG_SPEED: f32 = 0.02;
@@ -222,11 +226,27 @@ impl RoomEditor {
                 let mut edited = original.clone();
                 let mut go_to = None;
                 let mut is_interacting = false;
+                let model_tags = resources.library.model_tags();
+                let scale_blocker = Scene::scale_blocker(&self.scene.objects, index, &model_tags);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, true])
                     .max_height(ui.available_height() - 40.0)
                     .show(ui, |ui| {
-                        is_interacting = draw_object_fields(ui, &mut edited, resources);
+                        is_interacting = draw_object_fields(ui, &mut edited, resources, scale_blocker);
+                        if self.switched_off_doors.contains(&index) {
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "⚠ Daggerfall Unity switches this door off: it is within {} m of another \
+                                         door (or of the exit door) that comes before it in the dungeon",
+                                        crate::doors::OVERLAP_DISTANCE
+                                    ))
+                                    .color(WARNING_COLOR),
+                                )
+                                .wrap(),
+                            );
+                        }
                         if edited.is_marker() {
                             ui.add_space(8.0);
                             is_interacting |= show_marker(ui, self.id, &mut edited);
@@ -759,6 +779,7 @@ fn draw_object_fields(
     ui: &mut egui::Ui,
     object: &mut SceneObject,
     resources: &mut EditorResources<'_>,
+    scale_blocker: Option<&'static str>,
 ) -> bool {
     let mut responses: Vec<egui::Response> = Vec::new();
     let library = &mut *resources.library;
@@ -868,7 +889,96 @@ fn draw_object_fields(
         ));
     }
 
+    if !matches!(object.kind, SceneObjectKind::Light { .. }) {
+        ui.add_space(8.0);
+        responses.extend(scale_fields(ui, object, scale_blocker));
+    }
+
     responses.iter().any(|response| response.dragged() || response.has_focus())
+}
+
+/// The Scale checkbox and, while it is ticked, the object's scale along each
+/// axis (a flat's width and height). Unticking it gives the object back its
+/// usual size. `blocker` says why the object cannot be scaled, if it cannot.
+fn scale_fields(
+    ui: &mut egui::Ui,
+    object: &mut SceneObject,
+    blocker: Option<&'static str>,
+) -> Vec<egui::Response> {
+    let mut responses = Vec::new();
+    let is_flat = matches!(object.kind, SceneObjectKind::Flat { .. });
+    let mut scaled = object.scale.is_some();
+    // A scaled object that can no longer be scaled can still be unticked.
+    let can_tick = blocker.is_none() || scaled;
+    let hover = match blocker {
+        Some(reason) => format!("{reason}."),
+        None => "Changes the object's size. Only a .dfmod built with Unity shows it in the game; loose                  files keep the object at its usual size. Untick to give it back its usual size."
+            .to_string(),
+    };
+    let checkbox = ui
+        .add_enabled(can_tick, egui::Checkbox::new(&mut scaled, egui::RichText::new("Scale").strong()))
+        .on_hover_text(&hover)
+        .on_disabled_hover_text(&hover);
+    if checkbox.changed() {
+        object.scale = scaled.then_some(glam::Vec3::ONE);
+    }
+    responses.push(checkbox);
+    let Some(scale) = object.scale.as_mut() else {
+        return responses;
+    };
+    let clamp = |value: &mut f32| *value = value.clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end());
+    let axes: &[(&str, usize)] =
+        if is_flat { &[("Width", 0), ("Height", 1)] } else { &[("X", 0), ("Y", 1), ("Z", 2)] };
+    ui.horizontal(|ui| {
+        for &(label, axis) in axes {
+            ui.label(label);
+            responses.push(
+                ui.add(
+                    egui::DragValue::new(&mut scale[axis])
+                        .speed(SCALE_DRAG_SPEED)
+                        .range(SCALE_RANGE)
+                        .max_decimals(3)
+                        .suffix("×"),
+                ),
+            );
+        }
+    });
+    // One value for every axis at once: the first axis's, until it is changed.
+    let mut even = scale.x;
+    ui.horizontal(|ui| {
+        ui.label("All").on_hover_text("Sets every axis to the same scale.");
+        let response = ui.add(
+            egui::DragValue::new(&mut even)
+                .speed(SCALE_DRAG_SPEED)
+                .range(SCALE_RANGE)
+                .max_decimals(3)
+                .suffix("×"),
+        );
+        if response.changed() {
+            *scale = glam::Vec3::splat(even);
+        }
+        responses.push(response);
+        if ui.button("Reset").on_hover_text("Back to 1× along every axis, still ticked.").clicked() {
+            *scale = glam::Vec3::ONE;
+        }
+    });
+    for axis in 0..3 {
+        clamp(&mut scale[axis]);
+    }
+    if is_flat {
+        // Flats have no depth; keep it out of the way.
+        scale.z = 1.0;
+    }
+    if let Some(reason) = blocker {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(format!("⚠ {reason}, so the game will show it at its usual size."))
+                    .color(WARNING_COLOR),
+            )
+            .wrap(),
+        );
+    }
+    responses
 }
 
 /// One object in the cell, offered as the target of an action link.

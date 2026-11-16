@@ -122,6 +122,36 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   the dungeon, mapped as Daggerfall Unity maps it, so it faces the same way as
   in the game. **View > Skybox** turns it off and on. An image that cannot be
   read is named, with the reason, in the top left of the view.
+* **Dungeon textures**: Daggerfall Unity gives every dungeon its own wall and
+  floor textures, swapping Daggerfall's standard dungeon archives (119, 120,
+  122, 123, 124 and 168) for a table of six picked from the dungeon's location
+  id or map id and the climate of its map pixel; building doors (archive 74)
+  take their climate's variant. The dungeon view, and a cell view with a
+  dungeon selected under **Used in**, draw the dungeon's models with the
+  textures the game gives it, as the game draws them (with the standard
+  textures' texture coordinates; the exit door and tapestries without an action
+  keep the standard textures). How the game picks the table is its
+  `RandomDungeonTextures` setting, which the editor reads from Daggerfall
+  Unity's `settings.ini`: classic (0, the default), by climate (1 and 2) or
+  random (3 and 4; main story dungeons keep their classic tables in 0, 1 and
+  3). **View > Dungeon textures** chooses **As in Daggerfall Unity** (your
+  setting), **Standard** (Daggerfall's standard textures everywhere) or any
+  one setting. The random settings use Unity's random numbers, which the
+  editor imitates but has not checked against the game. A project dungeon's
+  textures are those it will have once exported, so it shows the standard ones
+  until it is placed on the world map; the properties panel's **Textures** row
+  lists the table.
+* **Doors the game switches off**: after laying a dungeon out, Daggerfall Unity
+  switches off every action door within 1.4 m of another door, keeping the
+  first in the dungeon's order (cell by cell, and in each cell by object
+  list), and of the start cell's exit door. Two cells with a door each on the
+  edge they share end up with one, as many of Daggerfall's own dungeons do.
+  The dungeon view and the cell view tint those doors red
+  (**View > Switched-off doors** turns it off), the dungeon's properties say
+  how many there are, a switched-off door's properties say so, and the export
+  window lists them. (The game places the exit door's point as if the start
+  cell were at the dungeon's corner, ignoring where it is; the editor does the
+  same so it finds the game's doors.)
 * The dungeon view's properties panel (right) shows the dungeon's name, type,
   location (including its region) and cells. Hovering a cell in its list highlights it, and
   double-clicking opens it. The name and type of a project dungeon can be
@@ -261,11 +291,31 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   are saved in project files. In the viewport each link is a red line, drawn
   over walls, from the object to the one it triggers, with an arrowhead at the
   target (**View > Action links** turns them off). Links stay within one cell.
+* **Scale**: ticking **Scale** in a model's or flat's properties lets you
+  change its size: X, Y and Z for a model (along its own axes), width and
+  height for a flat, from 0.05× to 20×, or every axis at once with **All**.
+  **Reset** sets it back to 1× and unticking **Scale** gives the object back its
+  usual size. Daggerfall's cells cannot store a size, so only a `.dfmod` shows
+  it in the game: there the export leaves scaled objects out of their cells and
+  a script in the mod puts them back, at their size, when the dungeon is laid
+  out. Loose files keep them at their usual size, and the export window warns
+  about it. Objects the game gives behaviour of their own cannot be scaled:
+  lights, markers, treasure, people (the game makes them NPCs that quests can
+  use), doors, the exit door, objects with an action and objects linked to
+  another's action (the checkbox says why). Scaled tapestries and banners have
+  no collision, as in the game. A scaled torch or animal is silent (the game
+  only gives its own copies their sound), and models that other mods replace
+  are shown as Daggerfall's own when scaled. The other objects in the cell keep
+  their positions, so saved games still find them. Checking for openings to
+  empty space uses scaled models' usual size.
 * **Preview action**, under Game settings, appears for objects whose action
   moves something: it plays the action in the viewport as Daggerfall Unity
   does, with every object down the chain moving at the same time (moves,
   slides, rotations, and doors that an action opens swinging open), holds the
   end for half a second and puts everything back. The cell is not changed.
+  Like Daggerfall Unity, it spins wheels (such as model 61032) a full turn
+  around their axle and turns coffin lids 90°, whatever axis their action
+  stores, and reads a few single traps' unusual axis values as the game does.
 * Several objects can be selected with Shift+click (in the viewport or the
   outliner; Shift+click a selected object to take it out) or by dragging a box
   over empty space in the viewport: the objects inside it light up, and
@@ -328,8 +378,9 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   selected and shown around it (in a cell window of the open dungeon, the cell
   opens in a cell window as if double-clicked in the dungeon view).
 * **View** toggles back-face hiding (to look into cells from outside), the grid,
-  the block outline, the asset palette, models, flats, editor markers, lights
-  and action links.
+  the block outline, the asset palette, models, flats, editor markers, lights,
+  action links and the red tint of doors the game switches off, and chooses
+  the dungeon textures (see **Dungeon textures** above).
 
 ### Projects
 
@@ -382,6 +433,9 @@ dungeons you choose to the game as new locations. The window has:
   with an exit door, a free spot in a region, and a name no other location of its
   region has. Anything missing is listed under it, and the export waits until it
   is fixed or the dungeon is unticked. **Check again** re-checks after changes.
+  Notes in yellow under a dungeon say what the game does differently from the
+  editor without stopping the export: the doors it switches off, and (for a
+  dungeon replacing Castle Daggerfall) whether its foyer doors fix still works.
 * **Output**: the folder to export into. A folder named after the mod is made
   there, holding:
   * `WorldData/location-<region>-<index>.json` for each dungeon that replaces
@@ -405,7 +459,11 @@ dungeons you choose to the game as new locations. The window has:
   dungeon has custom music, the window warns that custom music is not supported
   in loose files and those dungeons fall back to the game's own music; if one has
   a skybox, it warns that skyboxes do not work in loose files and those dungeons
-  stay black. The export still goes ahead. Tick the platforms to build for;
+  stay black; if one has scaled objects, it warns that scaled objects do not
+  export in loose files, only in a `.dfmod`, and they keep their usual size. The
+  export still goes ahead. An export for a `.dfmod` leaves scaled objects out of
+  the `WorldData` cells (the mod's script adds them), so for loose files export
+  with **Files only**. Tick the platforms to build for;
   each gets its own `.dfmod` in a `Windows`, `Linux` or `macOS` folder next to the
   files, and **Copy to Mods folder** also puts this computer's build into
   Daggerfall Unity's `Mods` folder.
@@ -419,7 +477,20 @@ dungeons you choose to the game as new locations. The window has:
 
 The output folder, Unity editor and platforms are remembered between runs.
 Block names, location ids and the mod's GUID stay the same from one export to
-the next, so saved games keep working with an updated mod.
+the next, so saved games keep working with an updated mod. A new dungeon's
+location id is picked from its map pixel, in the project's order, the same
+whichever dungeons are exported with it (the dungeon textures depend on it).
+
+Castle Daggerfall has a fix in Daggerfall Unity: a player who teleports into
+the castle can open the two magically held doors in its foyer (model 55004 in
+its start cell, `S0000160.RDB`), so they are not locked in the throne room.
+The game finds the doors by their ids, which are the cell's position in
+`BLOCKS.BSA` plus the doors' offsets in it. A project dungeon replacing Castle
+Daggerfall that uses its own copy of that cell, with the doors where they
+were, exports the cell with the original cell's position and the doors'
+original offsets, so the fix still works. If the doors were moved or removed,
+or the copy has more objects than fit under the original cell's ids, the
+export window says the fix will not work.
 
 ### Enemy markers
 
@@ -539,9 +610,11 @@ implemented yet.
 | `src/project.rs` | Project files (`.ddm`): the user's cells, dungeons and folders |
 | `src/encounters.rs` | Dungeon types and the enemies random enemy markers can become |
 | `src/music.rs`, `src/arena2/hmi.rs` | Dungeon music: how the game picks a song, reading Daggerfall's HMI songs, and playing them |
-| `src/export/` | Exporting the project as a Daggerfall Unity mod: world data JSON, manifest, music script, and the .dfmod built with Unity |
+| `src/export/` | Exporting the project as a Daggerfall Unity mod: world data JSON, manifest, music, skybox and scaled-object scripts, and the .dfmod built with Unity |
 | `src/catalog.rs` | Placeable assets, gathered from the game data at run time |
 | `src/connectors.rs` | Open faces and doorways of models, for snapping pieces together |
+| `src/dungeon_textures.rs` | The wall and floor textures Daggerfall Unity gives each dungeon |
+| `src/doors.rs` | The doors Daggerfall Unity switches off because they overlap another door |
 | `src/camera.rs`, `src/picking.rs` | Orbit camera and ray picking |
 | `src/render/` | wgpu renderer (models, billboards, helper lines) drawing into an egui texture |
 | `src/app/` | egui application: main window, menus, dialogs and cell editor windows |

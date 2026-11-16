@@ -59,6 +59,7 @@ pub struct Arena2Library {
     dungeon_cache: Option<Arc<[DungeonDefinition]>>,
     world_map_cache: Option<Arc<WorldMap>>,
     model_tag_cache: Option<Arc<HashMap<u32, String>>>,
+    location_id_cache: std::sync::OnceLock<Arc<HashSet<u16>>>,
 }
 
 impl Arena2Library {
@@ -118,6 +119,7 @@ impl Arena2Library {
             dungeon_cache: None,
             world_map_cache: None,
             model_tag_cache: None,
+            location_id_cache: std::sync::OnceLock::new(),
         })
     }
 
@@ -280,8 +282,12 @@ impl Arena2Library {
     }
 
     /// The id of every location and dungeon record in `MAPS.BSA` (empty without it).
-    pub fn location_ids(&self) -> HashSet<u16> {
-        self.maps_archive.as_ref().map(read_all_location_ids).unwrap_or_default()
+    pub fn location_ids(&self) -> Arc<HashSet<u16>> {
+        self.location_id_cache
+            .get_or_init(|| {
+                Arc::new(self.maps_archive.as_ref().map(read_all_location_ids).unwrap_or_default())
+            })
+            .clone()
     }
 
     /// The HMI song called `name` in `MIDI.BSA` (for example `DUNGEON5.HMI`),
@@ -301,6 +307,19 @@ impl Arena2Library {
     /// Whether `BLOCKS.BSA` has a block called `name`.
     pub fn has_block(&self, name: &str) -> bool {
         self.blocks_archive.record_by_name(name).is_some()
+    }
+
+    /// The number Daggerfall Unity gives the block called `name`: where its
+    /// record starts in `BLOCKS.BSA`. Added to an object's offset in the block
+    /// it makes the id the game knows the object by in saved games.
+    pub fn block_position(&self, name: &str) -> Option<i64> {
+        self.blocks_archive.record_offset_by_name(name).map(|offset| offset as i64)
+    }
+
+    /// The size in bytes of the block called `name`'s record in `BLOCKS.BSA`;
+    /// its objects' offsets are below it.
+    pub fn block_record_size(&self, name: &str) -> Option<usize> {
+        self.blocks_archive.record_by_name(name).map(<[u8]>::len)
     }
 
     /// Parses the RDB block called `name`.

@@ -229,6 +229,12 @@ impl RoomEditor {
             ui.ctx().request_repaint();
         }
         let selected_objects = self.selected_indices();
+        self.switched_off_doors = self.find_switched_off_doors(resources.library);
+        // The selected dungeon's textures, as the cell looks there in the game.
+        let dungeon_textures = match self.dungeon_context {
+            Some(_) => resources.dungeon_textures(self.dungeon_identity.as_ref()),
+            None => None,
+        };
         let water_planes: Vec<Vec3> =
             self.scene.water_level().map(|height| Vec3::new(0.0, height, 0.0)).into_iter().collect();
         let request = FrameRequest {
@@ -254,6 +260,8 @@ impl RoomEditor {
             snap_grid_spacing: self.snap.enabled.then_some(self.snap.step),
             size_in_pixels: size_in_pixels(ui, rect),
             sky: None,
+            dungeon_textures,
+            warned_objects: &self.switched_off_doors,
         };
         paint_scene(ui, rect, resources, &mut self.target, &request);
 
@@ -880,7 +888,13 @@ impl RoomEditor {
         for object in self.scene.objects.iter().chain(context.into_iter().flatten()) {
             if let SceneObjectKind::Model { model_id, .. } = object.kind {
                 (model_id, object.visible).hash(&mut hasher);
-                for value in object.position.to_array().into_iter().chain(object.rotation_degrees.to_array())
+                let scale = object.scale_or_one().to_array();
+                for value in object
+                    .position
+                    .to_array()
+                    .into_iter()
+                    .chain(object.rotation_degrees.to_array())
+                    .chain(scale)
                 {
                     value.to_bits().hash(&mut hasher);
                 }

@@ -309,7 +309,7 @@ impl DoorSlots {
 
 /// The box around `object`'s model box (`min` to `max` in model space), in world space.
 fn world_box(object: &SceneObject, min: Vec3, max: Vec3) -> (Vec3, Vec3) {
-    let rotation = object.rotation();
+    let matrix = object.model_matrix();
     let mut low = Vec3::splat(f32::MAX);
     let mut high = Vec3::splat(f32::MIN);
     for corner in 0..8 {
@@ -318,7 +318,7 @@ fn world_box(object: &SceneObject, min: Vec3, max: Vec3) -> (Vec3, Vec3) {
             if corner & 2 == 0 { min.y } else { max.y },
             if corner & 4 == 0 { min.z } else { max.z },
         );
-        let world = object.position + rotation * point;
+        let world = matrix.transform_point3(point);
         low = low.min(world);
         high = high.max(world);
     }
