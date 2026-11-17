@@ -67,8 +67,6 @@ const MAX_MODELS_PER_BLOCK: usize = 750;
 const FIRST_NEW_BLOCK_NUMBER: u64 = 9_000_000;
 /// How many new block numbers there are.
 const NEW_BLOCK_NUMBERS: u64 = 1_000_000;
-/// Block letters (types) a new block can keep from the cell it was copied from.
-const BLOCK_LETTERS: [char; 6] = ['N', 'W', 'L', 'S', 'B', 'M'];
 /// Daggerfall Unity identifies saved objects (opened doors, killed enemies)
 /// by their block's position plus their own. Daggerfall's blocks sit below
 /// 30 million; new blocks are spaced from here so none overlap.
@@ -1076,17 +1074,11 @@ fn readme_text(mod_files: &ModFiles) -> String {
     text
 }
 
-/// A new block name for the project cell `room`: the letter (block type) of
-/// the cell it was copied from, then a number made from the cell's id, so
-/// the name stays the same from one export to the next.
+/// A new block name for the project cell `room`: the letter of its category
+/// (block type), then a number made from the cell's id, so the name stays the
+/// same from one export to the next.
 fn new_block_name(room: &ProjectRoom, library: &Arena2Library, taken: &mut HashSet<String>) -> String {
-    let letter = room
-        .based_on
-        .as_deref()
-        .and_then(|name| name.chars().next())
-        .map(|letter| letter.to_ascii_uppercase())
-        .filter(|letter| BLOCK_LETTERS.contains(letter))
-        .unwrap_or('N');
+    let letter = room.category.letter();
     let mut number = room.id % NEW_BLOCK_NUMBERS;
     loop {
         let name = format!("{letter}{:07}.RDB", FIRST_NEW_BLOCK_NUMBER + number);
@@ -1265,6 +1257,7 @@ mod tests {
             visible: true,
             next: None,
             scale: None,
+            prefab: None,
         };
         let objects = [object(1), object(ADDED_OBJECTS_GROUP), object(0)];
         assert_eq!(object_groups(&objects), vec![vec![2], vec![0], vec![1]]);

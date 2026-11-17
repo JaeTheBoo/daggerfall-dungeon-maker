@@ -6,21 +6,23 @@
 
 use eframe::egui;
 
+use super::asset_palette::{PREFAB_COLOR, PREFAB_MARK};
 use super::history::SceneEdit;
 use super::RoomEditor;
-use crate::app::room_browser::{category_description, show_room_name_field};
+use crate::app::room_browser::{category_text, show_category_choice, show_room_name_field};
 use crate::app::viewport_tools::EditorResources;
 use crate::arena2::{world_to_native, RDB_BLOCK_SIDE, WORLD_SCALE};
 use crate::catalog::{flat_description, AssetCatalog};
 use crate::custom_names::CustomNames;
 use crate::encounters::{EncounterTable, Enemy};
-use crate::scene::Scene;
+use crate::project::CellCategory;
 use crate::scene::{
     action_type_name, axis_name, group_label, trigger_name, EnemyGender, FixedEnemy, FlatData, ObjectAction,
     ObjectId, SceneObject, SceneObjectKind, ACTION_TYPES, ADDED_OBJECTS_GROUP, FIXED_ENEMY_MARKER_RECORD,
     NO_ENEMY_ID, OUTSIDE_CELL_TOLERANCE, RANDOM_ENEMY_MARKER_RECORD, SCALE_RANGE, STARTING_LOCKS,
     START_MARKER_RECORD, TRIGGER_TYPES,
 };
+use crate::scene::{PrefabMember, Scene};
 
 /// Drag speed of scale fields, per pixel.
 const SCALE_DRAG_SPEED: f32 = 0.01;
@@ -76,18 +78,21 @@ impl RoomEditor {
         self.viewport.selection_changed_in_viewport = false;
     }
 
-    /// Draws one row per object in `group_index`.
+    /// Draws one row per object in `group_index`. The objects of a placed
+    /// prefab are marked; clicking one selects the whole prefab.
     fn show_outliner_group(
         &mut self,
         ui: &mut egui::Ui,
         group_index: usize,
-        resources: &EditorResources<'_>,
+        resources: &mut EditorResources<'_>,
     ) {
         let mut visibility_change = None;
         let mut menu_choice = None;
         let mut clicked = None;
+        let mut menu_opened = false;
         let selected = self.selected_indices();
         let shift_held = ui.input(|input| input.modifiers.shift);
+        let mut prefab_name = std::mem::take(&mut self.prefab_name);
         for (index, object) in self.scene.objects.iter().enumerate() {
             if object.group_index != group_index {
                 continue;
@@ -100,31 +105,43 @@ impl RoomEditor {
                 let is_selected = selected.contains(&index);
                 let name = object_display_name(object, resources.custom_names, resources.catalog);
                 let outside = self.is_outside_cell(index);
-                let label = format!("{}{name}  ·  {}", if outside { "⚠ " } else { "" }, object.kind_label());
+                let mark = match (outside, &object.prefab) {
+                    (true, _) => "⚠ ".to_string(),
+                    (false, Some(_)) => format!("{PREFAB_MARK} "),
+                    (false, None) => String::new(),
+                };
+                let label = format!("{mark}{name}  ·  {}", object.kind_label());
                 let mut response = ui.selectable_label(is_selected, label);
                 if outside {
                     response = response.on_hover_text(super::outside_cell_warning(self.outside_cell[index]));
                 }
-                // Right-clicking a row selects it too, like the viewport does, unless
-                // several objects are selected: they can only be moved, so they have no menu.
-                if response.clicked() || (response.secondary_clicked() && selected.len() <= 1) {
+                if let Some(member) = &object.prefab {
+                    response = response.on_hover_text(format!(
+                        "Part of the prefab {}: clicking it selects the whole prefab. Right-click to break it up",
+                        member.name
+                    ));
+                }
+                // Right-clicking a row selects it too, like the viewport does, unless it is already
+                // selected: then the menu is for the selection, which can become a prefab.
+                if response.clicked() || (response.secondary_clicked() && !is_selected) {
                     clicked = Some(index);
                 }
+                menu_opened |= response.secondary_clicked();
                 if is_selected && self.viewport.selection_changed_in_viewport {
                     response.scroll_to_me(Some(egui::Align::Center));
                 }
                 response.context_menu(|ui| {
-                    if selected.len() > 1 && is_selected {
-                        ui.label("Several objects are selected; they can only be moved");
-                        return;
-                    }
                     if let Some(info) = self.object_menu_info(index, resources) {
-                        if let Some(choice) = super::object_menu(ui, &info) {
+                        if let Some(choice) = super::object_menu(ui, &info, &mut prefab_name) {
                             menu_choice = Some((choice, index));
                         }
                     }
                 });
             });
+        }
+        self.prefab_name = prefab_name;
+        if menu_opened {
+            self.prepare_object_menu(resources);
         }
         if let Some(index) = clicked {
             // Shift+click adds a row to the selection, or takes it out.
@@ -137,13 +154,78 @@ impl RoomEditor {
         if let Some((choice, index)) = menu_choice {
             self.apply_object_menu(choice, index, resources);
         }
+        // A placed prefab is shown or hidden whole.
         if let Some((index, visible)) = visibility_change {
             if self.can_edit() {
-                let object = &mut self.scene.objects[index];
-                self.history.record(SceneEdit::Replace { index, object: object.clone() });
-                object.visible = visible;
+                let indices = self.scene.prefab_of(index);
+                let reverts = indices
+                    .iter()
+                    .map(|&index| SceneEdit::Replace { index, object: self.scene.objects[index].clone() })
+                    .collect();
+                for &index in &indices {
+                    self.scene.objects[index].visible = visible;
+                }
+                self.history.record(SceneEdit::Group(reverts));
             }
         }
+    }
+
+    /// With one placed prefab selected: what it is, its objects, and what can be done with it.
+    fn show_prefab_selection(
+        &mut self,
+        ui: &mut egui::Ui,
+        member: &PrefabMember,
+        members: &[usize],
+        resources: &mut EditorResources<'_>,
+    ) {
+        ui.label(
+            egui::RichText::new(format!("{PREFAB_MARK} Prefab: {}", member.name))
+                .strong()
+                .color(PREFAB_COLOR),
+        )
+        .on_hover_text(
+            "A placed prefab. Its objects stay together: they move, turn, copy and delete as one, and \
+                 cannot be changed one by one until the prefab is broken up.",
+        );
+        ui.label(
+            egui::RichText::new(
+                "Drag the arrows to move it, R, Q or E to turn it; Ctrl+C, Ctrl+D or Del to copy, duplicate or \
+                 delete it. Break the prefab to change its objects one by one.",
+            )
+            .weak(),
+        );
+        ui.add_space(6.0);
+        ui.label(format!("{} objects", members.len()));
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .max_height(ui.available_height() - 40.0)
+            .show(ui, |ui| {
+                for &index in members {
+                    let Some(object) = self.scene.objects.get(index) else { continue };
+                    let name = object_display_name(object, resources.custom_names, resources.catalog);
+                    ui.label(format!("{name}  ·  {}", object.kind_label()));
+                }
+            });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Frame").on_hover_text("Moves the camera to show the prefab (F)").clicked() {
+                self.focus_selection(resources.library);
+            }
+            if ui.button("Duplicate").on_hover_text("Adds a copy of the prefab next to it (Ctrl+D)").clicked()
+            {
+                self.duplicate_selection();
+            }
+            if ui.button("Delete").on_hover_text("Removes the prefab's objects from the cell (Del)").clicked()
+            {
+                self.delete_selection();
+            }
+            let hover = "Turns the prefab back into separate objects, each of which can then be changed";
+            if ui.button("Break Prefab").on_hover_text(hover).clicked() {
+                if let Some(&index) = members.first() {
+                    self.break_prefab(index);
+                }
+            }
+        });
     }
 
     /// With several objects selected: lists them, and explains what can be done with them.
@@ -170,7 +252,9 @@ impl RoomEditor {
                 for &index in &selected {
                     let Some(object) = self.scene.objects.get(index) else { continue };
                     let name = object_display_name(object, resources.custom_names, resources.catalog);
-                    let label = format!("{name}  ·  {}", object.kind_label());
+                    let mark =
+                        if object.prefab.is_some() { format!("{PREFAB_MARK} ") } else { String::new() };
+                    let label = format!("{mark}{name}  ·  {}", object.kind_label());
                     if ui
                         .selectable_label(false, label)
                         .on_hover_text("Click to select only this object")
@@ -195,6 +279,11 @@ impl RoomEditor {
                 ui.heading("Properties");
                 ui.separator();
 
+                // A placed prefab's objects cannot be changed one by one.
+                if let Some((member, members)) = self.selected_prefab() {
+                    self.show_prefab_selection(ui, &member, &members, resources);
+                    return;
+                }
                 if self.has_multiple_selection() {
                     self.show_multiple_selection(ui, resources);
                     return;
@@ -391,12 +480,28 @@ impl RoomEditor {
             ui.label(self.project_room_name.clone().unwrap_or_else(|| block_name.clone()));
             ui.end_row();
 
-            // A new cell is not based on a Daggerfall block, so it has no category.
-            if !block_name.is_empty() {
-                ui.label("Category").on_hover_text("Kind of cell, from the first letter of its block name: N interior, W interior with water, M interior variant, S special (quest), B border cap.");
-                let letter = block_name.chars().next().unwrap_or('?');
-                ui.label(format!("{letter} · {}", category_description(&block_name)));
-                ui.end_row();
+            // A project cell's category can be changed; a Daggerfall cell's comes from its block name.
+            match self.cell_category.as_mut().filter(|_| !self.read_only) {
+                Some(category) => {
+                    ui.label("Category").on_hover_text(
+                        "Kind of cell: N interior, W interior with water, M interior variant, S special \
+                         (quest), B border cap. Its letter starts the block name the cell is exported \
+                         under. The water itself comes from the water level below, not the category.",
+                    );
+                    show_category_choice(ui, self.id.with("cell_category"), category);
+                    ui.end_row();
+                }
+                None => {
+                    if let Some(category) = CellCategory::of_block(&block_name) {
+                        ui.label("Category").on_hover_text(
+                            "Kind of cell, from the first letter of its block name: N interior, W interior \
+                             with water, M interior variant, S special (quest), B border cap. Copy the cell \
+                             into your project to change it.",
+                        );
+                        ui.label(category_text(category));
+                        ui.end_row();
+                    }
+                }
             }
 
             ui.label("Source").on_hover_text("Where the cell comes from: Daggerfall's own data (read-only), or a copy in your project.");

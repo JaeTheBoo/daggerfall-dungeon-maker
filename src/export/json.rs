@@ -766,6 +766,7 @@ mod tests {
             visible: true,
             next: None,
             scale: None,
+            prefab: None,
         }
     }
 

@@ -32,6 +32,7 @@ pub mod export;
 pub mod merge;
 pub mod music;
 pub mod picking;
+pub mod prefabs;
 pub mod project;
 pub mod render;
 pub mod scene;

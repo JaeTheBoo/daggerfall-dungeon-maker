@@ -17,7 +17,7 @@ use glam::Vec3;
 
 use super::entrance_picker::{entrance_label, EntrancePicker, EntranceRequest};
 use super::project_panel::{DragPayload, OpenedItem};
-use super::room_browser::{category_description, show_room_name_field};
+use super::room_browser::show_room_name_field;
 use super::viewport_tools::{
     aspect_ratio, draw_unclosed_openings, find_unclosed_openings, handle_camera_input, paint_scene,
     size_in_pixels, EditorResources, ViewportProjection, UNCLOSED_CHECK_INTERVAL,
@@ -31,7 +31,7 @@ use crate::dungeon_textures::{DungeonIdentity, DungeonTextures};
 use crate::encounters::DungeonType;
 use crate::music::{DungeonSong, MusicPlayer, DUNGEON_SONGS};
 use crate::picking::{intersect_horizontal_plane, pick_object, PickOptions};
-use crate::project::{DungeonLocation, ItemId, Project, ProjectDungeonRoom};
+use crate::project::{CellCategory, DungeonLocation, ItemId, Project, ProjectDungeonRoom};
 use crate::render::{FrameRequest, RoomOutline, ViewSettings, ViewportTarget};
 use crate::scene::{ObjectId, Scene, SceneObject};
 
@@ -101,6 +101,8 @@ pub struct DungeonRoom {
     pub scene: Scene,
     /// The project room used here, or `None` for the Daggerfall room (which cannot be edited).
     pub project_room: Option<ItemId>,
+    /// The kind of cell: the project room's, or the Daggerfall block's.
+    pub category: CellCategory,
     /// Index of the room in the dungeon layout it was loaded from.
     layout_index: usize,
     /// Whether the room's objects were changed since the dungeon was loaded.
@@ -242,6 +244,7 @@ impl DungeonView {
             .enumerate()
             .filter_map(|(layout_index, placement)| match load_room_scene(placement, project, library) {
                 Ok((scene, project_room)) => Some(DungeonRoom {
+                    category: cell_category(placement, project_room, project),
                     has_exit: match project_room {
                         Some(_) => scene.objects.iter().any(SceneObject::is_exit_door),
                         None => cell_has_exit(&placement.block_name, library),
@@ -517,6 +520,7 @@ impl DungeonView {
         let (scene, project_room) = load_room_scene(placement, project, library)?;
         let was_empty = self.rooms.is_empty();
         self.rooms.push(DungeonRoom {
+            category: cell_category(placement, project_room, project),
             has_exit: match project_room {
                 Some(_) => scene.objects.iter().any(SceneObject::is_exit_door),
                 None => cell_has_exit(&placement.block_name, library),
@@ -654,7 +658,7 @@ impl DungeonView {
             Some(room) => format!(
                 "{} ({}) - double-click to edit, right-click to name it",
                 custom_names.room_label(&room.block_name),
-                category_description(&room.block_name)
+                room.category.label()
             ),
             None => "Hover a cell to highlight it, double-click to open it in a cell editor".to_string(),
         };
@@ -696,6 +700,13 @@ impl DungeonView {
                     project_room.objects = room.scene.objects.clone();
                 }
             }
+        }
+    }
+
+    /// Gives room `room_index` the category `category`, changed in its room window.
+    pub fn set_room_category(&mut self, room_index: usize, category: CellCategory) {
+        if let Some(room) = self.rooms.get_mut(room_index) {
+            room.category = category;
         }
     }
 
@@ -836,7 +847,7 @@ impl DungeonView {
                                 "{} ({})\nDouble-click to open it in a cell editor, Shift+click to select several, \
                                  right-click for more",
                                 room.block_name,
-                                category_description(&room.block_name)
+                                room.category.label()
                             ));
                         if response.hovered() {
                             hovered_row = Some(room_index);
@@ -1325,7 +1336,8 @@ impl DungeonView {
             highlighted_group: highlighted_room,
             highlighted_groups: &self.box_rooms,
             selected_groups: &self.selected_rooms,
-            placement_preview: None,
+            placement_preview: &[],
+            highlighted_objects: &[],
             context_scene: drop_spot.and(self.drop_preview.as_ref()).map(|preview| &preview.placed),
             ground_squares: &[],
             water_planes: &self.water_planes,
@@ -1493,7 +1505,7 @@ impl DungeonView {
                 "{} ({})\nDouble-click to edit this cell · drag to move it · Delete to remove it\n\
                  Shift+click or Shift+drag a box to select several, then right-click to merge them",
                 custom_names.room_label(&room.block_name),
-                category_description(&room.block_name)
+                room.category.label()
             );
             painter.text(
                 pointer + egui::vec2(16.0, 16.0),
@@ -1942,6 +1954,18 @@ fn cell_has_exit(block_name: &str, library: &mut Arena2Library) -> bool {
     library
         .rdb_block(block_name)
         .is_ok_and(|block| Scene::from_rdb_block(&block).objects.iter().any(SceneObject::is_exit_door))
+}
+
+/// The category of the cell `placement` uses: that of its project room
+/// `project_room`, or of the Daggerfall block it names.
+fn cell_category(
+    placement: &ProjectDungeonRoom,
+    project_room: Option<ItemId>,
+    project: &Project,
+) -> CellCategory {
+    project_room
+        .and_then(|room_id| project.room(room_id))
+        .map_or_else(|| CellCategory::of_copy(Some(&placement.block_name)), |room| room.category)
 }
 
 /// Builds the scene of one dungeon room: the project room it uses, or the

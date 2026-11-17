@@ -11,10 +11,14 @@
 //! a purple line, and so does every object its action sets moving, down the
 //! chain to its end. The lines are worked out afresh each frame, so they
 //! follow any change.
+//!
+//! A placed prefab under the pointer is lit up whole, with a green box around
+//! its objects; so is a selected one.
 
 use eframe::egui;
 use glam::{Quat, Vec2, Vec3};
 
+use super::asset_palette::{PlaceableAsset, PREFAB_COLOR};
 use super::history::SceneEdit;
 use super::panels::{object_display_name, percent};
 use super::RoomEditor;
@@ -176,8 +180,8 @@ pub struct ViewportState {
     /// The open face the model being placed snaps to, to outline it.
     snap_face: Option<OpenFace>,
     last_pointer_position: Option<egui::Pos2>,
-    /// Ghost of the armed asset at the position it would be placed.
-    placement_preview: Option<SceneObject>,
+    /// Ghost of the armed asset (each object of a prefab) where it would be placed.
+    placement_preview: Vec<SceneObject>,
     /// Object whose action is being tied to a target chosen with the mouse.
     pub tying_from: Option<ObjectId>,
     /// Object whose right-click menu is open.
@@ -189,6 +193,12 @@ pub struct ViewportState {
     /// Faded surrounding cell under the pointer (index into the context's cells).
     hovered_context_cell: Option<usize>,
 }
+
+/// How far the box around a placed prefab stands off its objects, in world units.
+const PREFAB_BOX_MARGIN: f32 = 0.1;
+/// The twelve edges of a box, as pairs of [`crate::scene::box_corners`] indices.
+const BOX_EDGES: [(usize, usize); 12] =
+    [(0, 1), (2, 3), (4, 5), (6, 7), (0, 2), (1, 3), (4, 6), (5, 7), (0, 4), (1, 5), (2, 6), (3, 7)];
 
 /// Colour of the line drawn from an object to the pointer while tying its action.
 const TYING_LINE_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 60, 60);
@@ -210,13 +220,13 @@ impl RoomEditor {
         let gizmo_handles =
             if is_placing || tying_from.is_some() { Vec::new() } else { self.gizmo_handles(&projection) };
         if let Some(source) = tying_from {
-            self.viewport.placement_preview = None;
+            self.viewport.placement_preview.clear();
             self.viewport.snap_face = None;
             self.handle_tying(&response, &projection, source, resources);
         } else if is_placing {
             self.handle_placement(ui, &response, &projection, resources);
         } else {
-            self.viewport.placement_preview = None;
+            self.viewport.placement_preview.clear();
             self.viewport.snap_face = None;
             self.handle_gizmo_and_picking(ui, &response, &projection, &gizmo_handles, resources);
             self.handle_object_menu(&response, &projection, resources);
@@ -237,6 +247,8 @@ impl RoomEditor {
         };
         let water_planes: Vec<Vec3> =
             self.scene.water_level().map(|height| Vec3::new(0.0, height, 0.0)).into_iter().collect();
+        // A prefab under the pointer lights up whole.
+        let hovered_prefab = self.hovered_prefab();
         let request = FrameRequest {
             scene: Some(preview.as_ref().unwrap_or(&self.scene)),
             camera: &self.camera,
@@ -244,10 +256,11 @@ impl RoomEditor {
             hovered_object: self.viewport.hovered_object,
             selected_objects: &selected_objects,
             hovered_objects: &self.viewport.selection_box_objects,
+            highlighted_objects: &hovered_prefab,
             highlighted_group: None,
             highlighted_groups: &[],
             selected_groups: &[],
-            placement_preview: self.viewport.placement_preview.as_ref(),
+            placement_preview: &self.viewport.placement_preview,
             context_scene: self.dungeon_context.as_ref().map(|context| &context.scene),
             ground_squares: &[],
             water_planes: &water_planes,
@@ -280,6 +293,7 @@ impl RoomEditor {
         if preview.is_none() {
             draw_unclosed_openings(&painter, &projection, &self.unclosed);
         }
+        self.draw_prefab_boxes(&painter, &projection, &hovered_prefab, resources.library);
         self.draw_gizmo(&painter, &gizmo_handles);
         self.draw_snap_face(&painter, &projection);
         if let Some(source) = self.viewport.tying_from {
@@ -288,20 +302,18 @@ impl RoomEditor {
         self.draw_hover_label(&painter, &response, resources);
     }
 
-    /// Opens an object's menu on right-click (without dragging, which orbits) and carries out the choice.
+    /// Opens an object's menu on right-click (without dragging, which orbits)
+    /// and carries out the choice. Right-clicking an object outside the
+    /// selection selects it (with its prefab); right-clicking one of several
+    /// selected objects, or empty space while several are selected, opens the
+    /// menu for the selection, which can become a prefab.
     fn handle_object_menu(
         &mut self,
         response: &egui::Response,
         projection: &ViewportProjection,
         resources: &mut EditorResources<'_>,
     ) {
-        if response.secondary_clicked() && self.has_multiple_selection() {
-            self.status_message =
-                "Several objects are selected: move them with the arrows, or copy (Ctrl+C), \
-                 duplicate (Ctrl+D) or delete (Del) them"
-                    .into();
-            self.viewport.context_object = None;
-        } else if response.secondary_clicked() {
+        if response.secondary_clicked() {
             let picked = response.interact_pointer_pos().and_then(|pointer| {
                 self.pick_visible_object(
                     projection.screen_to_ndc(pointer),
@@ -309,16 +321,24 @@ impl RoomEditor {
                     resources.library,
                 )
             });
-            self.viewport.context_object = picked;
-            if let Some(index) = picked {
-                self.select_objects(vec![index]);
-                self.viewport.selection_changed_in_viewport = true;
-            }
+            self.viewport.context_object = match picked {
+                Some(index) => {
+                    if !self.selected_indices().contains(&index) {
+                        self.select_objects(vec![index]);
+                        self.viewport.selection_changed_in_viewport = true;
+                    }
+                    Some(index)
+                }
+                None if self.has_multiple_selection() => self.selected_object,
+                None => None,
+            };
+            self.prepare_object_menu(resources);
         }
         let info = self.viewport.context_object.and_then(|index| self.object_menu_info(index, resources));
         let mut choice = None;
+        let prefab_name = &mut self.prefab_name;
         response.context_menu(|ui| match &info {
-            Some(info) => choice = super::object_menu(ui, info),
+            Some(info) => choice = super::object_menu(ui, info, prefab_name),
             None => ui.close_menu(),
         });
         if let (Some(choice), Some(index)) = (choice, self.viewport.context_object) {
@@ -583,9 +603,8 @@ impl RoomEditor {
                 _ => {
                     self.select_objects(picked.into_iter().collect());
                     self.viewport.selection_changed_in_viewport = picked.is_some();
-                    if let Some(description) = picked.and_then(|index| self.describe_object(index, resources))
-                    {
-                        self.status_message = format!("Selected {description}");
+                    if picked.is_some() {
+                        self.describe_selection(resources);
                     }
                 }
             }
@@ -939,6 +958,14 @@ impl RoomEditor {
     /// Puts what is selected in the status bar.
     fn describe_selection(&mut self, resources: &EditorResources<'_>) {
         let selected = self.selected_indices();
+        if let Some((member, members)) = self.selected_prefab() {
+            self.status_message = format!(
+                "Selected the prefab {} ({} objects); right-click it to break it up",
+                member.name,
+                members.len()
+            );
+            return;
+        }
         self.status_message = match selected.as_slice() {
             [] => "Nothing selected".into(),
             [index] => match self.describe_object(*index, resources) {
@@ -1109,12 +1136,13 @@ impl RoomEditor {
                     library,
                 )
             });
-            let mut preview =
-                surface_point.map(|point| armed.asset.create_object(library, point, armed.yaw_degrees));
-            // Snap onto an open face nearby, unless Alt is held.
+            let mut preview = surface_point
+                .map(|point| armed.asset.create_objects(library, resources.prefabs, point, armed.yaw_degrees))
+                .unwrap_or_default();
+            // A single model snaps onto an open face nearby, unless Alt is held.
             self.viewport.snap_face = None;
             if !ui.input(|input| input.modifiers.alt) {
-                if let Some(object) = preview.as_mut() {
+                if let [object] = preview.as_mut_slice() {
                     if let Some(snap) = self.find_snap(object, &resources.catalog.door_slots, library) {
                         object.position = snap.position;
                         if let Some(rotation) = snap.rotation {
@@ -1130,29 +1158,101 @@ impl RoomEditor {
         if !response.clicked_by(egui::PointerButton::Primary) {
             return;
         }
-        let Some(object) = self.viewport.placement_preview.clone() else { return };
+        if self.viewport.placement_preview.is_empty() {
+            return;
+        }
         if !self.can_edit() {
             self.palette.armed = None;
-            self.viewport.placement_preview = None;
+            self.viewport.placement_preview.clear();
             self.viewport.snap_face = None;
             return;
         }
-        let mut object = object;
-        object.id = self.scene.new_object_id();
-        let new_index = self.scene.objects.len();
-        self.scene.objects.push(object);
-        if let Some(description) = self.describe_object(new_index, resources) {
-            self.status_message = format!("Placed {description}");
+        // The ghost's objects are numbered from 0, and a prefab's are marked as placed prefab 0.
+        let first_id = self.scene.new_object_id();
+        let instance = self.scene.new_prefab_instance();
+        let start = self.scene.objects.len();
+        for object in &self.viewport.placement_preview {
+            let mut object = object.clone();
+            object.id += first_id;
+            object.next = object.next.map(|next| next + first_id);
+            if let Some(member) = object.prefab.as_mut() {
+                member.instance = instance;
+            }
+            self.scene.objects.push(object);
         }
-        self.history.record(SceneEdit::Remove { index: new_index });
-        self.selected_object = Some(new_index);
+        let end = self.scene.objects.len();
+        self.status_message = match armed.asset {
+            PlaceableAsset::Prefab { .. } => format!(
+                "Placed the prefab {} ({} objects)",
+                armed.asset.label(resources.custom_names, resources.catalog, resources.prefabs),
+                end - start
+            ),
+            _ => self
+                .describe_object(start, resources)
+                .map(|description| format!("Placed {description}"))
+                .unwrap_or_default(),
+        };
+        // Undoing removes them from the last one back.
+        self.history
+            .record(SceneEdit::Group((start..end).rev().map(|index| SceneEdit::Remove { index }).collect()));
+        self.select_objects((start..end).collect());
         self.viewport.selection_changed_in_viewport = true;
 
         // Shift+click keeps the asset armed for placing several copies.
         if !ui.input(|input| input.modifiers.shift) {
             self.palette.armed = None;
-            self.viewport.placement_preview = None;
+            self.viewport.placement_preview.clear();
             self.viewport.snap_face = None;
+        }
+    }
+
+    /// The objects of the placed prefab under the pointer, if one is.
+    fn hovered_prefab(&self) -> Vec<usize> {
+        match self.viewport.hovered_object {
+            Some(index) if self.scene.objects.get(index).is_some_and(|object| object.prefab.is_some()) => {
+                self.scene.prefab_of(index)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Draws a green box around the placed prefab under the pointer
+    /// (`hovered_prefab`) and around each selected one.
+    fn draw_prefab_boxes(
+        &self,
+        painter: &egui::Painter,
+        projection: &ViewportProjection,
+        hovered_prefab: &[usize],
+        library: &mut Arena2Library,
+    ) {
+        let mut instances: Vec<u32> = Vec::new();
+        for index in hovered_prefab.iter().copied().chain(self.selected_indices()) {
+            if let Some(member) = self.scene.objects.get(index).and_then(|object| object.prefab.as_ref()) {
+                if !instances.contains(&member.instance) {
+                    instances.push(member.instance);
+                }
+            }
+        }
+        for instance in instances {
+            let members = self.scene.prefab_members(instance);
+            let Some((minimum, maximum)) = self.scene.bounds_of(&members, library) else { continue };
+            let corners = crate::scene::box_corners(
+                minimum - Vec3::splat(PREFAB_BOX_MARGIN),
+                maximum + Vec3::splat(PREFAB_BOX_MARGIN),
+            );
+            let width = if hovered_prefab.first().is_some_and(|&index| members.contains(&index)) {
+                2.5_f32
+            } else {
+                1.5_f32
+            };
+            for (start, end) in BOX_EDGES {
+                let (Some(start), Some(end)) =
+                    (projection.world_to_screen(corners[start]), projection.world_to_screen(corners[end]))
+                else {
+                    continue;
+                };
+                painter.line_segment([start, end], egui::Stroke::new(width, PREFAB_COLOR));
+            }
         }
     }
 
@@ -1226,6 +1326,14 @@ impl RoomEditor {
             return;
         };
         if let Some(mut description) = self.describe_object(index, resources) {
+            if let Some(member) = &self.scene.objects[index].prefab {
+                let count = self.scene.prefab_members(member.instance).len();
+                description = format!(
+                    "{} Prefab: {} ({count} objects)\n{description}\nRight-click to break it up",
+                    super::asset_palette::PREFAB_MARK,
+                    member.name
+                );
+            }
             if let Some(fixed_enemy) = self.scene.objects[index].fixed_enemy() {
                 description = format!("{description}\nSpawns: {}", fixed_enemy.description());
             }

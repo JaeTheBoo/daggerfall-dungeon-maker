@@ -323,7 +323,28 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   several selected objects sits at their middle and moves them all together,
   as one undo step. With grid lock on, the last selected object lands on the
   grid and the others keep their places relative to it. Several objects can't
-  be turned at once.
+  be turned at once, unless they are prefabs.
+* **Prefabs** are groups of objects saved to place again together. Select
+  several objects (models, flats, markers, lights), right-click one of them (or
+  empty space) and choose **Create Prefab**, after typing a name if you like.
+  The prefab is added to the **▣ Prefabs** tab of the asset palette, and the
+  objects become a placed copy of it. Clicking a prefab in the palette arms all
+  of its objects: the ghost follows the mouse with the prefab's base (the
+  middle of the bottom of the box around its objects) on the surface, Q, E or
+  R turn it, and a click places it. Prefabs are saved with your settings, like
+  favorites, so every project can use them; right-clicking one in the palette
+  renames it or deletes it from the list (**Delete prefab**), which leaves the
+  copies already placed as they are.
+* A placed prefab stays together: hovering any of its objects lights them all
+  up inside a green box, and clicking one selects the whole prefab, which then
+  moves (the arrows), turns (R, Q, E, around its middle), copies, duplicates and
+  deletes as one. Its objects are marked ▣ in the outliner, and its own
+  properties can't be changed one by one: the properties panel shows the
+  prefab instead. Right-click it and choose **Break Prefab** (or use the button
+  in the properties panel) to turn it back into separate objects. Placed
+  prefabs are saved in the project with the cell; the game sees their objects
+  as any others. Copies, pasted copies and the cells of a merge each keep
+  their prefabs apart.
 * **Copy and paste**: Ctrl+C (or **Edit > Copy**) copies the selected objects,
   one or many, and Ctrl+V (**Edit > Paste**) pastes them, selected, as one undo
   step. Pasted into the same cell they land 1 m along from the originals; into
@@ -351,7 +372,11 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   actions** removes those actions, as one undo step.
 * With nothing selected, the properties panel shows the **cell**: name,
   category, source, size, object and object list counts, and its water level
-  and castle flag (which live on the cell's start marker). A cell with water
+  and castle flag (which live on the cell's start marker). A project cell's
+  category is a drop-down list (`N` interior, `W` interior with water, `M`
+  interior variant, `S` special, `B` border cap); a copy starts with the
+  category of the cell it was copied from, a new cell as an interior, and a
+  merged cell with that of the cell whose place it takes. A cell with water
   shows its water surface as a see-through blue plane across its square, in
   the cell editor and the dungeon view.
 * Every cell covers a 51.2 × 51.2 m square of the dungeon grid. Objects that
@@ -447,7 +472,7 @@ dungeons you choose to the game as new locations. The window has:
     location, entrance (the above-ground blocks of the Daggerfall dungeon chosen
     as entrance), climate and grid of cells;
   * `WorldData/<BLOCK>.RDB.json` for each project cell the dungeons use, under a
-    new block name: the letter of the cell it was copied from and a number from
+    new block name: the letter of the cell's category and a number from
     9000000 up, for example `N9000004.RDB`. Daggerfall's own cells are used by
     their own names and are not exported;
   * `<mod>.dfmod.json`, the mod's manifest, and a `README.txt` listing what is in it.
@@ -524,8 +549,10 @@ The **asset palette** along the bottom lists everything that can be placed:
 | Tab | Contents |
 | --- | --- |
 | ★ Favorites | The assets you marked as favorites, of every kind, in the order marked |
-| Cell models | Every model used in Daggerfall's dungeon cells, most widely used first |
-| All models | Every model in `ARCH3D.BSA` |
+| ▣ Prefabs | Your prefabs: groups of objects to place together (see above) |
+| Dungeon Models | Every model used in Daggerfall's dungeon cells, most widely used first |
+| Exterior Models | Every model Daggerfall uses outdoors (buildings seen from outside, walls, scenery, dungeon entrances), from its RMB blocks, most widely used first |
+| All Models | Every model in `ARCH3D.BSA` |
 | Flats | Sprites used in cells: torches, furniture, people, treasure |
 | Markers | Editor markers: start/enter points, enemy spawns, quest and treasure markers |
 | Lights | A point light |
@@ -612,6 +639,7 @@ implemented yet.
 | `src/music.rs`, `src/arena2/hmi.rs` | Dungeon music: how the game picks a song, reading Daggerfall's HMI songs, and playing them |
 | `src/export/` | Exporting the project as a Daggerfall Unity mod: world data JSON, manifest, music, skybox and scaled-object scripts, and the .dfmod built with Unity |
 | `src/catalog.rs` | Placeable assets, gathered from the game data at run time |
+| `src/prefabs.rs` | The user's prefabs: saving them, and placing their objects |
 | `src/connectors.rs` | Open faces and doorways of models, for snapping pieces together |
 | `src/dungeon_textures.rs` | The wall and floor textures Daggerfall Unity gives each dungeon |
 | `src/doors.rs` | The doors Daggerfall Unity switches off because they overlap another door |

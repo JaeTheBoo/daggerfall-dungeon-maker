@@ -23,7 +23,7 @@ use glam::Vec3;
 
 use crate::arena2::RDB_BLOCK_SIDE;
 use crate::scene::{
-    ObjectId, Scene, SceneObject, SceneObjectKind, ADDED_OBJECTS_GROUP, MARKER_TEXTURE_ARCHIVE,
+    ObjectId, PrefabMember, Scene, SceneObject, SceneObjectKind, ADDED_OBJECTS_GROUP, MARKER_TEXTURE_ARCHIVE,
     START_MARKER_RECORD,
 };
 
@@ -92,6 +92,7 @@ pub fn merge_cells(sources: &[MergeSource<'_>]) -> Result<MergedCell, String> {
     let mut objects = Vec::new();
     let mut next_id: ObjectId = 1;
     let mut group_base = 0;
+    let mut next_prefab = 1;
     for &index in &order {
         let source = &sources[index];
         let offset = Vec3::new(
@@ -119,16 +120,30 @@ pub fn merge_cells(sources: &[MergeSource<'_>]) -> Result<MergedCell, String> {
             .filter(|&group| group != ADDED_OBJECTS_GROUP)
             .max()
             .map_or(0, |group| group + 1);
-        objects.extend(kept.into_iter().map(|object| SceneObject {
-            id: ids[&object.id],
-            next: object.next.and_then(|next| ids.get(&next).copied()),
-            position: object.position + offset,
-            group_index: if object.group_index == ADDED_OBJECTS_GROUP {
-                ADDED_OBJECTS_GROUP
-            } else {
-                group_base + object.group_index
-            },
-            ..object.clone()
+        // Each cell's placed prefabs are numbered afresh, so two cells' prefabs stay apart.
+        let mut prefabs: HashMap<u32, u32> = HashMap::new();
+        for member in kept.iter().filter_map(|object| object.prefab.as_ref()) {
+            prefabs.entry(member.instance).or_insert_with(|| {
+                next_prefab += 1;
+                next_prefab - 1
+            });
+        }
+        objects.extend(kept.into_iter().map(|object| {
+            SceneObject {
+                id: ids[&object.id],
+                next: object.next.and_then(|next| ids.get(&next).copied()),
+                position: object.position + offset,
+                group_index: if object.group_index == ADDED_OBJECTS_GROUP {
+                    ADDED_OBJECTS_GROUP
+                } else {
+                    group_base + object.group_index
+                },
+                prefab: object
+                    .prefab
+                    .as_ref()
+                    .map(|member| PrefabMember { instance: prefabs[&member.instance], ..member.clone() }),
+                ..object.clone()
+            }
         }));
         group_base += groups;
     }
@@ -192,6 +207,7 @@ mod tests {
             id,
             next,
             scale: None,
+            prefab: None,
         }
     }
 
@@ -209,6 +225,7 @@ mod tests {
             id,
             next: None,
             scale: None,
+            prefab: None,
         }
     }
 
@@ -239,6 +256,27 @@ mod tests {
         // Object lists stay apart: the first cell used groups 0 and 1, so the second's start at 2.
         assert_eq!(merged.objects[3].group_index, 2);
         assert!(merged.warnings.is_empty());
+    }
+
+    #[test]
+    fn each_cells_prefabs_stay_apart() {
+        let in_prefab = |id, x| SceneObject {
+            prefab: Some(PrefabMember { instance: 1, name: "Pillar".to_string() }),
+            ..model(id, 55000, 0, x, None)
+        };
+        let first = vec![start_marker(1, 0), in_prefab(2, 1.0), in_prefab(3, 2.0)];
+        let second = vec![in_prefab(1, 1.0), in_prefab(2, 2.0)];
+        let merged = merge_cells(&[
+            MergeSource { objects: &first, spot: (0, 0), is_start: false },
+            MergeSource { objects: &second, spot: (1, 0), is_start: false },
+        ])
+        .unwrap();
+        let instances: Vec<Option<u32>> = merged
+            .objects
+            .iter()
+            .map(|object| object.prefab.as_ref().map(|member| member.instance))
+            .collect();
+        assert_eq!(instances, [None, Some(1), Some(1), Some(2), Some(2)]);
     }
 
     #[test]

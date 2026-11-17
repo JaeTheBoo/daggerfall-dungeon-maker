@@ -9,6 +9,10 @@
 //! Any asset can be marked as a favourite with the star in its tile's corner
 //! (or its right-click menu); the **Favorites** tab lists them all, whatever
 //! their kind. Favourites are saved with the user's names (see [`CustomNames`]).
+//!
+//! The **Prefabs** tab lists the user's prefabs (see [`crate::prefabs`]).
+//! Clicking one arms all of its objects, to place them together; its
+//! right-click menu renames it or deletes it from the list.
 
 use std::collections::HashMap;
 
@@ -19,6 +23,7 @@ use crate::app::viewport_tools::EditorResources;
 use crate::arena2::{Arena2Library, TextureKey};
 use crate::catalog::{flat_description, AssetCatalog};
 use crate::custom_names::{CustomNames, Favorite};
+use crate::prefabs::{PrefabId, PrefabLibrary};
 use crate::render::ThumbnailStatus;
 use crate::scene::{
     default_model_object_name, FlatData, LightData, ModelData, SceneObject, SceneObjectKind,
@@ -33,6 +38,10 @@ const CAPTION_HEIGHT: f32 = 16.0;
 const TILE_SPACING: f32 = 6.0;
 /// Colour of a favourite's star.
 const FAVORITE_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 200, 60);
+/// Marks prefabs in the palette and the outliner.
+pub const PREFAB_MARK: &str = "▣";
+/// Colour of prefabs: their mark, and the box drawn around a placed one.
+pub const PREFAB_COLOR: egui::Color32 = egui::Color32::from_rgb(90, 235, 120);
 /// Radius given to newly placed lights, in world units (400 native units).
 const DEFAULT_LIGHT_RADIUS: f32 = 10.0;
 /// Height above the surface at which new lights are placed, in world units.
@@ -41,18 +50,29 @@ const LIGHT_PLACEMENT_HEIGHT: f32 = 1.5;
 /// Something that can be placed in a room.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaceableAsset {
-    Model { model_id: u32 },
-    Flat { texture: TextureKey },
+    Model {
+        model_id: u32,
+    },
+    Flat {
+        texture: TextureKey,
+    },
     Light,
+    /// One of the user's prefabs: all of its objects.
+    Prefab {
+        id: PrefabId,
+    },
 }
 
 impl PlaceableAsset {
-    /// The favourite that marks this asset.
-    pub fn favorite(self) -> Favorite {
+    /// The favourite that marks this asset; prefabs are the user's own, so they are not marked.
+    pub fn favorite(self) -> Option<Favorite> {
         match self {
-            Self::Model { model_id } => Favorite::Model { model_id },
-            Self::Flat { texture } => Favorite::Flat { archive: texture.archive, record: texture.record },
-            Self::Light => Favorite::Light,
+            Self::Model { model_id } => Some(Favorite::Model { model_id }),
+            Self::Flat { texture } => {
+                Some(Favorite::Flat { archive: texture.archive, record: texture.record })
+            }
+            Self::Light => Some(Favorite::Light),
+            Self::Prefab { .. } => None,
         }
     }
 
@@ -74,28 +94,48 @@ impl PlaceableAsset {
             Self::Model { model_id } => default_model_object_name(*model_id),
             Self::Flat { texture } => flat_description(*texture),
             Self::Light => "Light".to_string(),
+            Self::Prefab { .. } => "Prefab".to_string(),
         }
     }
 
-    /// Name shown for this asset in the palette: for models, the model's display name.
-    pub fn label(&self, custom_names: &CustomNames, catalog: &AssetCatalog) -> String {
+    /// Name shown for this asset in the palette: for models, the model's
+    /// display name, and for prefabs, the prefab's name.
+    pub fn label(
+        &self,
+        custom_names: &CustomNames,
+        catalog: &AssetCatalog,
+        prefabs: &PrefabLibrary,
+    ) -> String {
         match self {
             Self::Model { model_id } => custom_names.model_label(*model_id, catalog),
+            Self::Prefab { id } => {
+                prefabs.get(*id).map_or("Deleted prefab", |prefab| prefab.label()).to_string()
+            }
             _ => self.name(),
         }
     }
 
-    /// Creates a scene object for this asset resting on `surface_point`, turned by `yaw_degrees`.
+    /// Creates the scene objects for this asset resting on `surface_point`,
+    /// turned by `yaw_degrees`: one, or a prefab's objects (numbered from 0,
+    /// marked as placed prefab 0; placing them renumbers both).
     ///
     /// Models are lifted so the bottom of their bounding box touches the
-    /// surface, flats so their lower edge does, and lights float above it.
-    pub fn create_object(
+    /// surface, flats so their lower edge does, and lights float above it. A
+    /// prefab's base rests on the surface.
+    pub fn create_objects(
         &self,
         library: &mut Arena2Library,
+        prefabs: &PrefabLibrary,
         surface_point: Vec3,
         yaw_degrees: f32,
-    ) -> SceneObject {
+    ) -> Vec<SceneObject> {
         let (kind, position, rotation_degrees) = match *self {
+            Self::Prefab { id } => {
+                return prefabs
+                    .get(id)
+                    .map(|prefab| prefab.place(surface_point, yaw_degrees, 0, 0))
+                    .unwrap_or_default()
+            }
             Self::Model { model_id } => {
                 let lift = library.model(model_id).map_or(0.0, |mesh| -mesh.bounds_min.y);
                 (
@@ -118,7 +158,7 @@ impl PlaceableAsset {
                 Vec3::ZERO,
             ),
         };
-        SceneObject {
+        vec![SceneObject {
             // The cell gives the object its id when it is placed.
             id: 0,
             next: None,
@@ -129,7 +169,8 @@ impl PlaceableAsset {
             rotation_degrees,
             visible: true,
             scale: None,
-        }
+            prefab: None,
+        }]
     }
 }
 
@@ -145,7 +186,9 @@ pub struct ArmedAsset {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaletteTab {
     Favorites,
-    RoomModels,
+    Prefabs,
+    DungeonModels,
+    ExteriorModels,
     AllModels,
     Flats,
     Markers,
@@ -153,14 +196,24 @@ enum PaletteTab {
 }
 
 impl PaletteTab {
-    const ALL: [Self; 6] =
-        [Self::Favorites, Self::RoomModels, Self::AllModels, Self::Flats, Self::Markers, Self::Lights];
+    const ALL: [Self; 8] = [
+        Self::Favorites,
+        Self::Prefabs,
+        Self::DungeonModels,
+        Self::ExteriorModels,
+        Self::AllModels,
+        Self::Flats,
+        Self::Markers,
+        Self::Lights,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Favorites => "★ Favorites",
-            Self::RoomModels => "Cell models",
-            Self::AllModels => "All models",
+            Self::Prefabs => "▣ Prefabs",
+            Self::DungeonModels => "Dungeon Models",
+            Self::ExteriorModels => "Exterior Models",
+            Self::AllModels => "All Models",
             Self::Flats => "Flats",
             Self::Markers => "Markers",
             Self::Lights => "Lights",
@@ -170,7 +223,14 @@ impl PaletteTab {
     fn tooltip(self) -> &'static str {
         match self {
             Self::Favorites => "The assets you marked with the star in a tile's corner, of every kind",
-            Self::RoomModels => "Models used in Daggerfall's dungeon cells, most common first",
+            Self::Prefabs => {
+                "Your prefabs: groups of objects to place together. Select several objects in a cell and \
+                 right-click them to create one; right-click a prefab here to rename or delete it"
+            }
+            Self::DungeonModels => "Models used in Daggerfall's dungeon cells, most common first",
+            Self::ExteriorModels => {
+                "Models Daggerfall uses outdoors: buildings, walls, scenery and dungeon entrances, most common first"
+            }
             Self::AllModels => "Every model in ARCH3D.BSA",
             Self::Flats => "Billboard sprites used in dungeon cells: torches, furniture, people, treasure",
             Self::Markers => {
@@ -192,7 +252,13 @@ struct PaletteEntry {
 
 impl PaletteEntry {
     /// Builds the tile for `asset`, with `usage` describing where the game uses it.
-    fn new(asset: PlaceableAsset, usage: String, custom_names: &CustomNames, catalog: &AssetCatalog) -> Self {
+    fn new(
+        asset: PlaceableAsset,
+        usage: String,
+        custom_names: &CustomNames,
+        catalog: &AssetCatalog,
+        prefabs: &PrefabLibrary,
+    ) -> Self {
         let details = match asset {
             PlaceableAsset::Model { model_id } => match catalog.model_description(model_id) {
                 Some(description) => format!("Model {model_id}\n{}\n{usage}", description.summary()),
@@ -200,7 +266,7 @@ impl PaletteEntry {
             },
             _ => usage,
         };
-        Self { asset, caption: asset.label(custom_names, catalog), details }
+        Self { asset, caption: asset.label(custom_names, catalog, prefabs), details }
     }
 }
 
@@ -223,7 +289,7 @@ impl Default for AssetPalette {
         Self {
             is_open: true,
             armed: None,
-            tab: PaletteTab::RoomModels,
+            tab: PaletteTab::DungeonModels,
             search_text: String::new(),
             tile_size: 84.0,
             flat_thumbnails: HashMap::new(),
@@ -238,6 +304,11 @@ impl AssetPalette {
             Some(armed) if armed.asset == asset => None,
             _ => Some(ArmedAsset { asset, yaw_degrees: 0.0 }),
         };
+    }
+
+    /// Shows the Prefabs tab, for example once a prefab was made.
+    pub fn show_prefabs(&mut self) {
+        self.tab = PaletteTab::Prefabs;
     }
 
     /// Rotates the armed asset by `degrees` around the vertical axis.
@@ -268,7 +339,18 @@ impl AssetPalette {
                 self.show_header(ui, resources);
                 ui.separator();
 
-                let entries = self.visible_entries(resources.catalog, resources.custom_names);
+                let entries = self.visible_entries(resources.catalog, resources.custom_names, resources.prefabs);
+                if entries.is_empty() && self.tab == PaletteTab::Prefabs {
+                    let text = match resources.prefabs.prefabs().is_empty() {
+                        true => {
+                            "No prefabs yet. Select several objects in a cell (Shift+click them, or drag a box \
+                             around them), right-click them and choose Create Prefab."
+                        }
+                        false => "No prefab matches the search.",
+                    };
+                    ui.label(egui::RichText::new(text).weak());
+                    return;
+                }
                 let mut thumbnail_budget = THUMBNAILS_PER_FRAME;
                 let mut has_pending_thumbnails = false;
 
@@ -294,18 +376,30 @@ impl AssetPalette {
                                     );
                                     has_pending_thumbnails |= thumbnail == TileImage::Pending;
                                     let favorite = entry.asset.favorite();
-                                    let is_favorite = resources.custom_names.is_favorite(favorite);
+                                    let is_favorite =
+                                        favorite.map(|favorite| resources.custom_names.is_favorite(favorite));
                                     let (response, star_clicked) =
                                         self.draw_tile(ui, entry, thumbnail, is_favorite);
-                                    if star_clicked {
+                                    if let (true, Some(favorite)) = (star_clicked, favorite) {
                                         resources.custom_names.toggle_favorite(favorite);
                                     } else if response.clicked() {
                                         self.toggle_armed(entry.asset);
                                     }
                                     response.context_menu(|ui| {
+                                        if let PlaceableAsset::Prefab { id } = entry.asset {
+                                            if show_prefab_menu(ui, id, resources.prefabs) {
+                                                resources.prefabs.remove(id);
+                                                if self.armed.is_some_and(|armed| armed.asset == entry.asset) {
+                                                    self.armed = None;
+                                                }
+                                                ui.close_menu();
+                                            }
+                                            return;
+                                        }
+                                        let Some(favorite) = favorite else { return };
                                         let text = match is_favorite {
-                                            true => "☆ Remove from favorites",
-                                            false => "★ Add to favorites",
+                                            Some(true) => "☆ Remove from favorites",
+                                            _ => "★ Add to favorites",
                                         };
                                         if ui.button(text).clicked() {
                                             resources.custom_names.toggle_favorite(favorite);
@@ -350,7 +444,8 @@ impl AssetPalette {
         match self.armed {
             Some(armed) => {
                 ui.horizontal_wrapped(|ui| {
-                    let asset_label = armed.asset.label(resources.custom_names, resources.catalog);
+                    let asset_label =
+                        armed.asset.label(resources.custom_names, resources.catalog, resources.prefabs);
                     ui.colored_label(hint_color, format!("Placing {asset_label} ({:.0}°)", armed.yaw_degrees));
                     ui.label(
                         egui::RichText::new(
@@ -364,18 +459,26 @@ impl AssetPalette {
                 });
             }
             None => {
-                ui.label(
-                    egui::RichText::new(
-                        "Click an asset to start placing it in the cell · ☆ in a tile's corner marks it as a favorite · right-click a model to name it",
-                    )
-                    .weak(),
-                );
+                let hint = match self.tab {
+                    PaletteTab::Prefabs => {
+                        "Click a prefab to start placing it in the cell · right-click it to rename or delete it"
+                    }
+                    _ => {
+                        "Click an asset to start placing it in the cell · ☆ in a tile's corner marks it as a favorite · right-click a model to name it"
+                    }
+                };
+                ui.label(egui::RichText::new(hint).weak());
             }
         }
     }
 
     /// Returns the tiles of the current tab that match the search text.
-    fn visible_entries(&self, catalog: &AssetCatalog, custom_names: &CustomNames) -> Vec<PaletteEntry> {
+    fn visible_entries(
+        &self,
+        catalog: &AssetCatalog,
+        custom_names: &CustomNames,
+        prefabs: &PrefabLibrary,
+    ) -> Vec<PaletteEntry> {
         let search = self.search_text.trim().to_lowercase();
         let matches = |text: &str| search.is_empty() || text.to_lowercase().contains(&search);
         // Models match on their id, the user's name for them, or their description.
@@ -384,7 +487,7 @@ impl AssetPalette {
                 || custom_names.model_name_matches(model_id, &search)
                 || catalog.model_description(model_id).is_some_and(|description| description.matches(&search))
         };
-        let entry = |asset, usage| PaletteEntry::new(asset, usage, custom_names, catalog);
+        let entry = |asset, usage| PaletteEntry::new(asset, usage, custom_names, catalog, prefabs);
         let model_usage = |model_id: u32| match catalog.room_model(model_id) {
             Some(model) => format!("Used in {} cells", model.room_count),
             None => "Not used in any dungeon cell".to_string(),
@@ -396,6 +499,7 @@ impl AssetPalette {
                 .iter()
                 .map(|&favorite| PlaceableAsset::of_favorite(favorite))
                 .filter_map(|asset| match asset {
+                    PlaceableAsset::Prefab { .. } => None,
                     PlaceableAsset::Model { model_id } => {
                         model_matches(model_id).then(|| entry(asset, model_usage(model_id)))
                     }
@@ -418,13 +522,34 @@ impl AssetPalette {
                     }),
                 })
                 .collect(),
-            PaletteTab::RoomModels => catalog
+            PaletteTab::Prefabs => prefabs
+                .prefabs()
+                .iter()
+                .filter(|prefab| matches(prefab.label()))
+                .map(|prefab| {
+                    let usage = format!("Prefab of {} objects", prefab.objects.len());
+                    entry(PlaceableAsset::Prefab { id: prefab.id }, usage)
+                })
+                .collect(),
+            PaletteTab::DungeonModels => catalog
                 .room_models
                 .iter()
                 .filter(|model| model_matches(model.model_id))
                 .map(|model| {
                     let usage = format!(
                         "Used in {} cells, {} placements in total",
+                        model.room_count, model.placement_count
+                    );
+                    entry(PlaceableAsset::Model { model_id: model.model_id }, usage)
+                })
+                .collect(),
+            PaletteTab::ExteriorModels => catalog
+                .exterior_models
+                .iter()
+                .filter(|model| model_matches(model.model_id))
+                .map(|model| {
+                    let usage = format!(
+                        "Used outdoors in {} blocks, {} placements in total",
                         model.room_count, model.placement_count
                     );
                     entry(PlaceableAsset::Model { model_id: model.model_id }, usage)
@@ -463,7 +588,22 @@ impl AssetPalette {
         budget: &mut usize,
     ) -> TileImage {
         let library = &mut *resources.library;
+        let asset = match asset {
+            PlaceableAsset::Prefab { id } => {
+                let model = resources.prefabs.get(id).and_then(|prefab| {
+                    prefab.largest_model(|model_id| {
+                        library.model(model_id).map_or(0.0, |mesh| mesh.bounding_radius())
+                    })
+                });
+                match model {
+                    Some(model_id) => PlaceableAsset::Model { model_id },
+                    None => return TileImage::PrefabIcon,
+                }
+            }
+            asset => asset,
+        };
         match asset {
+            PlaceableAsset::Prefab { .. } => TileImage::PrefabIcon,
             PlaceableAsset::Model { model_id } => {
                 let (Some(render_state), Some(renderer)) =
                     (resources.render_state, resources.renderer.as_deref_mut())
@@ -522,13 +662,15 @@ impl AssetPalette {
 
     /// Draws one tile, with the favourite star in its top-right corner (always
     /// shown for a favourite, otherwise while the pointer is over the tile).
-    /// Returns its response and whether the star was clicked.
+    /// `is_favorite` is `None` for assets that cannot be favourites (prefabs,
+    /// which show a prefab mark there instead). Returns its response and
+    /// whether the star was clicked.
     fn draw_tile(
         &self,
         ui: &mut egui::Ui,
         entry: &PaletteEntry,
         image: TileImage,
-        is_favorite: bool,
+        is_favorite: Option<bool>,
     ) -> (egui::Response, bool) {
         let tile_size = self.tile_size;
         let (rect, response) =
@@ -572,6 +714,15 @@ impl AssetPalette {
                 );
             }
             TileImage::LightIcon => draw_light_icon(&painter, image_rect),
+            TileImage::PrefabIcon => {
+                painter.text(
+                    image_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    PREFAB_MARK,
+                    egui::FontId::proportional(tile_size * 0.4),
+                    PREFAB_COLOR,
+                );
+            }
             TileImage::None => {
                 painter.text(
                     image_rect.center(),
@@ -596,9 +747,21 @@ impl AssetPalette {
             egui::vec2(18.0, 18.0),
         );
         let pointer = ui.ctx().pointer_interact_pos();
-        let over_star = response.hovered() && pointer.is_some_and(|pointer| star_rect.contains(pointer));
-        let star_clicked = response.clicked() && pointer.is_some_and(|pointer| star_rect.contains(pointer));
-        if is_favorite || response.hovered() {
+        let can_favorite = is_favorite.is_some();
+        let is_favorite = is_favorite == Some(true);
+        let over_star =
+            can_favorite && response.hovered() && pointer.is_some_and(|pointer| star_rect.contains(pointer));
+        let star_clicked =
+            can_favorite && response.clicked() && pointer.is_some_and(|pointer| star_rect.contains(pointer));
+        if !can_favorite {
+            painter.text(
+                star_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                PREFAB_MARK,
+                egui::FontId::proportional(14.0),
+                PREFAB_COLOR,
+            );
+        } else if is_favorite || response.hovered() {
             let (star, color) = match (is_favorite, over_star) {
                 (true, _) => ("★", FAVORITE_COLOR),
                 (false, true) => ("★", egui::Color32::from_gray(200)),
@@ -625,9 +788,10 @@ impl AssetPalette {
             PlaceableAsset::Model { .. } => " · right-click to name it",
             _ => "",
         };
-        let favorite_hint = match is_favorite {
-            true => "★ to remove from favorites",
-            false => "☆ to add to favorites",
+        let favorite_hint = match (can_favorite, is_favorite) {
+            (false, _) => "right-click to rename or delete it",
+            (true, true) => "★ to remove from favorites",
+            (true, false) => "☆ to add to favorites",
         };
         let response = match over_star {
             true => response.on_hover_text(favorite_hint),
@@ -638,6 +802,25 @@ impl AssetPalette {
         };
         (response, star_clicked)
     }
+}
+
+/// Contents of a prefab tile's right-click menu: its name, to edit, and a
+/// button deleting it from the list. Returns whether that was clicked.
+fn show_prefab_menu(ui: &mut egui::Ui, id: PrefabId, prefabs: &mut PrefabLibrary) -> bool {
+    let Some(prefab) = prefabs.get(id) else { return false };
+    ui.strong(format!("Prefab of {} objects", prefab.objects.len()));
+    let mut name = prefab.name.clone();
+    let field = egui::TextEdit::singleline(&mut name).hint_text("Name of the prefab");
+    if ui.add(field).on_hover_text("Rename the prefab (copies already placed keep their name)").changed() {
+        prefabs.rename(id, &name);
+    }
+    ui.separator();
+    ui.button("Delete prefab")
+        .on_hover_text(
+            "Removes the prefab from this list. Copies already placed in cells stay as they are, still \
+             grouped as prefabs.",
+        )
+        .clicked()
 }
 
 /// Contents of a model tile's right-click menu: a field for the user's name for the model.
@@ -653,9 +836,14 @@ fn show_model_name_menu(ui: &mut egui::Ui, model_id: u32, custom_names: &mut Cus
 /// What is drawn inside a tile.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TileImage {
-    Texture { texture_id: egui::TextureId, aspect_ratio: f32 },
+    Texture {
+        texture_id: egui::TextureId,
+        aspect_ratio: f32,
+    },
     Pending,
     LightIcon,
+    /// A prefab without models to show.
+    PrefabIcon,
     None,
 }
 

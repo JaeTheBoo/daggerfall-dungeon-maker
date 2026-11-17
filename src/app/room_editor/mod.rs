@@ -4,6 +4,11 @@
 //! (scene, camera, selection, undo history) and borrows the shared game data
 //! and renderer through [`EditorResources`]. That lets the same editor run in
 //! the main window or in its own window opened from the dungeon view.
+//!
+//! The objects of a placed prefab (see [`crate::prefabs`]) are always selected
+//! together: selecting one selects them all, so they move, turn, copy and
+//! delete as one. Their own properties cannot be changed until the prefab is
+//! broken up (**Break Prefab** in their right-click menu).
 
 mod asset_palette;
 mod history;
@@ -19,12 +24,13 @@ use crate::arena2::{Arena2Library, DoorKind, RDB_BLOCK_SIDE};
 use crate::camera::OrbitCamera;
 use crate::dungeon_textures::DungeonIdentity;
 use crate::encounters::{enemy_chances, DungeonType, EncounterTable, EnemyChance};
+use crate::project::CellCategory;
 use crate::render::{RoomOutline, ViewSettings, ViewportTarget};
 use crate::scene::{
-    ActionMotion, ObjectAction, ObjectId, Scene, SceneObject, SceneObjectKind, ADDED_OBJECTS_GROUP,
-    OPEN_DOOR_ACTION, OUTSIDE_CELL_TOLERANCE,
+    ActionMotion, ObjectAction, ObjectId, PrefabMember, Scene, SceneObject, SceneObjectKind,
+    ADDED_OBJECTS_GROUP, OPEN_DOOR_ACTION, OUTSIDE_CELL_TOLERANCE,
 };
-use asset_palette::AssetPalette;
+use asset_palette::{AssetPalette, PREFAB_COLOR, PREFAB_MARK};
 use history::{EditHistory, SceneEdit};
 use viewport::ViewportState;
 
@@ -121,6 +127,9 @@ pub struct RoomEditor {
     edit_blocked: bool,
     /// Name of the project room being edited; `None` for rooms from Daggerfall.
     project_room_name: Option<String>,
+    /// The project room's category, which the user can change; `None` for rooms
+    /// from Daggerfall, whose category comes from their block name.
+    cell_category: Option<CellCategory>,
     /// Type of the dungeon the room was opened from, which decides what random enemy markers become.
     dungeon_type: Option<DungeonType>,
     /// Player level used to preview which enemies random enemy markers can become.
@@ -156,6 +165,8 @@ pub struct RoomEditor {
     dungeon_identity: Option<DungeonIdentity>,
     /// The cell's doors (object indexes) the game switches off, refreshed every frame.
     switched_off_doors: Vec<usize>,
+    /// The name typed for a new prefab in a right-click menu.
+    prefab_name: String,
 }
 
 /// The cells around the edited one in a dungeon, shown faded for context.
@@ -223,6 +234,12 @@ pub(super) struct ObjectMenuInfo {
     can_tie: bool,
     /// How many objects' actions trigger this object.
     triggered_by: usize,
+    /// The name of the placed prefab the object is part of, if it is.
+    prefab: Option<String>,
+    /// How many objects are selected (a prefab counts all of its objects).
+    selected: usize,
+    /// Whether the selected objects can become a prefab: several, not all one prefab already.
+    can_create_prefab: bool,
 }
 
 /// What the user chose in an object's right-click menu.
@@ -230,25 +247,70 @@ pub(super) struct ObjectMenuInfo {
 pub(super) enum ObjectMenuChoice {
     TieAction,
     RemoveActions,
+    /// Make the selected objects a prefab, called as typed in the menu.
+    CreatePrefab,
+    /// Turn the prefab the object is part of back into separate objects.
+    BreakPrefab,
 }
 
-/// Draws the entries of an object's right-click menu. Returns the user's choice.
-pub(super) fn object_menu(ui: &mut egui::Ui, info: &ObjectMenuInfo) -> Option<ObjectMenuChoice> {
+/// Draws the entries of an object's right-click menu: what can be done with
+/// the object, or with the prefab it is part of, and with the selection when
+/// several objects are selected. `prefab_name` is the name typed for a new
+/// prefab. Returns the user's choice.
+pub(super) fn object_menu(
+    ui: &mut egui::Ui,
+    info: &ObjectMenuInfo,
+    prefab_name: &mut String,
+) -> Option<ObjectMenuChoice> {
     let mut choice = None;
-    ui.label(egui::RichText::new(&info.name).weak());
-    if info.can_tie
-        && ui.button("Tie action to…").on_hover_text("Choose the object this one's action triggers").clicked()
-    {
-        choice = Some(ObjectMenuChoice::TieAction);
-    }
-    if info.triggered_by > 0 {
-        let hover = format!("Remove the action of the {} object(s) that trigger this one", info.triggered_by);
-        if ui.button("Remove actions").on_hover_text(hover).clicked() {
-            choice = Some(ObjectMenuChoice::RemoveActions);
+    match &info.prefab {
+        Some(prefab) => {
+            ui.label(egui::RichText::new(format!("{PREFAB_MARK} Prefab: {prefab}")).color(PREFAB_COLOR));
+            let hover = "Turns the prefab back into separate objects, each of which can then be changed";
+            if ui.button("Break Prefab").on_hover_text(hover).clicked() {
+                choice = Some(ObjectMenuChoice::BreakPrefab);
+            }
+        }
+        None if info.selected > 1 => {
+            ui.label(egui::RichText::new(format!("{} objects selected", info.selected)).weak());
+        }
+        None => {
+            ui.label(egui::RichText::new(&info.name).weak());
+            if info.can_tie
+                && ui
+                    .button("Tie action to…")
+                    .on_hover_text("Choose the object this one's action triggers")
+                    .clicked()
+            {
+                choice = Some(ObjectMenuChoice::TieAction);
+            }
+            if info.triggered_by > 0 {
+                let hover =
+                    format!("Remove the action of the {} object(s) that trigger this one", info.triggered_by);
+                if ui.button("Remove actions").on_hover_text(hover).clicked() {
+                    choice = Some(ObjectMenuChoice::RemoveActions);
+                }
+            }
+            if !info.can_tie && info.triggered_by == 0 {
+                ui.label(egui::RichText::new("Lights cannot have actions").weak());
+            }
         }
     }
-    if !info.can_tie && info.triggered_by == 0 {
-        ui.label(egui::RichText::new("Lights cannot have actions").weak());
+    if info.can_create_prefab {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            ui.add(egui::TextEdit::singleline(prefab_name).desired_width(140.0))
+                .on_hover_text("The name of the new prefab");
+        });
+        let hover = format!(
+            "Groups the {} selected objects into a prefab, and adds it to the Prefabs tab of the asset palette \
+             to place again in any cell",
+            info.selected
+        );
+        if ui.button("Create Prefab").on_hover_text(hover).clicked() {
+            choice = Some(ObjectMenuChoice::CreatePrefab);
+        }
     }
     if choice.is_some() {
         ui.close_menu();
@@ -280,6 +342,7 @@ impl RoomEditor {
             read_only: false,
             edit_blocked: false,
             project_room_name: None,
+            cell_category: None,
             dungeon_type: None,
             enemy_preview_level: 1,
             used_in: Vec::new(),
@@ -297,6 +360,7 @@ impl RoomEditor {
             dungeon_context: None,
             dungeon_identity: None,
             switched_off_doors: Vec::new(),
+            prefab_name: String::new(),
         };
         editor.frame_room(library);
         if let Some((minimum, _)) = editor.scene.bounds(library) {
@@ -324,6 +388,17 @@ impl RoomEditor {
     /// Sets the project room name shown above the outliner; `None` for rooms from Daggerfall.
     pub fn set_project_room_name(&mut self, name: Option<String>) {
         self.project_room_name = name;
+    }
+
+    /// Sets the project room's category, shown and changed in the cell's
+    /// properties; `None` for rooms from Daggerfall.
+    pub fn set_cell_category(&mut self, category: Option<CellCategory>) {
+        self.cell_category = category;
+    }
+
+    /// The project room's category, as the user may have changed it.
+    pub fn cell_category(&self) -> Option<CellCategory> {
+        self.cell_category
     }
 
     /// Sets the type of the dungeon the room is in, to preview what random enemy markers become.
@@ -522,18 +597,27 @@ impl RoomEditor {
         self.open_request.take()
     }
 
-    /// What the right-click menu of object `index` offers.
+    /// What the right-click menu of object `index` offers, with the current selection.
     pub(super) fn object_menu_info(
         &self,
         index: usize,
         resources: &EditorResources<'_>,
     ) -> Option<ObjectMenuInfo> {
         let object = self.scene.objects.get(index)?;
+        let selected = self.selected_indices();
         Some(ObjectMenuInfo {
             name: panels::object_display_name(object, resources.custom_names, resources.catalog),
             can_tie: object.can_have_action(),
             triggered_by: self.scene.objects_triggering(object.id).len(),
+            prefab: object.prefab.as_ref().map(|member| member.name.clone()),
+            selected: selected.len(),
+            can_create_prefab: selected.len() > 1 && self.selected_prefab().is_none(),
         })
+    }
+
+    /// Gets a right-click menu ready to open: the name it offers a new prefab.
+    pub(super) fn prepare_object_menu(&mut self, resources: &EditorResources<'_>) {
+        self.prefab_name = resources.prefabs.new_name();
     }
 
     /// Carries out the choice made in the right-click menu of object `index`.
@@ -541,12 +625,99 @@ impl RoomEditor {
         &mut self,
         choice: ObjectMenuChoice,
         index: usize,
-        resources: &EditorResources<'_>,
+        resources: &mut EditorResources<'_>,
     ) {
         match choice {
             ObjectMenuChoice::TieAction => self.start_tying(index, resources),
             ObjectMenuChoice::RemoveActions => self.remove_actions_triggering(index, resources),
+            ObjectMenuChoice::CreatePrefab => self.create_prefab(resources),
+            ObjectMenuChoice::BreakPrefab => self.break_prefab(index),
         }
+    }
+
+    /// The placed prefab that is selected, when the selection is exactly one
+    /// prefab: its mark and its objects.
+    pub(super) fn selected_prefab(&self) -> Option<(PrefabMember, Vec<usize>)> {
+        let selected = self.selected_indices();
+        let member = self.scene.objects.get(*selected.first()?)?.prefab.clone()?;
+        let members = self.scene.prefab_members(member.instance);
+        (members.len() == selected.len()).then_some((member, members))
+    }
+
+    /// Makes the selected objects a prefab: adds it to the user's prefabs,
+    /// called as typed in the right-click menu, and groups the objects as a
+    /// placed copy of it (one undo step). In a read-only cell the prefab is
+    /// only added to the user's prefabs.
+    fn create_prefab(&mut self, resources: &mut EditorResources<'_>) {
+        let indices = self.selected_indices();
+        if indices.len() < 2 {
+            self.status_message = "Select at least two objects to make a prefab of them".to_string();
+            return;
+        }
+        let name = match self.prefab_name.trim() {
+            "" => resources.prefabs.new_name(),
+            name => name.to_string(),
+        };
+        // Its base: the middle of the bottom of the box around the objects.
+        let base = match self.scene.bounds_of(&indices, resources.library) {
+            Some((minimum, maximum)) => {
+                Vec3::new((minimum.x + maximum.x) * 0.5, minimum.y, (minimum.z + maximum.z) * 0.5)
+            }
+            None => {
+                indices.iter().map(|&index| self.scene.objects[index].position).sum::<Vec3>()
+                    / indices.len() as f32
+            }
+        };
+        let objects: Vec<SceneObject> =
+            indices.iter().map(|&index| self.scene.objects[index].clone()).collect();
+        resources.prefabs.add(&name, &objects, base);
+        self.palette.show_prefabs();
+        if self.read_only {
+            self.status_message = format!(
+                "Added the prefab {name} ({} objects) to the Prefabs tab; this cell is Daggerfall's own, so it \
+                 stays as it was",
+                indices.len()
+            );
+            return;
+        }
+        let member = PrefabMember { instance: self.scene.new_prefab_instance(), name: name.clone() };
+        let reverts = indices
+            .iter()
+            .map(|&index| SceneEdit::Replace { index, object: self.scene.objects[index].clone() })
+            .collect();
+        for &index in &indices {
+            self.scene.objects[index].prefab = Some(member.clone());
+        }
+        self.history.record(SceneEdit::Group(reverts));
+        self.status_message = format!(
+            "Created the prefab {name} from {} objects; it is in the Prefabs tab of the asset palette",
+            indices.len()
+        );
+    }
+
+    /// Turns the placed prefab object `index` is part of back into separate
+    /// objects, which stay selected (one undo step).
+    fn break_prefab(&mut self, index: usize) {
+        let Some(member) = self.scene.objects.get(index).and_then(|object| object.prefab.clone()) else {
+            return;
+        };
+        if !self.can_edit() {
+            return;
+        }
+        let members = self.scene.prefab_members(member.instance);
+        let reverts = members
+            .iter()
+            .map(|&index| SceneEdit::Replace { index, object: self.scene.objects[index].clone() })
+            .collect();
+        for &index in &members {
+            self.scene.objects[index].prefab = None;
+        }
+        self.history.record(SceneEdit::Group(reverts));
+        self.status_message = format!(
+            "Broke up the prefab {}: its {} objects can now be changed one by one",
+            member.name,
+            members.len()
+        );
     }
 
     /// Starts choosing the object that object `index`'s action triggers.
@@ -758,8 +929,8 @@ impl RoomEditor {
     /// Adds the Edit menu entries.
     pub fn edit_menu(&mut self, ui: &mut egui::Ui) {
         let has_selection = self.selected_object.is_some();
-        // Several objects can be copied, duplicated, deleted and moved, but not turned.
-        let has_one = has_selection && !self.has_multiple_selection();
+        // Several objects can be copied, duplicated, deleted and moved, but only turned as prefabs.
+        let has_one = has_selection && self.can_turn_selection();
         let has_copied = ui.ctx().data(|data| data.get_temp::<CopiedObjects>(copied_objects_id())).is_some();
         let menu_button = |ui: &mut egui::Ui, enabled: bool, label: &str, shortcut: &str| {
             let clicked = ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut)).clicked();
@@ -849,8 +1020,15 @@ impl RoomEditor {
         }
     }
 
-    /// Centres the camera on the selected object (the last selected, with several).
+    /// Centres the camera on the selected object, or frames all of them when several are.
     fn focus_selection(&mut self, library: &mut Arena2Library) {
+        let selected = self.selected_indices();
+        if selected.len() > 1 {
+            if let Some((minimum, maximum)) = self.scene.bounds_of(&selected, library) {
+                self.camera.frame_bounds(minimum, maximum);
+                return;
+            }
+        }
         let Some(object) = self.selected_object.and_then(|index| self.scene.objects.get(index)) else {
             return;
         };
@@ -864,16 +1042,42 @@ impl RoomEditor {
         self.camera.frame_bounds(center - Vec3::splat(radius), center + Vec3::splat(radius));
     }
 
-    /// Every selected object, the last selected last. Empty if none is.
+    /// Every selected object, the last selected last. Empty if none is. The
+    /// objects of a placed prefab are selected together, so each selected
+    /// one brings the rest of its prefab.
     pub(super) fn selected_indices(&self) -> Vec<usize> {
         let count = self.scene.objects.len();
-        match self.selected_object.filter(|&index| index < count) {
+        let chosen = match self.selected_object.filter(|&index| index < count) {
             Some(primary) if self.selection_set.contains(&primary) => {
                 self.selection_set.iter().copied().filter(|&index| index < count).collect()
             }
             Some(primary) => vec![primary],
             None => Vec::new(),
+        };
+        self.with_whole_prefabs(chosen)
+    }
+
+    /// `indices` with the rest of each placed prefab among them; the last one stays last.
+    fn with_whole_prefabs(&self, indices: Vec<usize>) -> Vec<usize> {
+        let in_prefab =
+            |index: &usize| self.scene.objects.get(*index).is_some_and(|object| object.prefab.is_some());
+        if !indices.iter().any(in_prefab) {
+            return indices;
         }
+        let mut whole = Vec::with_capacity(indices.len());
+        for &index in &indices {
+            for member in self.scene.prefab_of(index) {
+                if !whole.contains(&member) {
+                    whole.push(member);
+                }
+            }
+        }
+        // The one chosen last leads a move (it lands on the snap grid), so it stays last.
+        if let Some(&last) = indices.last() {
+            whole.retain(|&index| index != last);
+            whole.push(last);
+        }
+        whole
     }
 
     /// Whether more than one object is selected; then they can only be moved.
@@ -889,12 +1093,15 @@ impl RoomEditor {
         self.selection_set = if indices.len() > 1 { indices } else { Vec::new() };
     }
 
-    /// Adds object `index` to the selection, or takes it out if it is selected (Shift+click).
+    /// Adds object `index` to the selection, or takes it out if it is selected
+    /// (Shift+click); with it, the rest of the prefab it is part of.
     pub(super) fn toggle_selected(&mut self, index: usize) {
         let mut indices = self.selected_indices();
-        if let Some(position) = indices.iter().position(|&selected| selected == index) {
-            indices.remove(position);
+        let prefab = self.scene.prefab_of(index);
+        if indices.contains(&index) {
+            indices.retain(|selected| !prefab.contains(selected));
         } else {
+            indices.extend(prefab.into_iter().filter(|&member| member != index));
             indices.push(index);
         }
         self.select_objects(indices);
@@ -928,6 +1135,21 @@ impl RoomEditor {
             [object] => object.name.clone(),
             several => format!("{} objects", several.len()),
         }
+    }
+
+    /// Whether the selection can be turned: one object, or whole placed prefabs.
+    pub(super) fn can_turn_selection(&self) -> bool {
+        let selected = self.selected_indices();
+        selected.len() == 1 || self.is_whole_prefabs(&selected)
+    }
+
+    /// Whether `indices` are several objects, all of placed prefabs (the
+    /// selection only ever holds whole prefabs).
+    fn is_whole_prefabs(&self, indices: &[usize]) -> bool {
+        indices.len() > 1
+            && indices
+                .iter()
+                .all(|&index| self.scene.objects.get(index).is_some_and(|object| object.prefab.is_some()))
     }
 
     /// Removes the selected objects, as one undo step.
@@ -1026,6 +1248,9 @@ impl RoomEditor {
                 (object.id, id)
             })
             .collect();
+        // Copied prefabs are placed prefabs of their own, apart from the originals.
+        let mut next_prefab = self.scene.new_prefab_instance();
+        let mut prefabs = std::collections::HashMap::new();
         let start = self.scene.objects.len();
         for original in originals {
             let mut copy = original.clone();
@@ -1034,6 +1259,12 @@ impl RoomEditor {
             copy.position += offset;
             if !same_cell {
                 copy.group_index = ADDED_OBJECTS_GROUP;
+            }
+            if let Some(member) = copy.prefab.as_mut() {
+                member.instance = *prefabs.entry(member.instance).or_insert_with(|| {
+                    next_prefab += 1;
+                    next_prefab - 1
+                });
             }
             self.scene.objects.push(copy);
         }
@@ -1045,8 +1276,20 @@ impl RoomEditor {
         self.viewport.selection_changed_in_viewport = true;
     }
 
-    /// Turns the selected object around the vertical axis by `degrees`.
+    /// Turns the selected object around the vertical axis by `degrees`, or
+    /// selected prefabs around the middle of their objects.
     fn rotate_selection(&mut self, degrees: f32) {
+        let selected = self.selected_indices();
+        if self.is_whole_prefabs(&selected) {
+            if self.can_edit() {
+                self.turn_objects(&selected, degrees);
+                self.status_message = match self.selected_prefab() {
+                    Some((member, _)) => format!("Turned the prefab {} by {degrees:.0}°", member.name),
+                    None => format!("Turned {} objects by {degrees:.0}°", selected.len()),
+                };
+            }
+            return;
+        }
         if self.refuse_for_multiple_selection("rotate") {
             return;
         }
@@ -1059,6 +1302,32 @@ impl RoomEditor {
         let Some(object) = self.scene.objects.get_mut(index) else { return };
         self.history.record(SceneEdit::Replace { index, object: object.clone() });
         object.rotation_degrees.y = (object.rotation_degrees.y + degrees).rem_euclid(360.0);
+    }
+
+    /// Turns the objects `indices` together around the vertical line through
+    /// their middle by `degrees`, as one undo step. Models turn with them;
+    /// flats face the camera and lights have no direction.
+    fn turn_objects(&mut self, indices: &[usize], degrees: f32) {
+        let objects: Vec<&SceneObject> =
+            indices.iter().filter_map(|&index| self.scene.objects.get(index)).collect();
+        if objects.is_empty() {
+            return;
+        }
+        let middle = objects.iter().map(|object| object.position).sum::<Vec3>() / objects.len() as f32;
+        let turn = glam::Quat::from_rotation_y(degrees.to_radians());
+        let reverts = indices
+            .iter()
+            .map(|&index| SceneEdit::Replace { index, object: self.scene.objects[index].clone() })
+            .collect();
+        for &index in indices {
+            let object = &mut self.scene.objects[index];
+            let from_middle = object.position - middle;
+            object.position = middle + turn * from_middle;
+            if matches!(object.kind, SceneObjectKind::Model { .. }) {
+                object.set_rotation(turn * object.rotation());
+            }
+        }
+        self.history.record(SceneEdit::Group(reverts));
     }
 
     /// Reverts the last edit.

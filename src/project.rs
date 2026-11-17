@@ -27,8 +27,8 @@ use crate::arena2::{region_name, DungeonDefinition, LocationType, MapPixel, Text
 use crate::encounters::DungeonType;
 use crate::music::DungeonSong;
 use crate::scene::{
-    FlatData, LightData, ModelData, ObjectAction, ObjectId, Scene, SceneObject, SceneObjectKind,
-    ADDED_OBJECTS_GROUP,
+    FlatData, LightData, ModelData, ObjectAction, ObjectId, PrefabMember, Scene, SceneObject,
+    SceneObjectKind, ADDED_OBJECTS_GROUP,
 };
 
 /// File extension of project files, without the dot.
@@ -51,7 +51,75 @@ pub struct ProjectRoom {
     pub name: String,
     /// The Daggerfall room this one was copied from, for example `N0000004.RDB`.
     pub based_on: Option<String>,
+    /// The kind of cell, which gives the letter of its block name when exported.
+    pub category: CellCategory,
     pub objects: Vec<SceneObject>,
+}
+
+/// The kind of a cell. Daggerfall tells it by the first letter of the cell's
+/// block name (`N0000004.RDB` is an interior), so a project cell is exported
+/// under a block name starting with its category's letter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CellCategory {
+    /// `N`
+    #[default]
+    Interior,
+    /// `W`
+    Water,
+    /// `M`
+    Variant,
+    /// `S`
+    Special,
+    /// `B`
+    Border,
+}
+
+impl CellCategory {
+    /// Every category, in the order they are listed.
+    pub const ALL: [Self; 5] = [Self::Interior, Self::Water, Self::Variant, Self::Special, Self::Border];
+
+    /// The letter that block names of this category start with.
+    pub fn letter(self) -> char {
+        match self {
+            Self::Interior => 'N',
+            Self::Water => 'W',
+            Self::Variant => 'M',
+            Self::Special => 'S',
+            Self::Border => 'B',
+        }
+    }
+
+    /// Human readable name, for example "Interior with water".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Interior => "Interior",
+            Self::Water => "Interior with water",
+            Self::Variant => "Interior variant",
+            Self::Special => "Special (quest)",
+            Self::Border => "Border cap",
+        }
+    }
+
+    /// The category whose block names start with `letter` (in either case).
+    pub fn from_letter(letter: char) -> Option<Self> {
+        let letter = letter.to_ascii_uppercase();
+        Self::ALL.into_iter().find(|category| category.letter() == letter)
+    }
+
+    /// The category of the Daggerfall block `block_name`, for example
+    /// `N0000004.RDB`; `None` if it is not a block name (a letter, then digits).
+    pub fn of_block(block_name: &str) -> Option<Self> {
+        let mut characters = block_name.chars();
+        let letter = characters.next()?;
+        characters.next().filter(char::is_ascii_digit)?;
+        Self::from_letter(letter)
+    }
+
+    /// The category of a cell copied from the block `based_on`: that block's,
+    /// or an interior for a cell made from nothing.
+    pub fn of_copy(based_on: Option<&str>) -> Self {
+        based_on.and_then(Self::of_block).unwrap_or_default()
+    }
 }
 
 /// A dungeon belonging to the project.
@@ -509,7 +577,13 @@ impl Project {
     /// Adds an empty room called `name` at the top level and returns its id.
     pub fn add_empty_room(&mut self, name: &str) -> ItemId {
         let id = self.new_id();
-        let room = ProjectRoom { id, name: name.trim().to_string(), based_on: None, objects: Vec::new() };
+        let room = ProjectRoom {
+            id,
+            name: name.trim().to_string(),
+            based_on: None,
+            category: CellCategory::default(),
+            objects: Vec::new(),
+        };
         self.add(ProjectEntry::Room(room), None);
         id
     }
@@ -846,6 +920,10 @@ enum EntryFile {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         based_on: Option<String>,
+        /// The category's letter, for example "W". Files saved before cells had a
+        /// category of their own lack it; their cells keep that of `based_on`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<char>,
         objects: Vec<ObjectFile>,
     },
     Dungeon {
@@ -957,8 +1035,10 @@ struct DungeonRoomFile {
     room: Option<ItemId>,
 }
 
+/// An object as it is saved: in a project's cells, and in the prefabs of
+/// [`crate::prefabs::PrefabLibrary`].
 #[derive(Serialize, Deserialize)]
-struct ObjectFile {
+pub(crate) struct ObjectFile {
     /// Identifies the object within its cell, for action links.
     #[serde(default)]
     id: ObjectId,
@@ -977,6 +1057,15 @@ struct ObjectFile {
     /// Its scale along its X, Y and Z axes; absent when it is not scaled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scale: Option<[f32; 3]>,
+    /// The placed prefab it is part of; absent when it is not part of one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prefab: Option<PrefabMemberFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PrefabMemberFile {
+    instance: u32,
+    name: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1050,6 +1139,7 @@ impl EntryFile {
                 id: room.id,
                 name: room.name.clone(),
                 based_on: room.based_on.clone(),
+                category: Some(room.category.letter()),
                 objects: room.objects.iter().map(ObjectFile::from_object).collect(),
             },
             ProjectEntry::Dungeon(dungeon) => Self::Dungeon {
@@ -1089,10 +1179,13 @@ impl EntryFile {
                 name,
                 entries: entries.into_iter().map(|entry| entry.into_entry(project)).collect(),
             }),
-            Self::Room { id, name, based_on, objects } => ProjectEntry::Room(ProjectRoom {
+            Self::Room { id, name, based_on, category, objects } => ProjectEntry::Room(ProjectRoom {
                 // Rooms saved without an id (id 0) get a new one.
                 id: if id == 0 { project.new_id() } else { id },
                 name,
+                category: category
+                    .and_then(CellCategory::from_letter)
+                    .unwrap_or_else(|| CellCategory::of_copy(based_on.as_deref())),
                 based_on,
                 objects: {
                     let mut objects: Vec<SceneObject> =
@@ -1126,7 +1219,7 @@ impl EntryFile {
 }
 
 impl ObjectFile {
-    fn from_object(object: &SceneObject) -> Self {
+    pub(crate) fn from_object(object: &SceneObject) -> Self {
         let kind = match object.kind {
             SceneObjectKind::Model { model_id, data } => ObjectKindFile::Model {
                 model_id,
@@ -1161,10 +1254,14 @@ impl ObjectFile {
             rotation: object.rotation_degrees.to_array(),
             visible: object.visible,
             scale: object.scale.map(|scale| scale.to_array()),
+            prefab: object
+                .prefab
+                .as_ref()
+                .map(|member| PrefabMemberFile { instance: member.instance, name: member.name.clone() }),
         }
     }
 
-    fn into_object(self) -> SceneObject {
+    pub(crate) fn into_object(self) -> SceneObject {
         let kind = match self.kind {
             ObjectKindFile::Model { model_id, has_action, trigger_and_lock, sound, action } => {
                 let action = action
@@ -1198,6 +1295,7 @@ impl ObjectFile {
             rotation_degrees: Vec3::from_array(self.rotation),
             visible: self.visible,
             scale: self.scale.map(Vec3::from_array),
+            prefab: self.prefab.map(|member| PrefabMember { instance: member.instance, name: member.name }),
         }
     }
 }
@@ -1225,6 +1323,7 @@ mod tests {
                 id: 1,
                 next: Some(3),
                 scale: None,
+                prefab: None,
             },
             SceneObject {
                 name: "Torch".to_string(),
@@ -1239,6 +1338,7 @@ mod tests {
                 id: 2,
                 next: None,
                 scale: Some(Vec3::new(2.0, 0.5, 1.0)),
+                prefab: None,
             },
             SceneObject {
                 name: "Light".to_string(),
@@ -1250,6 +1350,7 @@ mod tests {
                 id: 3,
                 next: None,
                 scale: None,
+                prefab: Some(PrefabMember { instance: 2, name: "Lit alcove".to_string() }),
             },
         ]
     }
@@ -1259,6 +1360,7 @@ mod tests {
             id: project.new_id(),
             name: name.to_string(),
             based_on: Some("N0000004.RDB".to_string()),
+            category: CellCategory::Interior,
             objects: sample_objects(),
         })
     }
@@ -1389,6 +1491,38 @@ mod tests {
         assert_eq!(folder.entries.len(), 1);
         let ProjectEntry::Room(loaded_room) = &folder.entries[0] else { panic!("room expected") };
         assert_eq!(loaded_room.objects, sample_objects());
+    }
+
+    #[test]
+    fn cells_keep_their_category() {
+        let mut project = Project::default();
+        let entry = room(&mut project, "Hall");
+        let id = entry.id();
+        project.add(entry, None);
+        project.room_mut(id).unwrap().category = CellCategory::Water;
+        let text = project.to_file_text();
+        assert_eq!(Project::from_file_text(&text).unwrap().room(id).unwrap().category, CellCategory::Water);
+
+        // A cell saved before cells had a category has that of the block it was copied from.
+        let mut older: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let saved_room = older["entries"][0].as_object_mut().unwrap();
+        saved_room.remove("category");
+        saved_room.insert("based_on".to_string(), "B0000002.RDB".into());
+        let loaded = Project::from_file_text(&older.to_string()).unwrap();
+        assert_eq!(loaded.room(id).unwrap().category, CellCategory::Border);
+    }
+
+    #[test]
+    fn categories_come_from_block_names() {
+        assert_eq!(CellCategory::of_block("W0000005.RDB"), Some(CellCategory::Water));
+        assert_eq!(CellCategory::of_block("s0000999.rdb"), Some(CellCategory::Special));
+        // A new cell's name stands in for its block name in a dungeon; it has no category.
+        assert_eq!(CellCategory::of_block("Mine shaft"), None);
+        assert_eq!(CellCategory::of_block("L0000001.RDB"), None);
+        assert_eq!(CellCategory::of_copy(None), CellCategory::Interior);
+        for category in CellCategory::ALL {
+            assert_eq!(CellCategory::from_letter(category.letter()), Some(category));
+        }
     }
 
     #[test]

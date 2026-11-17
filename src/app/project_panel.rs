@@ -864,13 +864,14 @@ fn show_drag_preview(context: &egui::Context, project: &Project, dungeons: &[Dun
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project::{DungeonLocation, ProjectDungeon, ProjectRoom};
+    use crate::project::{CellCategory, DungeonLocation, ProjectDungeon, ProjectRoom};
 
     fn room(project: &mut Project, name: &str) -> ProjectEntry {
         ProjectEntry::Room(ProjectRoom {
             id: project.new_id(),
             name: name.into(),
             based_on: None,
+            category: CellCategory::Interior,
             objects: Vec::new(),
         })
     }

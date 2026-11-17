@@ -138,14 +138,17 @@ pub struct FrameRequest<'frame> {
     pub selected_objects: &'frame [usize],
     /// More objects drawn as hovered, such as those inside a selection box.
     pub hovered_objects: &'frame [usize],
+    /// More objects tinted as hovered, without the boxes drawn around
+    /// `hovered_objects`: the rest of a prefab under the pointer.
+    pub highlighted_objects: &'frame [usize],
     /// Every object whose group index matches is highlighted (used for whole rooms in the dungeon view).
     pub highlighted_group: Option<usize>,
     /// More groups highlighted the same way, such as the rooms inside a selection box.
     pub highlighted_groups: &'frame [usize],
     /// Groups whose every object is drawn as selected (selected rooms in the dungeon view).
     pub selected_groups: &'frame [usize],
-    /// Object being placed from the asset palette, drawn as a ghost.
-    pub placement_preview: Option<&'frame SceneObject>,
+    /// Objects being placed from the asset palette (several for a prefab), drawn as ghosts.
+    pub placement_preview: &'frame [SceneObject],
     /// Water surfaces to draw, each the corner of a cell's square at its water height.
     pub water_planes: &'frame [Vec3],
     /// Squares of ground to draw: each one's minimum corner and side, in world units.
@@ -626,7 +629,7 @@ impl SceneRenderer {
                 ROOM_HIGHLIGHT
             } else if request.hovered_objects.contains(&index) {
                 BOX_SELECTION_HIGHLIGHT
-            } else if request.hovered_object == Some(index) {
+            } else if request.hovered_object == Some(index) || request.highlighted_objects.contains(&index) {
                 HOVER_HIGHLIGHT
             } else {
                 [0.0; 4]
@@ -649,7 +652,7 @@ impl SceneRenderer {
             .enumerate()
             .filter(|(_, object)| object.visible)
             .map(|(index, object)| (object, highlight_for(index, object)))
-            .chain(request.placement_preview.map(|object| (object, PLACEMENT_PREVIEW_HIGHLIGHT)))
+            .chain(request.placement_preview.iter().map(|object| (object, PLACEMENT_PREVIEW_HIGHLIGHT)))
             .chain(
                 request
                     .context_scene
@@ -809,9 +812,10 @@ fn build_helper_lines(library: &mut Arena2Library, request: &FrameRequest<'_>) -
         }
     }
 
-    if let Some(SceneObject { kind: SceneObjectKind::Light { radius, .. }, position, .. }) =
-        request.placement_preview
-    {
+    for object in request.placement_preview {
+        let SceneObject { kind: SceneObjectKind::Light { radius, .. }, position, .. } = object else {
+            continue;
+        };
         for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
             let offset = axis * LIGHT_PICK_RADIUS;
             lines.add_line(*position - offset, *position + offset, PLACEMENT_PREVIEW_LINE_COLOR);

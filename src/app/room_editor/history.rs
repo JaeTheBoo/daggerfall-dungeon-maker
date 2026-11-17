@@ -138,6 +138,7 @@ mod tests {
             id: 0,
             next: None,
             scale: None,
+            prefab: None,
         }
     }
 

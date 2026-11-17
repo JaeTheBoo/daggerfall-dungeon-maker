@@ -201,6 +201,25 @@ fn describes_every_model() {
         }
     }
     println!("room model categories: {category_counts:?}");
+
+    // Exterior models come from the outdoor blocks: buildings, walls and scenery
+    // that dungeon cells never use, and the dungeon entrances seen from outside.
+    println!(
+        "{} exterior models, {} dungeon models",
+        catalog.exterior_models.len(),
+        catalog.room_models.len()
+    );
+    assert!(catalog.exterior_models.len() > 100);
+    let outdoors_only =
+        catalog.exterior_models.iter().filter(|model| catalog.room_model(model.model_id).is_none()).count();
+    assert!(outdoors_only > catalog.exterior_models.len() / 2, "{outdoors_only}");
+    assert!(catalog.exterior_models.iter().any(|model| {
+        catalog
+            .model_description(model.model_id)
+            .is_some_and(|description| description.category == ModelCategory::DungeonEntrance)
+    }));
+    let ranked = catalog.exterior_models.windows(2).all(|pair| pair[0].room_count >= pair[1].room_count);
+    assert!(ranked, "exterior models are listed most widely used first");
 }
 
 #[test]
@@ -429,7 +448,7 @@ fn exports_a_project_dungeon_as_a_new_location() {
     use daggerfall_dungeon_maker::arena2::MapPixel;
     use daggerfall_dungeon_maker::export::{build_mod, check_project};
     use daggerfall_dungeon_maker::project::{
-        DungeonLocation, ModDetails, Project, ProjectDungeonRoom, ProjectEntry, ProjectRoom,
+        CellCategory, DungeonLocation, ModDetails, Project, ProjectDungeonRoom, ProjectEntry, ProjectRoom,
     };
     use daggerfall_dungeon_maker::scene::Scene;
     let Some(mut library) = open_library() else { return };
@@ -455,6 +474,8 @@ fn exports_a_project_dungeon_as_a_new_location() {
             id: room_id,
             name: "My start".to_string(),
             based_on: Some(start.block_name.clone()),
+            // The cell's category, not the block it was copied from, gives its block name's letter.
+            category: CellCategory::Water,
             objects: scene.objects,
         }),
         None,
@@ -480,7 +501,7 @@ fn exports_a_project_dungeon_as_a_new_location() {
     assert_eq!(mod_files.file_name, "Export_Test");
     assert_eq!(mod_files.cells.len(), 1);
     let block_name = &mod_files.cells[0].block_name;
-    assert!(block_name.starts_with(&start.block_name[..1]) && block_name.ends_with(".RDB"), "{block_name}");
+    assert!(block_name.starts_with('W') && block_name.ends_with(".RDB"), "{block_name}");
     assert!(paths.contains(&format!("WorldData/{block_name}.json").as_str()));
     let location_file = format!("WorldData/locationnew-Test_Hold_of_Export-{region}.json");
     let location = mod_files.files.iter().find(|file| file.path == location_file).expect("the location file");
@@ -720,7 +741,8 @@ fn exports_a_dungeon_replacing_one_of_daggerfalls() {
 fn a_castle_daggerfall_copy_keeps_its_foyer_doors_ids() {
     use daggerfall_dungeon_maker::export::{build_mod, check_project, CASTLE_DAGGERFALL_MAP_ID};
     use daggerfall_dungeon_maker::project::{
-        DungeonLocation, DungeonReference, ModDetails, Project, ProjectDungeonRoom, ProjectEntry, ProjectRoom,
+        CellCategory, DungeonLocation, DungeonReference, ModDetails, Project, ProjectDungeonRoom,
+        ProjectEntry, ProjectRoom,
     };
     use daggerfall_dungeon_maker::scene::Scene;
     let Some(mut library) = open_library() else { return };
@@ -741,6 +763,7 @@ fn a_castle_daggerfall_copy_keeps_its_foyer_doors_ids() {
             id: room_id,
             name: "My foyer".to_string(),
             based_on: Some(start.block_name.clone()),
+            category: CellCategory::Special,
             objects: scene.objects,
         }),
         None,
@@ -868,6 +891,7 @@ fn finds_openings_that_lead_to_empty_space() {
         visible: true,
         next: None,
         scale: None,
+        prefab: None,
     };
     let found = unclosed_faces(std::slice::from_ref(&corridor), |_| true, &mut library, &mut cache);
     let normals: Vec<glam::Vec3> = found.iter().map(|face| face.face.normal.round()).collect();

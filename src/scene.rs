@@ -519,6 +519,20 @@ pub struct SceneObject {
     /// usual size). Flats use X for their width and Y for their height. Only a
     /// `.dfmod` can show it in the game; see [`SceneObject::scale_blocker`].
     pub scale: Option<Vec3>,
+    /// The placed prefab the object is part of, if it is. The editor only:
+    /// the game sees the objects of a prefab as any others.
+    pub prefab: Option<PrefabMember>,
+}
+
+/// Marks an object as part of a prefab placed in a cell. The objects of one
+/// placed prefab are selected, moved and deleted together, and cannot be
+/// changed one by one until the prefab is broken up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefabMember {
+    /// Tells this placed prefab from the cell's others (see [`Scene::new_prefab_instance`]).
+    pub instance: u32,
+    /// The prefab's name, kept with it so it outlives the prefab's place in the menu.
+    pub name: String,
 }
 
 impl SceneObject {
@@ -774,6 +788,7 @@ impl Scene {
                     visible: true,
                     next,
                     scale: None,
+                    prefab: None,
                 }
             })
             .collect();
@@ -803,6 +818,47 @@ impl Scene {
     /// An id no object in the cell uses yet, for a new object.
     pub fn new_object_id(&self) -> ObjectId {
         self.objects.iter().map(|object| object.id).max().unwrap_or(0) + 1
+    }
+
+    /// A number no prefab placed in the cell uses yet, for a newly placed one.
+    pub fn new_prefab_instance(&self) -> u32 {
+        Self::prefab_instance_after(&self.objects)
+    }
+
+    /// A prefab number none of `objects` uses yet.
+    pub fn prefab_instance_after(objects: &[SceneObject]) -> u32 {
+        objects
+            .iter()
+            .filter_map(|object| object.prefab.as_ref())
+            .map(|member| member.instance)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    /// Indices of the objects of the placed prefab `instance`.
+    pub fn prefab_members(&self, instance: u32) -> Vec<usize> {
+        self.objects
+            .iter()
+            .enumerate()
+            .filter(|(_, object)| object.prefab.as_ref().is_some_and(|member| member.instance == instance))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Indices of the objects of the placed prefab that object `index` is part
+    /// of, `index` among them; just `index` if it is not part of one.
+    pub fn prefab_of(&self, index: usize) -> Vec<usize> {
+        match self.objects.get(index).and_then(|object| object.prefab.as_ref()) {
+            Some(member) => self.prefab_members(member.instance),
+            None => vec![index],
+        }
+    }
+
+    /// World space bounds of the objects `indices`, as [`Scene::bounds`] works them out.
+    pub fn bounds_of(&self, indices: &[usize], library: &mut Arena2Library) -> Option<(Vec3, Vec3)> {
+        let objects = indices.iter().filter_map(|&index| self.objects.get(index)).cloned().collect();
+        Scene { block_name: String::new(), objects }.bounds(library)
     }
 
     /// Numbers `objects` 1, 2, 3, … if any id is missing (0) or repeated, as in
@@ -957,6 +1013,7 @@ mod tests {
             visible: true,
             next: None,
             scale: Some(Vec3::new(2.0, 3.0, 4.0)),
+            prefab: None,
         };
         let plain = model(1234);
         // Scaled along its own axes, then turned, then moved.
@@ -1004,6 +1061,7 @@ mod tests {
             id: 0,
             next: None,
             scale: None,
+            prefab: None,
         };
         let radians = object.rotation_degrees * (std::f32::consts::PI / 180.0);
         let expected = Mat4::from_translation(object.position)
@@ -1028,6 +1086,7 @@ mod tests {
             id: 0,
             next: None,
             scale: None,
+            prefab: None,
         };
         // The game ignores the high byte.
         let orc = marker(0x3507, 0, 0).fixed_enemy().unwrap();
@@ -1056,6 +1115,7 @@ mod tests {
             id: 0,
             next: None,
             scale: None,
+            prefab: None,
         };
         let mage = FixedEnemy { mobile_id: 128, passive: true, gender: EnemyGender::Female };
         object.set_fixed_enemy(mage);
@@ -1088,6 +1148,7 @@ mod tests {
             id: 0,
             next: None,
             scale: None,
+            prefab: None,
         };
         // A water byte of 5 puts the water 40 native units (1 m) up.
         let deep = flat(RANDOM_ENEMY_MARKER_RECORD, 0, 0.5);
@@ -1116,6 +1177,7 @@ mod tests {
             visible: true,
             next: Some(7),
             scale: None,
+            prefab: None,
         };
         let mut good = vec![light(4), light(9)];
         Scene::ensure_object_ids(&mut good);
@@ -1179,6 +1241,7 @@ mod tests {
             visible: true,
             next: None,
             scale: None,
+            prefab: None,
         };
         let halfway = object.moved_by(&lift, 0.5);
         assert_eq!(halfway.position, Vec3::new(0.0, 1.6, 0.0));
@@ -1198,6 +1261,7 @@ mod tests {
             visible: true,
             next,
             scale: None,
+            prefab: None,
         };
         let rotate = Some(ObjectAction { action_type: 0x08, axis: 4, duration: 20, magnitude: 512 });
         // Lever (10) -> object with no action (20) -> moving wall (30) -> lever again (loop).
@@ -1227,6 +1291,7 @@ mod tests {
             visible: true,
             next: None,
             scale: None,
+            prefab: None,
         };
         let box_2m = Some((Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 2.0, 1.0)));
         assert_eq!(object(10.0, 0.0).distance_outside_cell(None), 0.0);
@@ -1251,6 +1316,7 @@ mod tests {
             id: 0,
             next: None,
             scale: None,
+            prefab: None,
         };
         let mut scene = Scene {
             block_name: "N0000000.RDB".to_string(),

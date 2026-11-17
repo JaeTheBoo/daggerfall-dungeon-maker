@@ -32,9 +32,10 @@ use crate::catalog::AssetCatalog;
 use crate::connectors::OpeningsLeftOpen;
 use crate::custom_names::CustomNames;
 use crate::dungeon_textures::{DungeonIdentity, TextureMode, TextureSetting};
+use crate::prefabs::PrefabLibrary;
 use crate::project::{
-    DungeonLocation, ItemId, Project, ProjectDungeon, ProjectDungeonRoom, ProjectEntry, ProjectRoom,
-    PROJECT_FILE_EXTENSION,
+    CellCategory, DungeonLocation, ItemId, Project, ProjectDungeon, ProjectDungeonRoom, ProjectEntry,
+    ProjectRoom, PROJECT_FILE_EXTENSION,
 };
 use crate::render::{RoomOutline, SceneRenderer};
 use crate::scene::Scene;
@@ -51,6 +52,8 @@ use viewport_tools::EditorResources;
 const ARENA2_FOLDER_STORAGE_KEY: &str = "arena2_folder";
 /// Storage key under which the user's room and model names are saved.
 const CUSTOM_NAMES_STORAGE_KEY: &str = "custom_names";
+/// The user's prefabs, saved as JSON text (see [`PrefabLibrary::to_text`]).
+const PREFABS_STORAGE_KEY: &str = "prefabs";
 /// Storage key of the openings Daggerfall's dungeons leave open, learned from the game data.
 const OPENINGS_STORAGE_KEY: &str = "openings_left_open";
 /// Storage key of the export window's settings (folders, Unity editor, platforms).
@@ -166,6 +169,8 @@ pub struct DungeonMakerApp {
     cell_usage: HashMap<String, Vec<usize>>,
     /// The user's own names for rooms and models, saved with the settings.
     custom_names: CustomNames,
+    /// The user's prefabs, saved with the settings.
+    prefabs: PrefabLibrary,
     /// The user's own rooms and dungeons.
     project: Project,
     /// Where the project was last saved or opened from; `None` until it is saved.
@@ -234,6 +239,14 @@ impl DungeonMakerApp {
             .storage
             .and_then(|storage| eframe::get_value(storage, CUSTOM_NAMES_STORAGE_KEY))
             .unwrap_or_default();
+        let prefabs = match stored_string(PREFABS_STORAGE_KEY).map(|text| PrefabLibrary::from_text(&text)) {
+            Some(Ok(prefabs)) => prefabs,
+            Some(Err(error)) => {
+                log::warn!("could not read the saved prefabs: {error}");
+                PrefabLibrary::default()
+            }
+            None => PrefabLibrary::default(),
+        };
 
         let mut project_panel = ProjectPanel::default();
         if let Some(view) =
@@ -259,6 +272,7 @@ impl DungeonMakerApp {
             catalog: AssetCatalog::default(),
             cell_usage: HashMap::new(),
             custom_names,
+            prefabs,
             project,
             project_path: None,
             saved_project,
@@ -473,6 +487,7 @@ impl DungeonMakerApp {
                 let mut editor =
                     RoomEditor::new(scene, room.name.clone(), egui::Id::new("main_room_editor"), library);
                 editor.set_project_room_name(Some(room.name.clone()));
+                editor.set_cell_category(Some(room.category));
                 self.status_message = editor.status_message().to_string();
                 self.set_workspace(Workspace::Room(Box::new(editor)), Some(OpenedItem::Project(id)));
             }
@@ -548,6 +563,9 @@ impl DungeonMakerApp {
         let mut editor = RoomEditor::new(room.scene.clone(), title, editor_id, library);
         // Daggerfall's own rooms stay read-only, even in a project dungeon.
         editor.set_read_only(room.project_room.is_none());
+        editor.set_cell_category(
+            room.project_room.and_then(|room_id| self.project.room(room_id)).map(|room| room.category),
+        );
         editor.set_dungeon_type(view.dungeon_type);
         // The dungeon it was opened from is selected under "Used in", so its
         // other cells show faded around this one.
@@ -612,6 +630,9 @@ impl DungeonMakerApp {
                 if let Some(room) = self.project.room_mut(id) {
                     if room.objects != editor.scene.objects {
                         room.objects = editor.scene.objects.clone();
+                    }
+                    if let Some(category) = editor.cell_category() {
+                        room.category = category;
                     }
                 }
             }
@@ -936,6 +957,7 @@ impl DungeonMakerApp {
                     id: self.project.new_id(),
                     name: self.project.copy_name(&base_name),
                     based_on: Some(room_name.clone()),
+                    category: CellCategory::of_copy(Some(room_name)),
                     objects: scene.objects,
                 })
             }
@@ -976,9 +998,11 @@ impl DungeonMakerApp {
         };
         self.opened_item = Some(OpenedItem::Project(id));
         let message = format!("{}. You can now edit it.", self.status_message);
+        let category = self.project.room(id).map(|room| room.category);
         match &mut self.workspace {
             Workspace::Room(editor) => {
                 editor.set_read_only(false);
+                editor.set_cell_category(category);
                 editor.set_status_message(message);
             }
             Workspace::Dungeon(_) | Workspace::Empty => {}
@@ -1014,6 +1038,7 @@ impl DungeonMakerApp {
             ProjectEntry::Room(ProjectRoom {
                 id: room_id,
                 name: name.clone(),
+                category: CellCategory::of_copy(Some(&block_name)),
                 based_on: Some(block_name),
                 objects,
             }),
@@ -1029,6 +1054,7 @@ impl DungeonMakerApp {
         }
         if let Some(window) = self.room_windows.iter_mut().find(|window| window.viewport_id == viewport) {
             window.editor.set_read_only(false);
+            window.editor.set_cell_category(self.project.room(room_id).map(|room| room.category));
             window
                 .editor
                 .set_status_message(format!("Created {name} for {dungeon_name}. You can now edit it."));
@@ -1458,6 +1484,7 @@ impl DungeonMakerApp {
             renderer: self.renderer.as_mut(),
             catalog: &self.catalog,
             custom_names: &mut self.custom_names,
+            prefabs: &mut self.prefabs,
             texture_setting: &mut self.texture_setting,
             game_texture_mode: self.game_texture_mode,
         };
@@ -1758,11 +1785,17 @@ impl DungeonMakerApp {
                 (room.origin.x / crate::arena2::RDB_BLOCK_SIDE).round() as i32,
                 (room.origin.z / crate::arena2::RDB_BLOCK_SIDE).round() as i32,
             );
-            picked.push((layout_index, room.scene.objects.clone(), spot, room.is_starting_block));
+            picked.push((
+                layout_index,
+                room.scene.objects.clone(),
+                spot,
+                room.is_starting_block,
+                room.category,
+            ));
         }
         let sources: Vec<crate::merge::MergeSource<'_>> = picked
             .iter()
-            .map(|(_, objects, spot, is_start)| crate::merge::MergeSource {
+            .map(|(_, objects, spot, is_start, _)| crate::merge::MergeSource {
                 objects,
                 spot: *spot,
                 is_start: *is_start,
@@ -1798,6 +1831,8 @@ impl DungeonMakerApp {
                 id: room_id,
                 name: name.clone(),
                 based_on,
+                // The cell whose place it takes decides its kind.
+                category: picked[merged.anchor].4,
                 objects: merged.objects,
             }),
             None,
@@ -1961,6 +1996,7 @@ impl DungeonMakerApp {
             renderer: self.renderer.as_mut(),
             catalog: &self.catalog,
             custom_names: &mut self.custom_names,
+            prefabs: &mut self.prefabs,
             texture_setting: &mut self.texture_setting,
             game_texture_mode: self.game_texture_mode,
         };
@@ -2005,6 +2041,13 @@ impl DungeonMakerApp {
                 (window.dungeon_room_index, &mut self.workspace)
             {
                 view.update_room_objects(room_index, &window.editor.scene.objects);
+                let project_room = view.room(room_index).and_then(|room| room.project_room);
+                if let (Some(category), Some(room_id)) = (window.editor.cell_category(), project_room) {
+                    view.set_room_category(room_index, category);
+                    if let Some(room) = self.project.room_mut(room_id) {
+                        room.category = category;
+                    }
+                }
             }
         }
 
@@ -2269,6 +2312,7 @@ impl eframe::App for DungeonMakerApp {
             self.project_path.as_deref().map(|path| path.display().to_string()).unwrap_or_default();
         storage.set_string(PROJECT_FILE_STORAGE_KEY, project_file);
         eframe::set_value(storage, CUSTOM_NAMES_STORAGE_KEY, &self.custom_names);
+        storage.set_string(PREFABS_STORAGE_KEY, self.prefabs.to_text());
         eframe::set_value(storage, PANEL_VIEW_STORAGE_KEY, &self.project_panel.view);
         eframe::set_value(storage, EXPORT_SETTINGS_STORAGE_KEY, &self.export_window.settings);
         eframe::set_value(storage, DUNGEON_TEXTURES_STORAGE_KEY, &self.texture_setting);

@@ -414,7 +414,8 @@ impl EntrancePicker {
                 highlighted_group: None,
                 highlighted_groups: &[],
                 selected_groups: &[],
-                placement_preview: None,
+                placement_preview: &[],
+                highlighted_objects: &[],
                 context_scene: None,
                 ground_squares: &preview.ground,
                 water_planes: &[],
@@ -514,6 +515,7 @@ fn preview_object(
         visible: true,
         next: None,
         scale: None,
+        prefab: None,
     }
 }
 

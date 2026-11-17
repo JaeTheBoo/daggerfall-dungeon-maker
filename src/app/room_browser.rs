@@ -6,15 +6,7 @@
 use eframe::egui;
 
 use crate::custom_names::CustomNames;
-
-/// Block categories, keyed by the first letter of the block name.
-const ROOM_CATEGORIES: [(char, &str); 5] = [
-    ('N', "Interior"),
-    ('W', "Interior with water"),
-    ('M', "Interior variant"),
-    ('S', "Special (quest)"),
-    ('B', "Border cap"),
-];
+use crate::project::CellCategory;
 
 /// State of the room browser window.
 #[derive(Default)]
@@ -62,9 +54,10 @@ impl RoomBrowser {
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut self.category_filter, None, "All");
-                    for (letter, description) in ROOM_CATEGORIES {
-                        ui.selectable_value(&mut self.category_filter, Some(letter), format!("{letter}"))
-                            .on_hover_text(description);
+                    for category in CellCategory::ALL {
+                        let letter = category.letter();
+                        ui.selectable_value(&mut self.category_filter, Some(letter), letter.to_string())
+                            .on_hover_text(category.label());
                     }
                 });
                 ui.separator();
@@ -136,11 +129,24 @@ pub fn show_room_name_field(ui: &mut egui::Ui, block_name: &str, custom_names: &
     }
 }
 
-/// Human readable category of a room, based on its name's first letter.
+/// Human readable category of the Daggerfall room `room_name`, from its
+/// name's first letter; empty if it is not a block name.
 pub fn category_description(room_name: &str) -> &'static str {
-    let first_letter = room_name.chars().next().unwrap_or(' ');
-    ROOM_CATEGORIES
-        .iter()
-        .find(|(letter, _)| *letter == first_letter)
-        .map_or("", |(_, description)| description)
+    CellCategory::of_block(room_name).map_or("", CellCategory::label)
+}
+
+/// Draws a drop-down list choosing `category`. Returns whether the user changed it.
+pub fn show_category_choice(ui: &mut egui::Ui, id: egui::Id, category: &mut CellCategory) -> bool {
+    let before = *category;
+    egui::ComboBox::from_id_salt(id).selected_text(category_text(*category)).show_ui(ui, |ui| {
+        for choice in CellCategory::ALL {
+            ui.selectable_value(category, choice, category_text(choice));
+        }
+    });
+    *category != before
+}
+
+/// A category as the user sees it, for example "W · Interior with water".
+pub fn category_text(category: CellCategory) -> String {
+    format!("{} · {}", category.letter(), category.label())
 }

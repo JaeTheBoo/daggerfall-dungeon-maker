@@ -237,11 +237,22 @@ impl Arena2Library {
 
     /// Returns the names of every RDB dungeon block (room), sorted alphabetically.
     pub fn rdb_block_names(&self) -> Vec<String> {
+        self.block_names_ending(".RDB")
+    }
+
+    /// Returns the names of every RMB block (the outside of towns, castles,
+    /// ruins and dungeon entrances), sorted alphabetically.
+    pub fn rmb_block_names(&self) -> Vec<String> {
+        self.block_names_ending(".RMB")
+    }
+
+    /// The names of the blocks in `BLOCKS.BSA` that end with `extension`, sorted.
+    fn block_names_ending(&self, extension: &str) -> Vec<String> {
         let mut names: Vec<String> = self
             .blocks_archive
             .entries()
             .iter()
-            .filter(|entry| entry.name.to_ascii_uppercase().ends_with(".RDB"))
+            .filter(|entry| entry.name.to_ascii_uppercase().ends_with(extension))
             .map(|entry| entry.name.clone())
             .collect();
         names.sort();

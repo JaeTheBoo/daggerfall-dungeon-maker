@@ -3,7 +3,8 @@
 //! The catalog is computed at run time from the user's own game data when
 //! the ARENA2 folder is loaded. Nothing is stored with the program: every
 //! RDB block is scanned to find the models and flats Daggerfall actually uses
-//! in its dungeon rooms, and ARCH3D is listed for the full model set.
+//! in its dungeon rooms, every RMB block for the models it uses outdoors
+//! (buildings, walls, scenery), and ARCH3D is listed for the full model set.
 //!
 //! Daggerfall's models have numbers, not names, so each model also gets a
 //! [`ModelDescription`] worked out from its data: whether its faces are drawn
@@ -55,9 +56,9 @@ const MARKER_NAMES: [(u8, &str); 8] = [
 pub struct ModelAsset {
     /// Record identifier in `ARCH3D.BSA`.
     pub model_id: u32,
-    /// Number of different rooms that use the model.
+    /// Number of different rooms (or, for exterior models, outdoor blocks) that use the model.
     pub room_count: usize,
-    /// Total number of times the model is placed across all rooms.
+    /// Total number of times the model is placed across all of them.
     pub placement_count: usize,
     /// Number of those placements that have an action attached (it moves or triggers something).
     pub action_placement_count: usize,
@@ -201,6 +202,9 @@ impl FlatAsset {
 pub struct AssetCatalog {
     /// Models used in at least one dungeon room, most widely used first.
     pub room_models: Vec<ModelAsset>,
+    /// Models used outdoors, in at least one RMB block (buildings, walls,
+    /// scenery and dungeon entrances seen from outside), most widely used first.
+    pub exterior_models: Vec<ModelAsset>,
     /// Every model in `ARCH3D.BSA`, by id.
     pub all_model_ids: Vec<u32>,
     /// Non-marker flats used in at least one dungeon room, most widely used first.
@@ -263,18 +267,7 @@ impl AssetCatalog {
             door_slots.learn(&Scene::from_rdb_block(&block), library);
         }
 
-        let mut room_models: Vec<ModelAsset> = model_usage
-            .into_iter()
-            .map(|(model_id, usage)| ModelAsset {
-                model_id,
-                room_count: usage.rooms.len(),
-                placement_count: usage.placement_count,
-                action_placement_count: usage.action_placement_count,
-            })
-            .collect();
-        room_models.sort_by(|first, second| {
-            second.room_count.cmp(&first.room_count).then(first.model_id.cmp(&second.model_id))
-        });
+        let room_models = most_used_first(model_usage);
         let room_model_positions =
             room_models.iter().enumerate().map(|(position, model)| (model.model_id, position)).collect();
 
@@ -298,6 +291,7 @@ impl AssetCatalog {
 
         let mut catalog = Self {
             room_models,
+            exterior_models: exterior_models(library),
             all_model_ids: library.model_ids(),
             flats,
             markers,
@@ -328,6 +322,45 @@ impl AssetCatalog {
     pub fn model_description(&self, model_id: u32) -> Option<&ModelDescription> {
         self.model_descriptions.get(&model_id)
     }
+}
+
+/// The models of `usage`, most widely used first.
+fn most_used_first(usage: BTreeMap<u32, ModelUsageCounter>) -> Vec<ModelAsset> {
+    let mut models: Vec<ModelAsset> = usage
+        .into_iter()
+        .map(|(model_id, usage)| ModelAsset {
+            model_id,
+            room_count: usage.rooms.len(),
+            placement_count: usage.placement_count,
+            action_placement_count: usage.action_placement_count,
+        })
+        .collect();
+    models.sort_by(|first, second| {
+        second.room_count.cmp(&first.room_count).then(first.model_id.cmp(&second.model_id))
+    });
+    models
+}
+
+/// The models Daggerfall uses outdoors: those of every RMB block's
+/// buildings (seen from outside) and its loose models. Blocks that fail to
+/// parse are skipped and logged.
+fn exterior_models(library: &Arena2Library) -> Vec<ModelAsset> {
+    let mut usage: BTreeMap<u32, ModelUsageCounter> = BTreeMap::new();
+    for (block_index, name) in library.rmb_block_names().iter().enumerate() {
+        let block = match library.rmb_block(name) {
+            Ok(block) => block,
+            Err(error) => {
+                log::warn!("skipping {name} while listing exterior models: {error}");
+                continue;
+            }
+        };
+        for model in &block.models {
+            let counter = usage.entry(model.model_id).or_default();
+            counter.rooms.insert(block_index);
+            counter.placement_count += 1;
+        }
+    }
+    most_used_first(usage)
 }
 
 /// Short human readable description of a flat texture.
