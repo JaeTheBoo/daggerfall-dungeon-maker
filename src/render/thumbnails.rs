@@ -76,6 +76,13 @@ impl ThumbnailCache {
         }
     }
 
+    /// Releases the thumbnail of `model_id`, to render it again.
+    pub(super) fn forget(&mut self, render_state: &egui_wgpu::RenderState, model_id: u32) {
+        if let Some(Some(thumbnail)) = self.thumbnails.remove(&model_id) {
+            render_state.renderer.write().free_texture(&thumbnail.texture_id);
+        }
+    }
+
     /// Releases every thumbnail texture.
     pub(super) fn clear(&mut self, render_state: &egui_wgpu::RenderState) {
         let mut egui_renderer = render_state.renderer.write();

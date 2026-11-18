@@ -116,6 +116,38 @@ impl PrefabLibrary {
         self.push(name.trim().to_string(), objects)
     }
 
+    /// The names of the prefabs holding model `model_id`.
+    pub fn prefabs_using_model(&self, model_id: u32) -> Vec<&str> {
+        self.prefabs
+            .iter()
+            .filter(|prefab| prefab.objects.iter().any(|object| object.is_model(model_id)))
+            .map(|prefab| prefab.name.as_str())
+            .collect()
+    }
+
+    /// Removes every copy of model `model_id` from the prefabs (and the links
+    /// to them), and the prefabs left empty. Returns how many copies were removed.
+    pub fn remove_model(&mut self, model_id: u32) -> usize {
+        let mut removed = 0;
+        for prefab in &mut self.prefabs {
+            let gone: HashSet<ObjectId> = prefab
+                .objects
+                .iter()
+                .filter(|object| object.is_model(model_id))
+                .map(|object| object.id)
+                .collect();
+            prefab.objects.retain(|object| !object.is_model(model_id));
+            for object in &mut prefab.objects {
+                if object.next.is_some_and(|next| gone.contains(&next)) {
+                    object.next = None;
+                }
+            }
+            removed += gone.len();
+        }
+        self.prefabs.retain(|prefab| !prefab.objects.is_empty());
+        removed
+    }
+
     /// Removes the prefab `id` from the library. Copies already placed stay.
     pub fn remove(&mut self, id: PrefabId) -> Option<Prefab> {
         let position = self.prefabs.iter().position(|prefab| prefab.id == id)?;
@@ -202,6 +234,7 @@ mod tests {
             next,
             scale: None,
             prefab: Some(PrefabMember { instance: 4, name: "Older".to_string() }),
+            folder: None,
         }
     }
 
@@ -211,6 +244,23 @@ mod tests {
             next: None,
             ..model(id, position, None)
         }
+    }
+
+    #[test]
+    fn removing_a_model_takes_its_copies_out_of_prefabs() {
+        let mut library = PrefabLibrary::default();
+        // Object 7 (model 55007) triggers object 8 (model 55008).
+        let gate = library.add("Gate", &[model(7, Vec3::ZERO, Some(8)), model(8, Vec3::X, None)], Vec3::ZERO);
+        library.add("Lever", &[model(8, Vec3::ZERO, None)], Vec3::ZERO);
+        assert_eq!(library.prefabs_using_model(55008), ["Gate", "Lever"]);
+
+        assert_eq!(library.remove_model(55008), 2);
+        // The gate keeps its other object, no longer linked; the lever, left empty, is gone.
+        assert_eq!(library.prefabs().len(), 1);
+        let gate = library.get(gate).unwrap();
+        assert_eq!(gate.objects.len(), 1);
+        assert_eq!(gate.objects[0].next, None);
+        assert!(library.prefabs_using_model(55008).is_empty());
     }
 
     #[test]

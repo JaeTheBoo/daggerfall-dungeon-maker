@@ -10,7 +10,9 @@ use glam::Vec2;
 use super::blocks::{parse_rdb_block, read_model_tags, RdbBlock};
 use super::bsa::BsaArchive;
 use super::error::{read_file, Arena2Error, Arena2Result};
-use super::maps::{read_all_dungeons, read_all_location_ids, DungeonDefinition};
+use super::maps::{
+    read_all_dungeons, read_all_location_ids, read_all_locations, DungeonDefinition, LocationDefinition,
+};
 use super::mesh::{parse_model, ModelMesh};
 use super::rmb::{parse_rmb_block, RmbBlock};
 use super::texture::{read_archive_name, Palette, RgbaImage, TextureArchive, ARCHIVE_HEADER_SIZE};
@@ -19,6 +21,9 @@ use super::{TextureKey, WORLD_SCALE};
 
 /// Archive holding every 3D model.
 const MODELS_FILE: &str = "ARCH3D.BSA";
+/// Id of the first model the program makes itself (such as the ground of an
+/// outdoor cell), above Daggerfall's and the user's imported models.
+pub const FIRST_GENERATED_MODEL_ID: u32 = 9_000_000;
 /// Archive holding every city (RMB) and dungeon (RDB) block.
 const BLOCKS_FILE: &str = "BLOCKS.BSA";
 /// Archive holding region, location and dungeon layout data. Optional: only needed to open dungeons.
@@ -57,9 +62,18 @@ pub struct Arena2Library {
     /// Names from texture archive headers; read separately so naming does not load whole archives.
     texture_archive_name_cache: HashMap<u16, Option<String>>,
     dungeon_cache: Option<Arc<[DungeonDefinition]>>,
+    location_cache: Option<Arc<[LocationDefinition]>>,
     world_map_cache: Option<Arc<WorldMap>>,
     model_tag_cache: Option<Arc<HashMap<u32, String>>>,
     location_id_cache: std::sync::OnceLock<Arc<HashSet<u16>>>,
+    /// Models the user imported (see [`crate::custom_models`]), shown as if they were Daggerfall's.
+    custom_models: HashMap<u32, Arc<ModelMesh>>,
+    /// The images of the imported models' materials.
+    custom_textures: HashMap<TextureKey, RgbaImage>,
+    /// The saved files of each imported model, which a `.dfmod` carries.
+    custom_model_files: HashMap<u32, Vec<PathBuf>>,
+    /// Ids of the models the program made (see [`Self::generated_model`]), by what they show.
+    generated_model_ids: HashMap<String, u32>,
 }
 
 impl Arena2Library {
@@ -117,9 +131,14 @@ impl Arena2Library {
             texture_archive_cache: HashMap::new(),
             texture_archive_name_cache: HashMap::new(),
             dungeon_cache: None,
+            location_cache: None,
             world_map_cache: None,
             model_tag_cache: None,
             location_id_cache: std::sync::OnceLock::new(),
+            custom_models: HashMap::new(),
+            custom_textures: HashMap::new(),
+            custom_model_files: HashMap::new(),
+            generated_model_ids: HashMap::new(),
         })
     }
 
@@ -136,6 +155,36 @@ impl Arena2Library {
         self.dungeon_cache
             .get_or_insert_with(|| maps_archive.as_ref().map(read_all_dungeons).unwrap_or_default().into())
             .clone()
+    }
+
+    /// Returns every location defined in `MAPS.BSA` (towns, homes, temples,
+    /// dungeon entrances…), sorted by region then name.
+    ///
+    /// The list is read on first use and cached. It is empty if `MAPS.BSA` is missing.
+    pub fn locations(&mut self) -> Arc<[LocationDefinition]> {
+        let maps_archive = &self.maps_archive;
+        self.location_cache
+            .get_or_insert_with(|| maps_archive.as_ref().map(read_all_locations).unwrap_or_default().into())
+            .clone()
+    }
+
+    /// The locations as [`Self::locations`] last read them; empty until it has.
+    pub fn cached_locations(&self) -> Arc<[LocationDefinition]> {
+        self.location_cache.clone().unwrap_or_else(|| Arc::new([]))
+    }
+
+    /// The id of a model the program makes itself, such as the ground of an
+    /// outdoor cell, drawn like any model. `key` names what it shows; the
+    /// first time, `build` makes the model with the id it is given.
+    pub fn generated_model(&mut self, key: &str, build: impl FnOnce(&mut Self, u32) -> ModelMesh) -> u32 {
+        if let Some(&id) = self.generated_model_ids.get(key) {
+            return id;
+        }
+        let id = FIRST_GENERATED_MODEL_ID + self.generated_model_ids.len() as u32;
+        let mesh = build(self, id);
+        self.custom_models.insert(id, Arc::new(mesh));
+        self.generated_model_ids.insert(key.to_string(), id);
+        id
     }
 
     /// Returns the world map: every location and the region of each map pixel.
@@ -157,8 +206,39 @@ impl Arena2Library {
         &self.root
     }
 
+    /// Shows the model the user imported, `mesh`, as if it were one of
+    /// Daggerfall's: with the images `textures`, and its saved `files`.
+    pub fn add_custom_model(
+        &mut self,
+        mesh: Arc<ModelMesh>,
+        textures: Vec<(TextureKey, RgbaImage)>,
+        files: Vec<PathBuf>,
+    ) {
+        self.custom_model_files.insert(mesh.model_id, files);
+        self.custom_textures.extend(textures);
+        self.custom_models.insert(mesh.model_id, mesh);
+    }
+
+    /// Stops showing the imported model `model_id`, which was deleted, and its images `textures`.
+    pub fn remove_custom_model(&mut self, model_id: u32, textures: &[TextureKey]) {
+        self.custom_models.remove(&model_id);
+        self.custom_model_files.remove(&model_id);
+        for texture in textures {
+            self.custom_textures.remove(texture);
+        }
+    }
+
+    /// The saved files of the imported model `model_id` (its geometry, then
+    /// its images), or `None` if no such model was imported.
+    pub fn custom_model_files(&self, model_id: u32) -> Option<&[PathBuf]> {
+        self.custom_model_files.get(&model_id).map(Vec::as_slice)
+    }
+
     /// Returns the decoded model with id `model_id`, or `None` if it is missing or invalid.
     pub fn model(&mut self, model_id: u32) -> Option<Arc<ModelMesh>> {
+        if let Some(mesh) = self.custom_models.get(&model_id) {
+            return Some(mesh.clone());
+        }
         let models_archive = &self.models_archive;
         self.model_cache
             .entry(model_id)
@@ -180,6 +260,9 @@ impl Arena2Library {
     /// Used when every model is inspected once, so that the whole of
     /// `ARCH3D.BSA` is not kept in memory afterwards.
     pub fn read_model_uncached(&self, model_id: u32) -> Option<ModelMesh> {
+        if let Some(mesh) = self.custom_models.get(&model_id) {
+            return Some(ModelMesh::clone(mesh));
+        }
         if let Some(cached) = self.model_cache.get(&model_id) {
             return cached.as_deref().cloned();
         }
@@ -204,6 +287,9 @@ impl Arena2Library {
 
     /// Decodes the image for `texture`, or returns `None` if it is missing or invalid.
     pub fn texture_image(&mut self, texture: TextureKey) -> Option<RgbaImage> {
+        if let Some(image) = self.custom_textures.get(&texture) {
+            return Some(image.clone());
+        }
         let palette = self.texture_palette.clone();
         let archive = self.texture_archive(texture.archive)?;
         match archive.decode(texture.record, &palette) {
@@ -348,21 +434,30 @@ impl Arena2Library {
     /// these fall back to a block with the same first four and last six
     /// characters (for example `RUINAA12.RMB` for `RUINBA12.RMB`).
     pub fn rmb_block(&self, name: &str) -> Arena2Result<RmbBlock> {
-        let found =
-            self.blocks_archive.record_by_name(name).map(|data| (name.to_string(), data)).or_else(|| {
-                let (prefix, suffix) = (name.get(..4)?, name.get(name.len().checked_sub(6)?..)?);
-                self.blocks_archive
-                    .entries()
-                    .iter()
-                    .rev()
-                    .find(|entry| entry.name.starts_with(prefix) && entry.name.ends_with(suffix))
-                    .and_then(|entry| {
-                        Some((entry.name.clone(), self.blocks_archive.record_by_name(&entry.name)?))
-                    })
-            });
-        let (found_name, data) =
-            found.ok_or_else(|| Arena2Error::not_found(format!("block '{name}' in {BLOCKS_FILE}")))?;
+        let found_name = self
+            .rmb_block_found_name(name)
+            .ok_or_else(|| Arena2Error::not_found(format!("block '{name}' in {BLOCKS_FILE}")))?;
+        let data = self
+            .blocks_archive
+            .record_by_name(&found_name)
+            .ok_or_else(|| Arena2Error::not_found(format!("block '{found_name}' in {BLOCKS_FILE}")))?;
         parse_rmb_block(&found_name, data)
+    }
+
+    /// The name of the RMB block a location's block name `name` stands for:
+    /// `name` itself, or for the few names that do not exist, the block
+    /// Daggerfall Unity uses instead (see [`Self::rmb_block`]).
+    pub fn rmb_block_found_name(&self, name: &str) -> Option<String> {
+        if self.blocks_archive.record_by_name(name).is_some() {
+            return Some(name.to_string());
+        }
+        let (prefix, suffix) = (name.get(..4)?, name.get(name.len().checked_sub(6)?..)?);
+        self.blocks_archive
+            .entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.name.starts_with(prefix) && entry.name.ends_with(suffix))
+            .map(|entry| entry.name.clone())
     }
 
     /// Loads (or fetches from cache) the texture archive with number `archive_index`.

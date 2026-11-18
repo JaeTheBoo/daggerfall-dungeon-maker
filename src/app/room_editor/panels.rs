@@ -8,7 +8,7 @@ use eframe::egui;
 
 use super::asset_palette::{PREFAB_COLOR, PREFAB_MARK};
 use super::history::SceneEdit;
-use super::RoomEditor;
+use super::{OutlinerSection, RoomEditor, FOLDER_MARK};
 use crate::app::room_browser::{category_text, show_category_choice, show_room_name_field};
 use crate::app::viewport_tools::EditorResources;
 use crate::arena2::{world_to_native, RDB_BLOCK_SIDE, WORLD_SCALE};
@@ -18,11 +18,16 @@ use crate::encounters::{EncounterTable, Enemy};
 use crate::project::CellCategory;
 use crate::scene::{
     action_type_name, axis_name, group_label, trigger_name, EnemyGender, FixedEnemy, FlatData, ObjectAction,
-    ObjectId, SceneObject, SceneObjectKind, ACTION_TYPES, ADDED_OBJECTS_GROUP, FIXED_ENEMY_MARKER_RECORD,
-    NO_ENEMY_ID, OUTSIDE_CELL_TOLERANCE, RANDOM_ENEMY_MARKER_RECORD, SCALE_RANGE, STARTING_LOCKS,
-    START_MARKER_RECORD, TRIGGER_TYPES,
+    ObjectId, SceneObject, SceneObjectKind, ACTION_TYPES, FIXED_ENEMY_MARKER_RECORD, NO_ENEMY_ID,
+    OUTSIDE_CELL_TOLERANCE, RANDOM_ENEMY_MARKER_RECORD, SCALE_RANGE, STARTING_LOCKS, START_MARKER_RECORD,
+    TRIGGER_TYPES,
 };
 use crate::scene::{PrefabMember, Scene};
+
+/// What the quarters of a cell are, for the outliner and the properties panel.
+const QUARTER_HINT: &str = "Daggerfall lists a cell's objects by the quarter of the cell they are in (squares of \
+    25.6 m), and the game goes through them in that order. Objects join the quarter they are placed, pasted or moved \
+    into.";
 
 /// Drag speed of scale fields, per pixel.
 const SCALE_DRAG_SPEED: f32 = 0.01;
@@ -33,7 +38,9 @@ const POSITION_DRAG_SPEED: f32 = 0.02;
 const ROTATION_DRAG_SPEED: f32 = 0.5;
 
 impl RoomEditor {
-    /// Draws the outliner listing every object, grouped by the RDB object list it came from.
+    /// Draws the outliner: the object lists the user made, each with its
+    /// objects, then the rest of the objects by the quarter of the cell they
+    /// are in, as Daggerfall lists them.
     pub(super) fn show_outliner(&mut self, context: &egui::Context, resources: &mut EditorResources<'_>) {
         egui::SidePanel::left(self.id.with("outliner")).resizable(true).default_width(240.0).show(
             context,
@@ -58,45 +65,69 @@ impl RoomEditor {
                 ui.label(egui::RichText::new(format!("{} objects", self.scene.objects.len())).weak());
                 ui.separator();
 
+                self.outliner_shown.clear();
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    for group_index in self.scene.group_indices() {
-                        let member_count = self
-                            .scene
-                            .objects
-                            .iter()
-                            .filter(|object| object.group_index == group_index)
-                            .count();
-                        let header = format!("{} ({member_count})", group_label(group_index));
-                        egui::CollapsingHeader::new(header)
-                            .id_salt(self.id.with(("object_group", group_index)))
-                            .default_open(true)
-                            .show(ui, |ui| self.show_outliner_group(ui, group_index, resources));
+                    let mut folder_choice = None;
+                    for (section, rows) in self.outliner_sections() {
+                        match section {
+                            OutlinerSection::Folder(folder) => {
+                                let header = format!("{FOLDER_MARK} {} ({})", folder.name, rows.len());
+                                let header_response = egui::CollapsingHeader::new(header)
+                                    .id_salt(self.id.with(("object_folder", folder.id)))
+                                    .default_open(true)
+                                    .show(ui, |ui| self.show_outliner_rows(ui, &rows, resources))
+                                    .header_response
+                                    .on_hover_text(
+                                        "An object list you made, to keep the cell organised; the game never sees \
+                                         it. Right-click it to rename it, select its objects or remove it",
+                                    );
+                                if header_response.secondary_clicked() {
+                                    self.prepare_folder_menu(&folder);
+                                }
+                                let name = &mut self.folder_rename;
+                                header_response.context_menu(|ui| {
+                                    if let Some(choice) = super::folder_menu(ui, &folder, name) {
+                                        folder_choice = Some((choice, folder.id));
+                                    }
+                                });
+                            }
+                            OutlinerSection::Quarter(group_index) => {
+                                let header = format!("{} ({})", group_label(group_index), rows.len());
+                                egui::CollapsingHeader::new(header)
+                                    .id_salt(self.id.with(("object_group", group_index)))
+                                    .default_open(true)
+                                    .show(ui, |ui| self.show_outliner_rows(ui, &rows, resources))
+                                    .header_response
+                                    .on_hover_text(QUARTER_HINT);
+                            }
+                        }
+                    }
+                    if let Some((choice, id)) = folder_choice {
+                        self.apply_folder_menu(choice, id);
                     }
                 });
+                // Every row is drawn now, so Shift+click knows what lies between.
+                if self.apply_outliner_click() {
+                    self.describe_selection(resources);
+                }
             },
         );
         self.viewport.selection_changed_in_viewport = false;
     }
 
-    /// Draws one row per object in `group_index`. The objects of a placed
+    /// Draws one row for each of the objects `rows`. The objects of a placed
     /// prefab are marked; clicking one selects the whole prefab.
-    fn show_outliner_group(
-        &mut self,
-        ui: &mut egui::Ui,
-        group_index: usize,
-        resources: &mut EditorResources<'_>,
-    ) {
+    fn show_outliner_rows(&mut self, ui: &mut egui::Ui, rows: &[usize], resources: &mut EditorResources<'_>) {
         let mut visibility_change = None;
         let mut menu_choice = None;
         let mut clicked = None;
-        let mut menu_opened = false;
+        let mut right_clicked = None;
+        let mut menu_opened = None;
         let selected = self.selected_indices();
-        let shift_held = ui.input(|input| input.modifiers.shift);
-        let mut prefab_name = std::mem::take(&mut self.prefab_name);
-        for (index, object) in self.scene.objects.iter().enumerate() {
-            if object.group_index != group_index {
-                continue;
-            }
+        let mut menu_text = std::mem::take(&mut self.menu_text);
+        for &index in rows {
+            let Some(object) = self.scene.objects.get(index) else { continue };
+            self.outliner_shown.push(index);
             ui.horizontal(|ui| {
                 let mut visible = object.visible;
                 if ui.checkbox(&mut visible, "").on_hover_text("Visible").changed() {
@@ -123,33 +154,38 @@ impl RoomEditor {
                 }
                 // Right-clicking a row selects it too, like the viewport does, unless it is already
                 // selected: then the menu is for the selection, which can become a prefab.
-                if response.clicked() || (response.secondary_clicked() && !is_selected) {
+                if response.clicked() {
                     clicked = Some(index);
+                } else if response.secondary_clicked() && !is_selected {
+                    right_clicked = Some(index);
                 }
-                menu_opened |= response.secondary_clicked();
+                if response.secondary_clicked() {
+                    menu_opened = Some(index);
+                }
                 if is_selected && self.viewport.selection_changed_in_viewport {
                     response.scroll_to_me(Some(egui::Align::Center));
                 }
                 response.context_menu(|ui| {
                     if let Some(info) = self.object_menu_info(index, resources) {
-                        if let Some(choice) = super::object_menu(ui, &info, &mut prefab_name) {
+                        if let Some(choice) = super::object_menu(ui, &info, &mut menu_text) {
                             menu_choice = Some((choice, index));
                         }
                     }
                 });
             });
         }
-        self.prefab_name = prefab_name;
-        if menu_opened {
-            self.prepare_object_menu(resources);
-        }
+        self.menu_text = menu_text;
+        // A click is handled once every row is drawn (see `apply_outliner_click`).
         if let Some(index) = clicked {
-            // Shift+click adds a row to the selection, or takes it out.
-            if shift_held {
-                self.toggle_selected(index);
-            } else {
-                self.select_objects(vec![index]);
-            }
+            self.outliner_click = Some((index, ui.input(|input| input.modifiers)));
+        }
+        if let Some(index) = right_clicked {
+            self.select_objects(vec![index]);
+            self.set_selection_anchor(index);
+        }
+        // Once the selection is right for it, the menu gets its names ready.
+        if let Some(index) = menu_opened {
+            self.prepare_object_menu(Some(index), resources);
         }
         if let Some((choice, index)) = menu_choice {
             self.apply_object_menu(choice, index, resources);
@@ -232,7 +268,8 @@ impl RoomEditor {
     fn show_multiple_selection(&mut self, ui: &mut egui::Ui, resources: &EditorResources<'_>) {
         let selected = self.selected_indices();
         ui.strong(format!("{} objects selected", selected.len())).on_hover_text(
-            "Shift+click objects, or drag a box around them, to select several. Several objects can be \
+            "Ctrl+click objects (in the outliner, Shift+click selects every row in between), or drag a box \
+             around them, to select several. Several objects can be \
              moved together (drag the arrows), copied (Ctrl+C) and pasted (Ctrl+V) into this cell or another, \
              duplicated (Ctrl+D) or deleted (Del).",
         );
@@ -366,6 +403,9 @@ impl RoomEditor {
                         self.history.record(SceneEdit::Replace { index, object: original });
                         self.property_edit_session = Some(index);
                     }
+                    // An object moved by typing joins the quarter it is moved into.
+                    let mut edited = edited;
+                    edited.group_index = crate::scene::quarter_of(edited.position);
                     self.scene.objects[index] = edited;
                 }
                 if !is_interacting {
@@ -537,10 +577,11 @@ impl RoomEditor {
             }
             ui.end_row();
 
-            ui.label("Object lists").on_hover_text("The groups in the outliner, roughly one per room");
-            let lists =
-                self.scene.group_indices().into_iter().filter(|group| *group != ADDED_OBJECTS_GROUP).count();
-            ui.label(lists.to_string());
+            ui.label("Object lists").on_hover_text(
+                "The object lists you made: folders in the outliner (right-click an object and choose Create \
+                 Object List). The other objects are listed by the quarter of the cell they are in.",
+            );
+            ui.label(self.scene.folders().len().to_string());
             ui.end_row();
 
             let Some(SceneObjectKind::Flat { data, .. }) =
@@ -898,8 +939,17 @@ fn draw_object_fields(
         ui.label(object.kind_label());
         ui.end_row();
 
-        ui.label("Group").on_hover_text("The object list the object belongs to, roughly one per room. Objects you add go in Added objects.");
+        ui.label("Quarter").on_hover_text(QUARTER_HINT);
         ui.label(group_label(object.group_index));
+        ui.end_row();
+
+        ui.label("Object list").on_hover_text(
+            "The object list you put the object in, a folder in the outliner; right-click objects to make one",
+        );
+        match &object.folder {
+            Some(folder) => ui.label(format!("{FOLDER_MARK} {}", folder.name)),
+            None => ui.label(egui::RichText::new("None").weak()),
+        };
         ui.end_row();
 
         ui.label("Visible").on_hover_text("Shows or hides the object in the editor's view only. Hidden objects are still saved and still in the game.");

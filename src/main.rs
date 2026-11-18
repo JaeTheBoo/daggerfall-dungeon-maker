@@ -3,7 +3,8 @@
 
 //! Entry point: parses the command line, creates the window and starts the dungeon maker.
 //!
-//! Usage: `daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [--dungeon <name>]`
+//! Usage: `daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB or name.RMB>]
+//! [--dungeon <name>] [--settlement <name>]`
 //!
 //! Every argument is optional. Without `--arena2` the program uses the
 //! folder chosen last time, or asks for one. Without a project file the
@@ -34,8 +35,8 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Reads a project file, `--arena2 <folder>`, `--cell <name>` (or `--room`) and `--dungeon <name>` from the
-/// command line, ignoring anything else.
+/// Reads a project file, `--arena2 <folder>`, `--cell <name>` (or `--room`), `--dungeon <name>` and
+/// `--settlement <name>` from the command line, ignoring anything else.
 fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> StartupOptions {
     let mut options = StartupOptions::default();
     while let Some(argument) = arguments.next() {
@@ -43,6 +44,7 @@ fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> StartupOption
             "--arena2" => options.arena2_folder = arguments.next().map(PathBuf::from),
             "--cell" | "--room" => options.room_name = arguments.next(),
             "--dungeon" => options.dungeon_name = arguments.next(),
+            "--settlement" => options.settlement_name = arguments.next(),
             "--project" => options.project_file = arguments.next().map(PathBuf::from),
             path if path.to_ascii_lowercase().ends_with(".ddm") => {
                 options.project_file = Some(PathBuf::from(path))

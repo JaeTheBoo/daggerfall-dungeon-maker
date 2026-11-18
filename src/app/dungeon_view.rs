@@ -920,11 +920,17 @@ impl DungeonView {
                 }));
             }
         }
+        let climate = request
+            .location
+            .map_pixel
+            .and_then(|pixel| request.world?.location_climate_at(pixel))
+            .map_or(crate::arena2::Climate::DEFAULT, crate::arena2::Climate::from_value);
         let entrance_request = EntranceRequest {
             dungeon_name: &self.name,
             daggerfall_dungeons: request.daggerfall_dungeons,
             current: request.location.entrance.as_ref(),
             read_only: request.read_only,
+            climate,
         };
         if let Some(entrance) = self.entrance_picker.show(context, &entrance_request, resources) {
             action = Some(DungeonPropertiesAction::SetLocation(DungeonLocation {
@@ -1306,7 +1312,8 @@ impl DungeonView {
         let drop_spot = self.drop_spot();
         let mut room_outlines = self.room_outlines.clone();
         if let Some((grid_x, grid_z)) = drop_spot {
-            room_outlines.push(RoomOutline { origin: grid_origin(grid_x, grid_z), highlighted: true });
+            room_outlines
+                .push(RoomOutline { highlighted: true, ..RoomOutline::cell(grid_origin(grid_x, grid_z)) });
         }
 
         if !response.dragged() {
@@ -1339,7 +1346,6 @@ impl DungeonView {
             placement_preview: &[],
             highlighted_objects: &[],
             context_scene: drop_spot.and(self.drop_preview.as_ref()).map(|preview| &preview.placed),
-            ground_squares: &[],
             water_planes: &self.water_planes,
             room_outlines: &room_outlines,
             settings: &self.view_settings,
@@ -1348,6 +1354,7 @@ impl DungeonView {
             size_in_pixels: size_in_pixels(ui, rect),
             sky,
             dungeon_textures: self.textures,
+            climate_textures: None,
             warned_objects: &self.switched_off_doors,
         };
         paint_scene(ui, rect, resources, &mut self.target, &request);
@@ -1725,8 +1732,7 @@ impl DungeonView {
         self.combined_scene = Scene { block_name: self.name.clone(), objects };
         self.unclosed_stale = true;
         self.doors_stale = true;
-        self.room_outlines =
-            self.rooms.iter().map(|room| RoomOutline { origin: room.origin, highlighted: false }).collect();
+        self.room_outlines = self.rooms.iter().map(|room| RoomOutline::cell(room.origin)).collect();
         self.water_planes = self
             .rooms
             .iter()

@@ -22,6 +22,7 @@ use glam::Vec3;
 use crate::app::viewport_tools::EditorResources;
 use crate::arena2::{Arena2Library, TextureKey};
 use crate::catalog::{flat_description, AssetCatalog};
+use crate::custom_models::CustomModelLibrary;
 use crate::custom_names::{CustomNames, Favorite};
 use crate::prefabs::{PrefabId, PrefabLibrary};
 use crate::render::ThumbnailStatus;
@@ -170,6 +171,7 @@ impl PlaceableAsset {
             visible: true,
             scale: None,
             prefab: None,
+            folder: None,
         }]
     }
 }
@@ -193,10 +195,11 @@ enum PaletteTab {
     Flats,
     Markers,
     Lights,
+    CustomModels,
 }
 
 impl PaletteTab {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Favorites,
         Self::Prefabs,
         Self::DungeonModels,
@@ -205,6 +208,7 @@ impl PaletteTab {
         Self::Flats,
         Self::Markers,
         Self::Lights,
+        Self::CustomModels,
     ];
 
     fn label(self) -> &'static str {
@@ -217,6 +221,7 @@ impl PaletteTab {
             Self::Flats => "Flats",
             Self::Markers => "Markers",
             Self::Lights => "Lights",
+            Self::CustomModels => "Custom Models",
         }
     }
 
@@ -237,6 +242,7 @@ impl PaletteTab {
                 "Editor markers: start and enter points, enemy spawns, quest and treasure markers"
             }
             Self::Lights => "Point lights",
+            Self::CustomModels => "Your own models, imported with Import > Import Model…",
         }
     }
 }
@@ -282,6 +288,17 @@ pub struct AssetPalette {
     tile_size: f32,
     /// egui textures for flat thumbnails; `None` marks textures that failed to load.
     flat_thumbnails: HashMap<TextureKey, Option<egui::TextureHandle>>,
+    /// What the user asked to do with one of their imported models, for the application to do.
+    model_request: Option<CustomModelRequest>,
+}
+
+/// Something the user asked to do with one of their imported models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomModelRequest {
+    /// Choose an image for part `part` of the model (`None`: every part without a texture).
+    ChangeTexture { model_id: u32, part: Option<usize> },
+    /// Delete the model.
+    Delete { model_id: u32 },
 }
 
 impl Default for AssetPalette {
@@ -293,17 +310,35 @@ impl Default for AssetPalette {
             search_text: String::new(),
             tile_size: 84.0,
             flat_thumbnails: HashMap::new(),
+            model_request: None,
         }
     }
 }
 
 impl AssetPalette {
+    /// What the user asked to do with one of their imported models, once.
+    pub fn take_model_request(&mut self) -> Option<CustomModelRequest> {
+        self.model_request.take()
+    }
+
+    /// Stops placing the model `model_id`, which was deleted.
+    pub fn forget_model(&mut self, model_id: u32) {
+        if self.armed.is_some_and(|armed| armed.asset == PlaceableAsset::Model { model_id }) {
+            self.armed = None;
+        }
+    }
+
     /// Arms `asset` for placement, or disarms it if it is already armed.
     fn toggle_armed(&mut self, asset: PlaceableAsset) {
         self.armed = match self.armed {
             Some(armed) if armed.asset == asset => None,
             _ => Some(ArmedAsset { asset, yaw_degrees: 0.0 }),
         };
+    }
+
+    /// Shows the Custom Models tab, for example once a model was imported.
+    pub fn show_custom_models(&mut self) {
+        self.tab = PaletteTab::CustomModels;
     }
 
     /// Shows the Prefabs tab, for example once a prefab was made.
@@ -339,11 +374,27 @@ impl AssetPalette {
                 self.show_header(ui, resources);
                 ui.separator();
 
-                let entries = self.visible_entries(resources.catalog, resources.custom_names, resources.prefabs);
+                let entries = self.visible_entries(
+                    resources.catalog,
+                    resources.custom_names,
+                    resources.prefabs,
+                    resources.custom_models,
+                );
+                if entries.is_empty() && self.tab == PaletteTab::CustomModels {
+                    let text = match resources.custom_models.models().is_empty() {
+                        true => {
+                            "No custom models yet. Import a model of your own (an OBJ, glTF, GLB or .blend file) \
+                             with Import > Import Model…"
+                        }
+                        false => "No custom model matches the search.",
+                    };
+                    ui.label(egui::RichText::new(text).weak());
+                    return;
+                }
                 if entries.is_empty() && self.tab == PaletteTab::Prefabs {
                     let text = match resources.prefabs.prefabs().is_empty() {
                         true => {
-                            "No prefabs yet. Select several objects in a cell (Shift+click them, or drag a box \
+                            "No prefabs yet. Select several objects in a cell (Ctrl+click them, or drag a box \
                              around them), right-click them and choose Create Prefab."
                         }
                         false => "No prefab matches the search.",
@@ -408,6 +459,23 @@ impl AssetPalette {
                                         if let PlaceableAsset::Model { model_id } = entry.asset {
                                             ui.separator();
                                             show_model_name_menu(ui, model_id, resources.custom_names);
+                                            if let Some(model) = resources.custom_models.get(model_id) {
+                                                ui.separator();
+                                                if let Some(part) = show_texture_menu(ui, model) {
+                                                    self.model_request =
+                                                        Some(CustomModelRequest::ChangeTexture { model_id, part });
+                                                    ui.close_menu();
+                                                }
+                                                ui.separator();
+                                                let hover = "Deletes the model from Custom Models, after asking. \
+                                                             Copies placed in your project's cells and prefabs \
+                                                             are removed too; the file it was imported from \
+                                                             is not touched.";
+                                                if ui.button("Delete model…").on_hover_text(hover).clicked() {
+                                                    self.model_request = Some(CustomModelRequest::Delete { model_id });
+                                                    ui.close_menu();
+                                                }
+                                            }
                                         }
                                     });
                                 }
@@ -478,6 +546,7 @@ impl AssetPalette {
         catalog: &AssetCatalog,
         custom_names: &CustomNames,
         prefabs: &PrefabLibrary,
+        custom_models: &CustomModelLibrary,
     ) -> Vec<PaletteEntry> {
         let search = self.search_text.trim().to_lowercase();
         let matches = |text: &str| search.is_empty() || text.to_lowercase().contains(&search);
@@ -553,6 +622,19 @@ impl AssetPalette {
                         model.room_count, model.placement_count
                     );
                     entry(PlaceableAsset::Model { model_id: model.model_id }, usage)
+                })
+                .collect(),
+            PaletteTab::CustomModels => custom_models
+                .models()
+                .iter()
+                .filter(|model| model_matches(model.id) || matches(&model.name))
+                .map(|model| {
+                    let size = model.mesh.size();
+                    let usage = format!(
+                        "Your model, imported from {}\n{:.1} × {:.1} × {:.1} m",
+                        model.source, size.x, size.y, size.z
+                    );
+                    entry(PlaceableAsset::Model { model_id: model.id }, usage)
                 })
                 .collect(),
             PaletteTab::AllModels => catalog
@@ -821,6 +903,41 @@ fn show_prefab_menu(ui: &mut egui::Ui, id: PrefabId, prefabs: &mut PrefabLibrary
              grouped as prefabs.",
         )
         .clicked()
+}
+
+/// The entries of an imported model's right-click menu that change its
+/// texture: one for a model of one part, else one per part and one for every
+/// part without a texture. Returns the part chosen (`None` for every part
+/// without one), once one is.
+fn show_texture_menu(ui: &mut egui::Ui, model: &crate::custom_models::CustomModel) -> Option<Option<usize>> {
+    let hover = "Choose an image (PNG, JPG, BMP or TGA) to draw the model with, as its texture coordinates \
+                 lay it out, or its MTL material file (whose materials and textures it then takes). Use it when \
+                 the texture or the MTL file was not found on import.";
+    if model.parts.len() <= 1 {
+        let text = match model.parts.first().is_some_and(|part| part.textured) {
+            true => "Change texture…",
+            false => "Choose texture… (it has none)",
+        };
+        return ui.button(text).on_hover_text(hover).clicked().then_some(Some(0));
+    }
+    let mut chosen = None;
+    ui.menu_button("Change texture", |ui| {
+        if ui.button("Every part without one…").on_hover_text(hover).clicked() {
+            chosen = Some(None);
+        }
+        ui.separator();
+        for (index, part) in model.parts.iter().enumerate() {
+            let material = match part.material.is_empty() {
+                true => format!("Part {}", index + 1),
+                false => part.material.clone(),
+            };
+            let state = if part.textured { "" } else { " (no texture)" };
+            if ui.button(format!("{material}{state}…")).on_hover_text(hover).clicked() {
+                chosen = Some(Some(index));
+            }
+        }
+    });
+    chosen
 }
 
 /// Contents of a model tile's right-click menu: a field for the user's name for the model.

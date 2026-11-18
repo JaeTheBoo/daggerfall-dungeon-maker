@@ -56,7 +56,7 @@ const TRAJECTORY_COLOR: egui::Color32 = egui::Color32::from_rgb(190, 90, 255);
 /// Points along a trajectory line.
 const TRAJECTORY_STEPS: usize = 32;
 /// The single block outline drawn around a room, which always sits at the origin.
-const ROOM_OUTLINE: [RoomOutline; 1] = [RoomOutline { origin: Vec3::ZERO, highlighted: false }];
+const ROOM_OUTLINE: [RoomOutline; 1] = [RoomOutline::cell(Vec3::ZERO)];
 
 /// A world axis the gizmo can move an object along.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,7 +262,6 @@ impl RoomEditor {
             selected_groups: &[],
             placement_preview: &self.viewport.placement_preview,
             context_scene: self.dungeon_context.as_ref().map(|context| &context.scene),
-            ground_squares: &[],
             water_planes: &water_planes,
             room_outlines: self
                 .dungeon_context
@@ -274,6 +273,7 @@ impl RoomEditor {
             size_in_pixels: size_in_pixels(ui, rect),
             sky: None,
             dungeon_textures,
+            climate_textures: None,
             warned_objects: &self.switched_off_doors,
         };
         paint_scene(ui, rect, resources, &mut self.target, &request);
@@ -332,13 +332,13 @@ impl RoomEditor {
                 None if self.has_multiple_selection() => self.selected_object,
                 None => None,
             };
-            self.prepare_object_menu(resources);
+            self.prepare_object_menu(self.viewport.context_object, resources);
         }
         let info = self.viewport.context_object.and_then(|index| self.object_menu_info(index, resources));
         let mut choice = None;
-        let prefab_name = &mut self.prefab_name;
+        let menu_text = &mut self.menu_text;
         response.context_menu(|ui| match &info {
-            Some(info) => choice = super::object_menu(ui, info, prefab_name),
+            Some(info) => choice = super::object_menu(ui, info, menu_text),
             None => ui.close_menu(),
         });
         if let (Some(choice), Some(index)) = (choice, self.viewport.context_object) {
@@ -591,17 +591,22 @@ impl RoomEditor {
         }
 
         if clicked && self.viewport.hovered_part.is_none() {
-            let shift_held = ui.input(|input| input.modifiers.shift);
+            // Shift or Ctrl adds to the selection here; in the outliner Shift selects a range.
+            let shift_held = ui.input(|input| input.modifiers.shift || input.modifiers.command);
             match picked {
-                // Shift+click adds the object to the selection, or takes it out.
+                // Shift+click (or Ctrl+click) adds the object to the selection, or takes it out.
                 Some(index) if shift_held => {
                     self.toggle_selected(index);
+                    self.set_selection_anchor(index);
                     self.viewport.selection_changed_in_viewport = true;
                     self.describe_selection(resources);
                 }
                 Some(_) | None if shift_held => {}
                 _ => {
                     self.select_objects(picked.into_iter().collect());
+                    if let Some(index) = picked {
+                        self.set_selection_anchor(index);
+                    }
                     self.viewport.selection_changed_in_viewport = picked.is_some();
                     if picked.is_some() {
                         self.describe_selection(resources);
@@ -691,9 +696,11 @@ impl RoomEditor {
             *component = (*component / self.snap.step).round() * self.snap.step;
         }
         let offset = lead_position - lead_start;
+        // Moved objects join the quarter they are moved into.
         for &(index, start) in &drag.objects {
             if let Some(object) = self.scene.objects.get_mut(index) {
                 object.position = start + offset;
+                object.group_index = crate::scene::quarter_of(object.position);
             }
         }
     }
@@ -956,7 +963,7 @@ impl RoomEditor {
     }
 
     /// Puts what is selected in the status bar.
-    fn describe_selection(&mut self, resources: &EditorResources<'_>) {
+    pub(super) fn describe_selection(&mut self, resources: &EditorResources<'_>) {
         let selected = self.selected_indices();
         if let Some((member, members)) = self.selected_prefab() {
             self.status_message = format!(
@@ -1026,31 +1033,13 @@ impl RoomEditor {
         projection: &ViewportProjection,
         library: &mut Arena2Library,
     ) -> Vec<usize> {
-        let settings = &self.view_settings;
         self.scene
             .objects
             .iter()
             .enumerate()
-            .filter(|(_, object)| {
-                object.visible
-                    && match object.kind {
-                        SceneObjectKind::Model { .. } => settings.show_models,
-                        SceneObjectKind::Flat { .. } if object.is_marker() => settings.show_markers,
-                        SceneObjectKind::Flat { .. } => settings.show_flats,
-                        SceneObjectKind::Light { .. } => settings.show_lights,
-                    }
-            })
+            .filter(|(_, object)| self.is_shown(object))
             .filter_map(|(index, object)| {
-                let center = match object.kind {
-                    SceneObjectKind::Model { model_id, .. } => library
-                        .model(model_id)
-                        .map(|mesh| {
-                            object.model_matrix().transform_point3((mesh.bounds_min + mesh.bounds_max) * 0.5)
-                        })
-                        .unwrap_or(object.position),
-                    _ => object.position,
-                };
-                let screen = projection.world_to_screen(center)?;
+                let screen = projection.world_to_screen(super::object_middle(object, library))?;
                 rect.contains(screen).then_some(index)
             })
             .collect()
@@ -1178,6 +1167,7 @@ impl RoomEditor {
             if let Some(member) = object.prefab.as_mut() {
                 member.instance = instance;
             }
+            object.group_index = crate::scene::quarter_of(object.position);
             self.scene.objects.push(object);
         }
         let end = self.scene.objects.len();

@@ -93,6 +93,7 @@ using UnityEngine;
 using DaggerfallWorkshop;
 using DaggerfallWorkshop.Game;
 using DaggerfallWorkshop.Utility;
+using DaggerfallWorkshop.Utility.AssetInjection;
 using DaggerfallWorkshop.Game.Utility.ModSupport;
 
 public class {class_name} : MonoBehaviour
@@ -171,11 +172,16 @@ public class {class_name} : MonoBehaviour
             GameObject made;
             if (ObjectModels[i] >= 0)
             {{
-                bool tapestry = ObjectModels[i] >= FirstTapestry && ObjectModels[i] <= LastTapestry;
-                made = GameObjectHelper.CreateDaggerfallMeshGameObject((uint)ObjectModels[i], block, false, null, tapestry);
-                DaggerfallMesh mesh = made.GetComponent<DaggerfallMesh>();
-                if (mesh != null)
-                    mesh.SetDungeonTextures(laidOut.DungeonTextureTable);
+                // A mod's own model (such as the user's imported ones) first, as the game does.
+                made = MeshReplacement.ImportCustomGameobject((uint)ObjectModels[i], block, Matrix4x4.identity);
+                if (made == null)
+                {{
+                    bool tapestry = ObjectModels[i] >= FirstTapestry && ObjectModels[i] <= LastTapestry;
+                    made = GameObjectHelper.CreateDaggerfallMeshGameObject((uint)ObjectModels[i], block, false, null, tapestry);
+                    DaggerfallMesh mesh = made.GetComponent<DaggerfallMesh>();
+                    if (mesh != null)
+                        mesh.SetDungeonTextures(laidOut.DungeonTextureTable);
+                }}
             }}
             else
             {{

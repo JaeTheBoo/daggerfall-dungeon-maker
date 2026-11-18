@@ -73,14 +73,20 @@ capable graphics driver is needed to run it. Both X11 and Wayland desktops work.
 Optional command line arguments:
 
 ```text
-daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [--dungeon <name>]
+daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB or name.RMB>]
+                         [--dungeon <name>] [--settlement <name>]
 ```
+
+`--cell` opens a dungeon cell (`.RDB`) or an outdoor cell (`.RMB`);
+`--settlement` opens the largest location of that name.
 
 ## Using the viewer
 
-* The **project panel** (left) lists everything that can be opened, one kind
-  at a time: **Dungeons** or **Cells**, chosen at the top. The **Daggerfall**
-  toggle beside them shows or hides the game's own (dungeons grouped by
+* The **project panel** (left) lists everything that can be opened. The
+  toggle at its top chooses **Dungeons** or **Settlements** (see
+  [Settlements](#settlements) below). For dungeons, it lists one kind at a
+  time: **Dungeons** or **Cells**, chosen below the toggle. The **Daggerfall**
+  switch beside them shows or hides the game's own (dungeons grouped by
   region); below them are the project's own, in their folders. Opening
   something of the other kind switches to its section. Click a dungeon or
   double-click a cell to open it; the search box filters the list shown. The
@@ -280,7 +286,24 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   and takes nothing. A project cell dropped in is used as it is (not copied), so
   changing it changes it in every dungeon that uses it. In a dungeon from
   Daggerfall it offers to make a copy first.
-* The outliner (left) lists every object grouped by the block's object lists.
+* The outliner (left) lists every object: first the **object lists** you made
+  (🗀 folders, see below), then the rest by the **quarter** of the cell they
+  are in. Daggerfall lists a cell's objects that way, in squares of 25.6 m
+  (south-west, south-east, north-west, north-east, and past the north or east
+  edge for objects standing on or beyond it), and the game goes through them
+  in that order; every one of Daggerfall's 187 cells keeps to it (five number
+  their lists on a grid twice as wide, which the editor reads the same way).
+  Objects join the quarter they are placed, pasted or moved into.
+* **Object lists** are folders of your own in the outliner, to keep a cell
+  organised; the game never sees them. Right-click an object, type a name if
+  you like and choose **Create Object List**: every object whose middle is
+  inside the object's box (as **Select All Within** finds them, below), the
+  object included, goes into the new list; an object already in a list moves
+  to the new one. Right-clicking a list in the outliner renames it, selects
+  its objects (**Select All**) or removes it (**Delete List**, which leaves
+  the objects in the cell). An object's menu can also take it out of its
+  list. Lists are saved in the project with the cell; copies stay in their
+  list, and copies pasted into another cell join its list of the same name.
   The properties panel (right) edits name, visibility, position and rotation,
   and under **Game settings** lists every setting Daggerfall stores with the
   object, set or not: for models the trigger, starting lock, sound, action
@@ -316,8 +339,12 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   Like Daggerfall Unity, it spins wheels (such as model 61032) a full turn
   around their axle and turns coffin lids 90°, whatever axis their action
   stores, and reads a few single traps' unusual axis values as the game does.
-* Several objects can be selected with Shift+click (in the viewport or the
-  outliner; Shift+click a selected object to take it out) or by dragging a box
+* Several objects can be selected with Ctrl+click (in the viewport or the
+  outliner; Ctrl+click a selected object to take it out; in the viewport
+  Shift+click does the same). In the outliner, Shift+click selects every row
+  from the one clicked last to the one clicked, as the outliner shows them
+  (rows under a closed heading are skipped), and Ctrl+Shift+click adds them to
+  the selection. Objects can also be selected by dragging a box
   over empty space in the viewport: the objects inside it light up, and
   releasing selects them (Shift adds them to the selection). The gizmo of
   several selected objects sits at their middle and moves them all together,
@@ -363,7 +390,16 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   turns). Every object its action sets moving shows its trajectory too, down
   the chain to its end. It is worked out every frame, so it follows any change to the
   action's type, axis or magnitude, or to the object's position.
-* Right-clicking an object (in the viewport or the outliner) opens its menu.
+* Right-clicking an object (in the viewport or the outliner) opens its menu;
+  right-clicking one of several selected objects opens it for all of them.
+  **Rename** edits the object's name (or a prefab's) as you type, as one undo
+  step; clearing a model's name lists it by its model's name again.
+  **Duplicate** and **Delete** work as Ctrl+D and Del. **Select All Within**
+  selects every object whose middle is inside the object's box (the one drawn
+  around it when selected, turned with it), the object included; for a prefab
+  or several selected objects it uses the box around them all. It counts only
+  the objects the view shows, and prefabs it reaches into come whole.
+  **Create Object List** puts those objects in a new object list (see above).
   **Tie action to…** draws a red line from the object to the pointer; the
   object under the pointer is highlighted, and clicking it makes the action
   trigger it (Escape, right-click or clicking empty space cancels). A model
@@ -371,7 +407,7 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   settings. On an object that other objects' actions trigger, **Remove
   actions** removes those actions, as one undo step.
 * With nothing selected, the properties panel shows the **cell**: name,
-  category, source, size, object and object list counts, and its water level
+  category, source, size, how many objects and object lists it has, and its water level
   and castle flag (which live on the cell's start marker). A project cell's
   category is a drop-down list (`N` interior, `W` interior with water, `M`
   interior variant, `S` special, `B` border cap); a copy starts with the
@@ -406,6 +442,60 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB>] [
   the block outline, the asset palette, models, flats, editor markers, lights,
   action links and the red tint of doors the game switches off, and chooses
   the dungeon textures (see **Dungeon textures** above).
+
+### Settlements
+
+With **Settlements** chosen at the top of the project panel, it lists the
+world above ground, from Daggerfall's own data. These open read-only; making
+settlements and outdoor cells of your own is not supported yet.
+
+* **Settlements** lists every location of the world (all 15 251: cities,
+  hamlets, villages, taverns, temples, homes, farms, covens and the dungeons'
+  entrances), by region and then by type. The search box finds them by name,
+  region or type. Click one to open it.
+* **Cells** lists the outdoor cells (RMB blocks) locations are built from, by
+  kind (taverns, residences, city walls, guild halls and so on). They can be
+  given names of your own, as dungeon cells can. Double-click one to open it.
+
+A settlement is shown with all of its cells on their grid: their buildings,
+scenery, flats and trees, standing on their ground, drawn as Daggerfall Unity
+(1.1.1) draws them in the location's climate:
+
+* The buildings' and other models' textures are swapped for the climate's
+  variants (`ClimateSwaps.ApplyClimate`): a desert town's walls and roofs are
+  the desert's, a swamp's the swamp's.
+* The ground is drawn tile by tile with the climate's ground textures, each tile
+  turned as the cell says (a quarter turn anticlockwise, a half turn, or both,
+  as the game's terrain shader turns them).
+* The trees, rocks and plants are the climate's.
+* In winter (the **Season** list), the ground, the trees and the buildings take
+  their snowy textures where they have them; deserts have no winter.
+
+Tiles marked past the end of the ground textures are the "blend space" Daggerfall
+Unity leaves around walled cities (and a few other cells), where the world's own
+terrain shows: grass, with patches of dirt and stone that depend on the spot.
+They are drawn as the climate's plain ground. Hovering a cell highlights it and
+its outline; double-clicking it opens that cell on its own. **View > Frame
+settlement** (Home) shows it all again.
+
+Its properties (right) show its name, region, type, place on the world map,
+whether the travel map shows it from the start, its climate, its size in cells,
+the dungeon under it (click to open the dungeon), its buildings by type, and its
+cells (hover to highlight one, double-click to open it). The **Climate** list
+draws it in another climate, to see how it would look there, and the **Season**
+list in summer or winter; these change the view only.
+
+An outdoor cell opened on its own shows its kind, its objects and buildings,
+your name for it, and **Used in**: every location built with it (click one to
+open it). It is drawn in the woodlands climate, in summer, unless others are
+chosen.
+
+The entrance window of a dungeon draws each entrance the same way, in the
+climate of the dungeon's spot on the world map.
+
+Dungeons are drawn with the wall and floor textures Daggerfall Unity gives them
+where they are (see **View > Dungeon textures**): picked from the dungeon's ids
+and the climate of its spot, with the climate's building doors.
 
 ### Projects
 
@@ -475,6 +565,8 @@ dungeons you choose to the game as new locations. The window has:
     new block name: the letter of the cell's category and a number from
     9000000 up, for example `N9000004.RDB`. Daggerfall's own cells are used by
     their own names and are not exported;
+  * `Models/<id>_model.json` and `Models/<id>_texture_<n>.png` for each of your
+    imported models the cells use (in an export for a `.dfmod` only);
   * `<mod>.dfmod.json`, the mod's manifest, and a `README.txt` listing what is in it.
 
   The `WorldData` files work as they are when copied into Daggerfall Unity's
@@ -485,8 +577,9 @@ dungeons you choose to the game as new locations. The window has:
   in loose files and those dungeons fall back to the game's own music; if one has
   a skybox, it warns that skyboxes do not work in loose files and those dungeons
   stay black; if one has scaled objects, it warns that scaled objects do not
-  export in loose files, only in a `.dfmod`, and they keep their usual size. The
-  export still goes ahead. An export for a `.dfmod` leaves scaled objects out of
+  export in loose files, only in a `.dfmod`, and they keep their usual size; if
+  one uses custom models, it warns that loose files cannot carry them and they
+  will be missing in the game. The export still goes ahead. An export for a `.dfmod` leaves scaled objects out of
   the `WorldData` cells (the mod's script adds them), so for loose files export
   with **Files only**. Tick the platforms to build for;
   each gets its own `.dfmod` in a `Windows`, `Linux` or `macOS` folder next to the
@@ -498,7 +591,10 @@ dungeons you choose to the game as new locations. The window has:
   editors installed by Unity Hub. Each platform needs its build support installed
   in the editor. The first build makes a small Unity project to build in (in the
   local application data folder) and takes a few minutes; later builds take about
-  a minute.
+  a minute. The build makes each custom model the cells use a prefab named after
+  its id (its mesh, a material for each of its images, and a collider), which
+  Daggerfall Unity puts wherever a cell uses that model, as it does for any
+  mod's models; the cells also tag the model `COL`, which gives it a collider.
 
 The output folder, Unity editor and platforms are remembered between runs.
 Block names, location ids and the mod's GUID stay the same from one export to
@@ -556,6 +652,69 @@ The **asset palette** along the bottom lists everything that can be placed:
 | Flats | Sprites used in cells: torches, furniture, people, treasure |
 | Markers | Editor markers: start/enter points, enemy spawns, quest and treasure markers |
 | Lights | A point light |
+| Custom Models | The models you imported with **Import > Import Model…** (see below) |
+
+**Import > Import Model…** imports a 3D model of your own, as Blender and most
+3D programs export it:
+
+* a **Wavefront OBJ** file, with its MTL materials and their textures (PNG, JPG,
+  BMP or TGA). An OBJ file holds no image itself: it names its MTL file, which
+  names each material's texture. Both are looked for where the files say, then
+  by their names (whatever their case) beside the model, in the folder the name
+  gives, or in a `textures` (or `tex`, `images`, `maps`, `materials`) folder
+  beside it; options written before a texture's name in the MTL file are
+  skipped;
+* a **glTF** file: a `.gltf` with its `.bin` buffers and images next to it, or
+  a single `.glb`. The meshes are placed as the file's scene places them (each
+  node's position, turn and scale); each material is drawn with its base colour
+  texture (tinted by its base colour, and moved by `KHR_texture_transform`) or
+  in its colour. Files that need Draco mesh compression or other extensions
+  the editor cannot read are refused with their names: export them again
+  without those;
+* a **Blender** file (`.blend`). Only Blender reads its own files reliably, so,
+  as Unity does, the editor runs Blender without a window to export the file
+  as glTF, then imports that. The status bar shows the conversion going on; the
+  editor stays usable meanwhile. The export takes what the file's view layer
+  shows (hidden objects are left out), with modifiers applied, without
+  cameras, lights or animation, and does not run scripts saved in the file.
+  Blender (free from [blender.org](https://www.blender.org)) must be
+  installed: the editor finds it where Blender's installer, the system's
+  packages or Steam put it, or on the `PATH`; **Import > Locate Blender…**
+  chooses another one (its tooltip says which is in use).
+
+If a model names a material file or texture that cannot be found or read, it
+is still imported, its parts drawn in their colour. If its MTL file was not
+found, a message asks whether to find it: the file chosen (whatever its name or
+folder) gives the model its materials, the OBJ file being read again with it
+(textures are then looked for beside the MTL file first, then beside the
+model), keeping the model's id and name. Otherwise, a message says which
+textures are missing and offers to choose the texture image at once.
+
+A model's texture can also be chosen (or replaced) at any time: right-click it
+under **Custom Models** and choose **Change texture…** (for a model of several
+parts, one part, or every part without a texture). It takes an image, laid on
+the model as its texture coordinates say, or an MTL file, used as above (if the
+OBJ file the model came from is gone, the MTL file's materials go to the parts
+of the same names, or its one material to every part). Either is saved with the
+model and taken into the game by a `.dfmod` export.
+
+**Delete model…** in the same menu deletes an imported model, after asking:
+its saved files are removed from the application's data folder (the file it was
+imported from is not touched) and it leaves **Custom Models**. If the project's
+cells or your prefabs use it, the question lists where, and those copies are
+removed too (save the project to keep that). Its id is never given to another
+model, so a project file that still places it never shows a different model.
+
+One unit is a metre, with Y up. Like Unity's own OBJ and glTF importers, the
+editor mirrors the model into the game's left-handed space, so it looks in the
+game as it did in the program it was made with. A material without a texture
+is drawn in its colour. The model gets an id of its own, from 8000000 up, is
+named after its file (right-click its tile to rename it) and is listed under
+**Custom Models**, to place, snap, turn and scale like Daggerfall's models.
+Imported models are converted once and kept in the application's data folder
+(`custom_models`), so every project can use them; a project using one needs it
+imported on the computer that exports it. Only an export for a `.dfmod` takes
+them into the game (see above).
 
 The list is built from your own game data when the ARENA2 folder is loaded.
 Any tile can be marked as a **favorite**: hover it and click the ☆ in its
@@ -581,8 +740,8 @@ door standing in it) is taken and not snapped to again. Hold Alt to place
 without snapping. **Grid lock** on the menu bar (or G) snaps objects to the grid while they are
 moved or placed: the position along the dragged axis lands on a grid line,
 which is drawn faintly at the chosen step (0.4, 0.8, 1.6 or 3.2 m, that is 16,
-32, 64 or 128 game units). Placed objects appear under **Added objects** in the outliner and can
-be moved, rotated, duplicated, deleted and undone like any other object.
+32, 64 or 128 game units). Placed objects appear in the outliner under the quarter of the cell they
+are placed in, and can be moved, rotated, duplicated, deleted and undone like any other object.
 
 An opening of a hall or room piece that joins nothing and leads out into
 empty space gets a **yellow pane** over it, in the cell editor and in the
@@ -640,13 +799,17 @@ implemented yet.
 | `src/export/` | Exporting the project as a Daggerfall Unity mod: world data JSON, manifest, music, skybox and scaled-object scripts, and the .dfmod built with Unity |
 | `src/catalog.rs` | Placeable assets, gathered from the game data at run time |
 | `src/prefabs.rs` | The user's prefabs: saving them, and placing their objects |
+| `src/custom_models.rs` | Importing the user's own OBJ and glTF models, and keeping them |
+| `src/blender.rs` | Finding Blender, and having it convert `.blend` files to glTF for import |
 | `src/connectors.rs` | Open faces and doorways of models, for snapping pieces together |
 | `src/dungeon_textures.rs` | The wall and floor textures Daggerfall Unity gives each dungeon |
 | `src/doors.rs` | The doors Daggerfall Unity switches off because they overlap another door |
 | `src/camera.rs`, `src/picking.rs` | Orbit camera and ray picking |
 | `src/render/` | wgpu renderer (models, billboards, helper lines) drawing into an egui texture |
 | `src/app/` | egui application: main window, menus, dialogs and cell editor windows |
-| `src/app/project_panel.rs` | The project panel: dungeons or cells, Daggerfall's and the project's |
+| `src/app/project_panel.rs` | The project panel: dungeons or cells, Daggerfall's and the project's; settlements and outdoor cells |
+| `src/app/exterior_view.rs` | The read-only view of a settlement or outdoor cell, and its properties |
+| `src/exterior.rs` | Outdoor cells as scenes: their objects, and their ground in a climate's tiles |
 | `src/app/room_editor/` | The cell editor: outliner, properties, asset palette, viewport, undo history |
 | `src/app/dungeon_view.rs` | Whole-dungeon view with cell highlighting, and the dungeon's properties |
 | `src/app/world_map.rs` | The world map window for choosing a dungeon's spot |

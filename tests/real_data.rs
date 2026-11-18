@@ -48,6 +48,151 @@ fn lists_dungeons_whose_blocks_all_exist() {
 }
 
 #[test]
+fn lists_every_location_with_its_outdoor_cells() {
+    let Some(mut library) = open_library() else { return };
+
+    let locations = library.locations();
+    let dungeons = library.dungeons();
+    let with_dungeon = locations.iter().filter(|location| location.has_dungeon).count();
+    println!("{} locations, {with_dungeon} with a dungeon, {} dungeons", locations.len(), dungeons.len());
+    assert!(locations.len() > 10_000);
+    // Every dungeon lies under a location; a few locations share one dungeon's record.
+    assert!(with_dungeon >= dungeons.len() * 99 / 100, "{with_dungeon} of {}", dungeons.len());
+
+    let city = locations
+        .iter()
+        .find(|location| location.name == "Daggerfall" && location.region_name == "Daggerfall")
+        .expect("the city of Daggerfall");
+    println!(
+        "Daggerfall: {:?}, {} × {} cells",
+        city.location_type, city.exterior.width, city.exterior.height
+    );
+    assert_eq!(city.location_type, Some(daggerfall_dungeon_maker::arena2::LocationType::City));
+    assert!(city.exterior.width * city.exterior.height >= 25);
+    assert!(city.has_dungeon, "Castle Daggerfall lies under the city");
+
+    // Every outdoor cell a location uses can be found (some through Daggerfall Unity's
+    // substitutes) and read, with its 16 × 16 ground tiles.
+    let mut unreadable = Vec::new();
+    let mut checked = std::collections::HashSet::new();
+    for location in locations.iter() {
+        assert_eq!(location.exterior.block_names.len(), location.exterior.width * location.exterior.height);
+        for name in &location.exterior.block_names {
+            if !checked.insert(name.clone()) {
+                continue;
+            }
+            match library.rmb_block(name) {
+                Ok(block) => assert_eq!(block.ground.len(), 256, "{name}"),
+                Err(error) => unreadable.push(format!("{name} ({}): {error}", location.name)),
+            }
+        }
+    }
+    println!("{} different outdoor cells used", checked.len());
+    assert!(unreadable.is_empty(), "{unreadable:?}");
+}
+
+#[test]
+fn outdoor_cells_stand_on_their_climates_ground() {
+    use daggerfall_dungeon_maker::arena2::{Climate, Season, RMB_BLOCK_SIDE};
+    use daggerfall_dungeon_maker::exterior::cell_scene;
+    use daggerfall_dungeon_maker::scene::SceneObjectKind;
+    let Some(mut library) = open_library() else { return };
+
+    let block = library.rmb_block("TVRNAL01.RMB").expect("a tavern cell");
+    for (climate, season) in [
+        (Climate::DEFAULT, Season::Summer),
+        (Climate::DEFAULT, Season::Winter),
+        (Climate::from_value(224), Season::Winter),
+    ] {
+        let scene = cell_scene(&block, climate, season, 3, &mut library);
+        assert!(scene.objects.iter().all(|object| object.group_index == 3));
+        // The ground comes first: 256 tiles of two triangles each, the size of the cell.
+        let SceneObjectKind::Model { model_id, .. } = scene.objects[0].kind else { panic!("ground first") };
+        let ground = library.model(model_id).expect("the ground model");
+        assert_eq!(ground.triangle_count(), 512);
+        let ground_archive = climate.ground_archive_in(season);
+        assert!(ground.submeshes.iter().all(|submesh| submesh.texture.archive == ground_archive));
+        assert!(
+            (ground.size().x - RMB_BLOCK_SIDE).abs() < 0.001
+                && (ground.size().z - RMB_BLOCK_SIDE).abs() < 0.001
+        );
+        // Every tile's texture can be drawn.
+        for submesh in &ground.submeshes {
+            assert!(library.texture_image(submesh.texture).is_some(), "{:?}", submesh.texture);
+        }
+        // Then the buildings and scenery, and the flats, trees in the climate's own archive.
+        assert_eq!(scene.objects.len(), 1 + block.models.len() + block.flats.len());
+        let nature = scene.objects.iter().filter(|object| {
+            matches!(object.kind, SceneObjectKind::Flat { texture, .. } if (500..=511).contains(&texture.archive))
+        });
+        assert!(nature.clone().count() > 0);
+        let nature_archive = climate.nature_archive_in(season);
+        assert!(nature.clone().all(|object| matches!(object.kind,
+            SceneObjectKind::Flat { texture, .. } if texture.archive == nature_archive)));
+    }
+
+    // Sentinel's cells mark some tiles with a record past the archive's, drawn as plain ground.
+    let sentinel = library.rmb_block("SENT1.RMB").expect("a cell of Sentinel");
+    assert!(sentinel.ground.iter().any(|tile| tile.record == 63));
+    let scene = cell_scene(&sentinel, Climate::from_value(224), Season::Summer, 0, &mut library);
+    let SceneObjectKind::Model { model_id, .. } = scene.objects[0].kind else { panic!("ground first") };
+    let ground = library.model(model_id).expect("the ground model");
+    for submesh in &ground.submeshes {
+        assert!(library.texture_image(submesh.texture).is_some(), "{:?}", submesh.texture);
+    }
+}
+
+#[test]
+fn climate_swaps_find_their_textures_in_every_outdoor_cell() {
+    use daggerfall_dungeon_maker::arena2::{Climate, Season};
+    use daggerfall_dungeon_maker::exterior::ClimateTextures;
+    use std::collections::{BTreeMap, BTreeSet};
+    let Some(mut library) = open_library() else { return };
+
+    // Every texture of every model in every outdoor cell.
+    let mut textures = BTreeSet::new();
+    for name in library.rmb_block_names() {
+        for model in library.rmb_block(&name).expect("an outdoor cell").models {
+            if let Some(mesh) = library.model(model.model_id) {
+                textures.extend(mesh.submeshes.iter().map(|submesh| submesh.texture));
+            }
+        }
+    }
+    // The textures the climates swap them for, in summer and winter, that the game data lacks (none).
+    let mut missing: BTreeMap<String, BTreeSet<(u16, u8)>> = BTreeMap::new();
+    let mut swapped = 0;
+    for climate in Climate::ALL {
+        for season in Season::ALL {
+            let swaps = ClimateTextures::new(climate, season);
+            for &texture in &textures {
+                let new = swaps.apply(texture);
+                if new == texture {
+                    continue;
+                }
+                swapped += 1;
+                if library.texture_image(new).is_none() {
+                    missing
+                        .entry(format!("{} {}", climate.name, season.name()))
+                        .or_default()
+                        .insert((new.archive, new.record));
+                }
+            }
+        }
+    }
+    println!("{} textures used outdoors, {swapped} swaps", textures.len());
+    for (climate, textures) in &missing {
+        println!(
+            "{climate}: {} missing, e.g. {:?}",
+            textures.len(),
+            textures.iter().take(8).collect::<Vec<_>>()
+        );
+    }
+    assert!(swapped > 1000);
+    // Every swap finds its texture in the game data.
+    assert!(missing.is_empty(), "swaps that find no texture: {missing:?}");
+}
+
+#[test]
 fn dungeons_have_types() {
     let Some(mut library) = open_library() else { return };
 
@@ -175,6 +320,42 @@ fn parses_every_rdb_block_and_its_models() {
     println!("{object_count} objects, {missing_models} missing model references");
     assert!(object_count > 10_000);
     assert_eq!(missing_models, 0);
+}
+
+#[test]
+fn object_lists_are_the_quarters_of_a_cell() {
+    use daggerfall_dungeon_maker::arena2::native_to_world;
+    use daggerfall_dungeon_maker::scene::{group_label, quarter_of, Scene};
+    let Some(library) = open_library() else { return };
+
+    // Each of a cell's own lists holds the objects of one square of it, and the
+    // lists come in the order of those squares (west to east, then south to
+    // north), whether the cell's grid is four lists wide or, in five cells, eight.
+    let mut checked = 0;
+    for name in library.rdb_block_names() {
+        let block = library.rdb_block(&name).unwrap();
+        let mut quarter_of_list = std::collections::BTreeMap::new();
+        for object in &block.objects {
+            let quarter = quarter_of(native_to_world(object.position));
+            let known = *quarter_of_list.entry(object.group_index).or_insert(quarter);
+            assert_eq!(known, quarter, "{name}: list {} spans several squares", object.group_index);
+            checked += 1;
+        }
+        let quarters: Vec<usize> = quarter_of_list.values().copied().collect();
+        assert!(
+            quarters.windows(2).all(|pair| pair[0] < pair[1]),
+            "{name}: lists out of order: {quarter_of_list:?}"
+        );
+        // The editor lists the cell's objects by those squares, in the same order.
+        let scene = Scene::from_rdb_block(&block);
+        for (object, read) in scene.objects.iter().zip(&block.objects) {
+            assert_eq!(object.group_index, quarter_of_list[&read.group_index]);
+        }
+    }
+    println!("{checked} objects are in their square's list");
+    assert_eq!(group_label(0), "South-west quarter");
+    assert_eq!(group_label(5), "North-east quarter");
+    assert_eq!(group_label(2), "Past the east edge, south (list 2)");
 }
 
 #[test]
@@ -594,6 +775,61 @@ fn exports_a_project_dungeon_as_a_new_location() {
     let room = project.room_mut(room_id).expect("the room is there");
     room.objects[index].scale = None;
 
+    // A model of the user's own in the cell: a .dfmod carries its files and the
+    // cell tags it so the game gives it a collider; loose files cannot carry it.
+    {
+        use daggerfall_dungeon_maker::custom_models::{CustomModelLibrary, FIRST_CUSTOM_MODEL_ID};
+        use daggerfall_dungeon_maker::scene::{ModelData, SceneObjectKind};
+        let models_folder = std::env::temp_dir().join(format!("ddm-export-models-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&models_folder);
+        std::fs::create_dir_all(&models_folder).unwrap();
+        let obj = models_folder.join("pillar.obj");
+        std::fs::write(&obj, "v 0 0 0\nv 1 0 0\nv 0 2 0\nf 1 2 3\n").unwrap();
+        let (mut custom_models, _) = CustomModelLibrary::open(models_folder.join("store"));
+        let model_id = custom_models.import(&obj).expect("the model imports").model.id;
+        assert_eq!(model_id, FIRST_CUSTOM_MODEL_ID);
+
+        let room = project.room_mut(room_id).expect("the room is there");
+        let mut pillar = room.objects[index].clone();
+        pillar.kind = SceneObjectKind::Model { model_id, data: ModelData::default() };
+        pillar.id = room.objects.iter().map(|object| object.id).max().unwrap() + 1;
+        pillar.next = None;
+        room.objects.push(pillar);
+        // Not imported on this computer: the dungeon cannot be exported.
+        let checks = check_project(&project, &mut library);
+        assert!(
+            checks[0].problems.iter().any(|problem| problem.contains("not imported")),
+            "{:?}",
+            checks[0].problems
+        );
+
+        custom_models.register(&mut library);
+        let checks = check_project(&project, &mut library);
+        assert!(checks[0].is_ready(), "{:?}", checks[0].problems);
+        assert_eq!(checks[0].custom_models, 1);
+        let with_model = build_mod(&project, &mut library, &details, "Fallback", &[dungeon_id], true)
+            .expect("the mod builds");
+        let copied: Vec<&str> = with_model.copied_files.iter().map(|file| file.path.as_str()).collect();
+        assert!(copied.contains(&format!("Models/{model_id}_model.json").as_str()), "{copied:?}");
+        assert!(copied.contains(&format!("Models/{model_id}_texture_0.png").as_str()), "{copied:?}");
+        let block =
+            with_model.files.iter().find(|file| file.path == format!("WorldData/{block_name}.json")).unwrap();
+        let block: serde_json::Value = serde_json::from_str(&block.contents).unwrap();
+        let reference = block["RdbBlock"]["ModelReferenceList"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|reference| reference["ModelIdNum"] == model_id)
+            .expect("the cell refers to the model");
+        assert_eq!(reference["Description"], "COL");
+        let loose = build_mod(&project, &mut library, &details, "Fallback", &[dungeon_id], false)
+            .expect("the mod builds");
+        assert!(loose.copied_files.iter().all(|file| !file.path.starts_with("Models/")));
+
+        project.room_mut(room_id).expect("the room is there").objects.pop();
+        let _ = std::fs::remove_dir_all(&models_folder);
+    }
+
     // Its name may not repeat a location of its region.
     project.dungeon_mut(dungeon_id).unwrap().name = original.name.clone();
     let checks = check_project(&project, &mut library);
@@ -892,6 +1128,7 @@ fn finds_openings_that_lead_to_empty_space() {
         next: None,
         scale: None,
         prefab: None,
+        folder: None,
     };
     let found = unclosed_faces(std::slice::from_ref(&corridor), |_| true, &mut library, &mut cache);
     let normals: Vec<glam::Vec3> = found.iter().map(|face| face.face.normal.round()).collect();

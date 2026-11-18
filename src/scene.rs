@@ -145,8 +145,47 @@ impl FixedEnemy {
 /// starting block and removes it from every other block (as Daggerfall Unity does).
 pub const EXIT_DOOR_MODEL_ID: u32 = 70300;
 
-/// Group index given to objects the user places, so they are listed separately from the room's own lists.
+/// Group index of objects outside the cell's quarters: those placed before
+/// placed objects joined the quarter they are in. New objects never get it.
 pub const ADDED_OBJECTS_GROUP: usize = usize::MAX;
+
+/// Side of the squares Daggerfall lists a cell's objects by, in native units:
+/// a quarter of the cell.
+const QUARTER_SIDE_NATIVE: i32 = 1024;
+/// Squares along each side of the grid of object lists. A cell covers the
+/// first two; objects past its north or east edge fall in the others.
+const QUARTER_GRID_WIDTH: usize = 4;
+
+/// The object list (group index) Daggerfall puts an object at `position` in:
+/// the 25.6 m square of the cell it is in, counted west to east, then south
+/// to north, in a grid four squares wide. A cell's own squares are 0 and 1
+/// (south) and 4 and 5 (north); an object on or past its north or east edge
+/// is in a square beyond them. Positions past the grid count as its last square.
+pub fn quarter_of(position: Vec3) -> usize {
+    let square = |world: f32| {
+        let native = (world / WORLD_SCALE).round() as i32;
+        native.div_euclid(QUARTER_SIDE_NATIVE).clamp(0, QUARTER_GRID_WIDTH as i32 - 1) as usize
+    };
+    square(position.x) + QUARTER_GRID_WIDTH * square(position.z)
+}
+
+/// Human readable name of an object group: the quarter of the cell it holds,
+/// for example "North-west quarter".
+pub fn group_label(group_index: usize) -> String {
+    if group_index == ADDED_OBJECTS_GROUP {
+        return "Added objects".to_string();
+    }
+    let (column, row) = (group_index % QUARTER_GRID_WIDTH, group_index / QUARTER_GRID_WIDTH);
+    let west_east = if column == 0 { "west" } else { "east" };
+    match (column, row) {
+        (0 | 1, 0) => format!("South-{west_east} quarter"),
+        (0 | 1, 1) => format!("North-{west_east} quarter"),
+        (0 | 1, _) => format!("Past the north edge, {west_east} (list {group_index})"),
+        (_, 0) => format!("Past the east edge, south (list {group_index})"),
+        (_, 1) => format!("Past the east edge, north (list {group_index})"),
+        _ => format!("Past the north-east corner (list {group_index})"),
+    }
+}
 
 /// Name given to model objects until the user renames them, for example "Model 70300".
 ///
@@ -154,15 +193,6 @@ pub const ADDED_OBJECTS_GROUP: usize = usize::MAX;
 /// [display name](crate::custom_names::CustomNames::model_label) instead.
 pub fn default_model_object_name(model_id: u32) -> String {
     format!("Model {model_id}")
-}
-
-/// Human readable name of an object group.
-pub fn group_label(group_index: usize) -> String {
-    if group_index == ADDED_OBJECTS_GROUP {
-        "Added objects".to_string()
-    } else {
-        format!("Object list {group_index}")
-    }
 }
 
 /// Identifies an object within its cell. It stays the same while the cell is
@@ -522,6 +552,19 @@ pub struct SceneObject {
     /// The placed prefab the object is part of, if it is. The editor only:
     /// the game sees the objects of a prefab as any others.
     pub prefab: Option<PrefabMember>,
+    /// The object list the user put it in (a folder in the outliner), if any.
+    /// The editor only, like prefabs.
+    pub folder: Option<ObjectFolder>,
+}
+
+/// An object list the user made: a folder of objects in the outliner, to keep
+/// a cell organised. Each object is in at most one. The game never sees them;
+/// it lists a cell's objects by quarter (see [`quarter_of`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectFolder {
+    /// Tells this list from the cell's others (see [`Scene::new_folder_id`]).
+    pub id: u32,
+    pub name: String,
 }
 
 /// Marks an object as part of a prefab placed in a cell. The objects of one
@@ -644,6 +687,11 @@ impl SceneObject {
     /// Local-to-world transform of the object, with its scale.
     pub fn model_matrix(&self) -> Mat4 {
         Mat4::from_scale_rotation_translation(self.scale_or_one(), self.rotation(), self.position)
+    }
+
+    /// Whether the object is a copy of model `model_id`.
+    pub fn is_model(&self, model_id: u32) -> bool {
+        matches!(self.kind, SceneObjectKind::Model { model_id: id, .. } if id == model_id)
     }
 
     /// Returns `true` for the door model that leads out of a dungeon.
@@ -778,17 +826,22 @@ impl Scene {
                     ),
                 };
 
+                // Daggerfall lists a cell's objects by the quarter they are in, in a grid
+                // four lists wide (eight in a few cells); the editor numbers every
+                // cell's quarters the same way, which keeps the lists' order.
+                let position = native_to_world(object.position);
                 SceneObject {
                     id: index as ObjectId + 1,
                     name,
-                    group_index: object.group_index,
+                    group_index: quarter_of(position),
                     kind,
-                    position: native_to_world(object.position),
+                    position,
                     rotation_degrees,
                     visible: true,
                     next,
                     scale: None,
                     prefab: None,
+                    folder: None,
                 }
             })
             .collect();
@@ -853,6 +906,48 @@ impl Scene {
             Some(member) => self.prefab_members(member.instance),
             None => vec![index],
         }
+    }
+
+    /// A number no object list of the cell uses yet, for a new one.
+    pub fn new_folder_id(&self) -> u32 {
+        self.objects
+            .iter()
+            .filter_map(|object| object.folder.as_ref())
+            .map(|folder| folder.id)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    /// The cell's object lists, oldest first.
+    pub fn folders(&self) -> Vec<ObjectFolder> {
+        let mut folders: Vec<ObjectFolder> = Vec::new();
+        for folder in self.objects.iter().filter_map(|object| object.folder.as_ref()) {
+            if !folders.iter().any(|known| known.id == folder.id) {
+                folders.push(folder.clone());
+            }
+        }
+        folders.sort_by_key(|folder| folder.id);
+        folders
+    }
+
+    /// Indices of the objects in the object list `id`.
+    pub fn folder_members(&self, id: u32) -> Vec<usize> {
+        self.objects
+            .iter()
+            .enumerate()
+            .filter(|(_, object)| object.folder.as_ref().is_some_and(|folder| folder.id == id))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// A name for a new object list: "Object list 1", "Object list 2", …, the first the cell does not use.
+    pub fn new_folder_name(&self) -> String {
+        let folders = self.folders();
+        (1..)
+            .map(|number| format!("Object list {number}"))
+            .find(|name| !folders.iter().any(|folder| folder.name.trim().eq_ignore_ascii_case(name)))
+            .expect("an unused name always exists")
     }
 
     /// World space bounds of the objects `indices`, as [`Scene::bounds`] works them out.
@@ -1014,6 +1109,7 @@ mod tests {
             next: None,
             scale: Some(Vec3::new(2.0, 3.0, 4.0)),
             prefab: None,
+            folder: None,
         };
         let plain = model(1234);
         // Scaled along its own axes, then turned, then moved.
@@ -1062,6 +1158,7 @@ mod tests {
             next: None,
             scale: None,
             prefab: None,
+            folder: None,
         };
         let radians = object.rotation_degrees * (std::f32::consts::PI / 180.0);
         let expected = Mat4::from_translation(object.position)
@@ -1087,6 +1184,7 @@ mod tests {
             next: None,
             scale: None,
             prefab: None,
+            folder: None,
         };
         // The game ignores the high byte.
         let orc = marker(0x3507, 0, 0).fixed_enemy().unwrap();
@@ -1116,6 +1214,7 @@ mod tests {
             next: None,
             scale: None,
             prefab: None,
+            folder: None,
         };
         let mage = FixedEnemy { mobile_id: 128, passive: true, gender: EnemyGender::Female };
         object.set_fixed_enemy(mage);
@@ -1149,6 +1248,7 @@ mod tests {
             next: None,
             scale: None,
             prefab: None,
+            folder: None,
         };
         // A water byte of 5 puts the water 40 native units (1 m) up.
         let deep = flat(RANDOM_ENEMY_MARKER_RECORD, 0, 0.5);
@@ -1178,6 +1278,7 @@ mod tests {
             next: Some(7),
             scale: None,
             prefab: None,
+            folder: None,
         };
         let mut good = vec![light(4), light(9)];
         Scene::ensure_object_ids(&mut good);
@@ -1242,6 +1343,7 @@ mod tests {
             next: None,
             scale: None,
             prefab: None,
+            folder: None,
         };
         let halfway = object.moved_by(&lift, 0.5);
         assert_eq!(halfway.position, Vec3::new(0.0, 1.6, 0.0));
@@ -1262,6 +1364,7 @@ mod tests {
             next,
             scale: None,
             prefab: None,
+            folder: None,
         };
         let rotate = Some(ObjectAction { action_type: 0x08, axis: 4, duration: 20, magnitude: 512 });
         // Lever (10) -> object with no action (20) -> moving wall (30) -> lever again (loop).
@@ -1292,6 +1395,7 @@ mod tests {
             next: None,
             scale: None,
             prefab: None,
+            folder: None,
         };
         let box_2m = Some((Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 2.0, 1.0)));
         assert_eq!(object(10.0, 0.0).distance_outside_cell(None), 0.0);
@@ -1317,6 +1421,7 @@ mod tests {
             next: None,
             scale: None,
             prefab: None,
+            folder: None,
         };
         let mut scene = Scene {
             block_name: "N0000000.RDB".to_string(),

@@ -111,6 +111,15 @@ pub struct RoomOutline {
     pub origin: Vec3,
     /// Draw the outline in the highlight colour.
     pub highlighted: bool,
+    /// Width and depth of the block, in world units.
+    pub side: f32,
+}
+
+impl RoomOutline {
+    /// The outline of a dungeon cell (an RDB block) whose minimum corner is at `origin`.
+    pub const fn cell(origin: Vec3) -> Self {
+        Self { origin, highlighted: false, side: RDB_BLOCK_SIDE }
+    }
 }
 
 impl FrameRequest<'_> {
@@ -151,8 +160,6 @@ pub struct FrameRequest<'frame> {
     pub placement_preview: &'frame [SceneObject],
     /// Water surfaces to draw, each the corner of a cell's square at its water height.
     pub water_planes: &'frame [Vec3],
-    /// Squares of ground to draw: each one's minimum corner and side, in world units.
-    pub ground_squares: &'frame [(Vec3, f32)],
     /// Objects drawn faded for context only, such as the cells around the edited
     /// one in a dungeon. They are never highlighted or picked.
     pub context_scene: Option<&'frame Scene>,
@@ -170,9 +177,23 @@ pub struct FrameRequest<'frame> {
     /// The textures of the dungeon the scene is in, which replace the standard
     /// dungeon textures of its models (and of the context scene's), as in the game.
     pub dungeon_textures: Option<crate::dungeon_textures::DungeonTextures>,
+    /// The climate and season of the outdoor location the scene is in, whose
+    /// variants of its models' textures are drawn, as in the game.
+    pub climate_textures: Option<crate::exterior::ClimateTextures>,
     /// Objects of the scene tinted red as a warning, such as doors the game
     /// switches off (when [`ViewSettings::show_switched_off_doors`] is on).
     pub warned_objects: &'frame [usize],
+}
+
+/// Whose textures a model is drawn with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TextureSwap {
+    /// Its own.
+    None,
+    /// Its dungeon's ([`FrameRequest::dungeon_textures`]).
+    Dungeon,
+    /// Its location's climate's ([`FrameRequest::climate_textures`]).
+    Climate,
 }
 
 /// The image one viewport is rendered into, plus the egui texture that displays it.
@@ -482,6 +503,22 @@ impl SceneRenderer {
         self.sky.error(path)
     }
 
+    /// Drops what is cached of model `model_id` (its mesh and thumbnail) and
+    /// of the textures `textures`, after they changed, such as an imported
+    /// model given another image.
+    pub fn forget_model(
+        &mut self,
+        render_state: &egui_wgpu::RenderState,
+        model_id: u32,
+        textures: &[TextureKey],
+    ) {
+        self.models.remove(&model_id);
+        for texture in textures {
+            self.textures.remove(texture);
+        }
+        self.thumbnails.forget(render_state, model_id);
+    }
+
     /// Drops every cached model, texture and thumbnail, for example after a different ARENA2 folder is loaded.
     pub fn clear_cache(&mut self, render_state: &egui_wgpu::RenderState) {
         self.models.clear();
@@ -519,8 +556,7 @@ impl SceneRenderer {
 
         let lines = build_helper_lines(library, request);
         self.line_vertex_buffer.write(device, queue, bytemuck::cast_slice(&lines.vertices));
-        let mut water = ground_vertices(request.ground_squares);
-        water.extend(water_vertices(request.water_planes));
+        let water = water_vertices(request.water_planes);
         self.water_vertex_buffer.write(device, queue, bytemuck::cast_slice(&water));
 
         let mut encoder = device
@@ -636,11 +672,17 @@ impl SceneRenderer {
             }
         };
 
-        // By model, and whether it is drawn with the dungeon's textures.
-        let mut model_instances_by_id: BTreeMap<(u32, bool), Vec<ModelInstance>> = BTreeMap::new();
-        let dungeon_textures = request.dungeon_textures;
-        let themed = |object: &SceneObject| {
-            dungeon_textures.is_some() && crate::dungeon_textures::uses_dungeon_textures(object)
+        // By model, and whose textures it is drawn with.
+        let mut model_instances_by_id: BTreeMap<(u32, TextureSwap), Vec<ModelInstance>> = BTreeMap::new();
+        let (dungeon_textures, climate_textures) = (request.dungeon_textures, request.climate_textures);
+        let swap_of = |object: &SceneObject| {
+            if dungeon_textures.is_some() && crate::dungeon_textures::uses_dungeon_textures(object) {
+                TextureSwap::Dungeon
+            } else if climate_textures.is_some() && crate::exterior::uses_climate_textures(object) {
+                TextureSwap::Climate
+            } else {
+                TextureSwap::None
+            }
         };
         let mut billboard_instances_by_texture: BTreeMap<TextureKey, Vec<BillboardInstance>> =
             BTreeMap::new();
@@ -665,7 +707,7 @@ impl SceneRenderer {
         for (object, highlight) in drawable_objects {
             match object.kind {
                 SceneObjectKind::Model { model_id, .. } if settings.show_models => {
-                    model_instances_by_id.entry((model_id, themed(object))).or_default().push(
+                    model_instances_by_id.entry((model_id, swap_of(object))).or_default().push(
                         ModelInstance { model_matrix: object.model_matrix().to_cols_array_2d(), highlight },
                     );
                 }
@@ -689,13 +731,19 @@ impl SceneRenderer {
         // Models: upload any new ones and concatenate instances into one buffer.
         let mut model_instances = Vec::new();
         let mut model_batches = Vec::new();
-        for ((model_id, themed), instances) in model_instances_by_id {
+        for ((model_id, swap), instances) in model_instances_by_id {
             if !self.ensure_model(device, queue, library, model_id) {
                 continue;
             }
-            // The dungeon's textures in place of the model's own, part by part.
-            let textures = match (themed, dungeon_textures) {
-                (true, Some(dungeon_textures)) => {
+            // The dungeon's or the climate's textures in place of the model's own, part by part.
+            let swapped = |key: TextureKey| match (swap, dungeon_textures, climate_textures) {
+                (TextureSwap::Dungeon, Some(textures), _) => textures.apply(key),
+                (TextureSwap::Climate, _, Some(textures)) => textures.apply(key),
+                _ => key,
+            };
+            let textures = match swap {
+                TextureSwap::None => None,
+                _ => {
                     let keys: Vec<TextureKey> = self
                         .models
                         .get(&model_id)
@@ -704,11 +752,10 @@ impl SceneRenderer {
                         .unwrap_or_default();
                     Some(
                         keys.into_iter()
-                            .map(|key| self.texture(device, queue, library, dungeon_textures.apply(key)))
+                            .map(|key| self.texture(device, queue, library, swapped(key)))
                             .collect(),
                     )
                 }
-                _ => None,
             };
             let start = model_instances.len() as u32;
             model_instances.extend(instances);
@@ -800,12 +847,8 @@ fn build_helper_lines(library: &mut Arena2Library, request: &FrameRequest<'_>) -
         for outline in outlines.chain(highlighted) {
             let color = if outline.highlighted { HIGHLIGHTED_ROOM_OUTLINE_COLOR } else { ROOM_OUTLINE_COLOR };
             let corner = |x: f32, z: f32| outline.origin + Vec3::new(x, 0.0, z) + Vec3::Y * grid_height;
-            let corners = [
-                corner(0.0, 0.0),
-                corner(RDB_BLOCK_SIDE, 0.0),
-                corner(RDB_BLOCK_SIDE, RDB_BLOCK_SIDE),
-                corner(0.0, RDB_BLOCK_SIDE),
-            ];
+            let side = outline.side;
+            let corners = [corner(0.0, 0.0), corner(side, 0.0), corner(side, side), corner(0.0, side)];
             for side in 0..4 {
                 lines.add_line(corners[side], corners[(side + 1) % 4], color);
             }
@@ -885,23 +928,6 @@ const WATER_COLOR: [f32; 4] = [0.2, 0.5, 1.0, 0.28];
 /// Colour of the edge of a water surface.
 const WATER_EDGE_COLOR: Vec4 = Vec4::new(0.35, 0.65, 1.0, 1.0);
 
-/// Colour of the ground under a location's preview: a muted grass green.
-const GROUND_COLOR: [f32; 4] = [0.035, 0.055, 0.025, 1.0];
-
-/// Two triangles for each square of ground.
-fn ground_vertices(squares: &[(Vec3, f32)]) -> Vec<LineVertex> {
-    squares
-        .iter()
-        .flat_map(|&(corner, side)| {
-            let at = |x: f32, z: f32| LineVertex {
-                position: (corner + Vec3::new(x, 0.0, z)).to_array(),
-                color: GROUND_COLOR,
-            };
-            [at(0.0, 0.0), at(side, 0.0), at(side, side), at(0.0, 0.0), at(side, side), at(0.0, side)]
-        })
-        .collect()
-}
-
 /// Two triangles for each water surface, covering a cell's square at water height.
 fn water_vertices(planes: &[Vec3]) -> Vec<LineVertex> {
     planes
@@ -978,7 +1004,7 @@ fn add_grid(
 
     let (minimum_corner, maximum_corner) = room_outlines
         .iter()
-        .map(|outline| (outline.origin, outline.origin + Vec3::new(RDB_BLOCK_SIDE, 0.0, RDB_BLOCK_SIDE)))
+        .map(|outline| (outline.origin, outline.origin + Vec3::new(outline.side, 0.0, outline.side)))
         .reduce(|(minimum, maximum), (low, high)| (minimum.min(low), maximum.max(high)))
         .unwrap_or((Vec3::ZERO, Vec3::new(RDB_BLOCK_SIDE, 0.0, RDB_BLOCK_SIDE)));
     let snap_down = |value: f32| ((value - margin) / GRID_SPACING).floor() as i32;

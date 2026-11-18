@@ -139,6 +139,7 @@ mod tests {
             next: None,
             scale: None,
             prefab: None,
+            folder: None,
         }
     }
 

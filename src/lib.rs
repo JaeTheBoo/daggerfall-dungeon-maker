@@ -21,14 +21,17 @@
 
 pub mod app;
 pub mod arena2;
+pub mod blender;
 pub mod camera;
 pub mod catalog;
 pub mod connectors;
+pub mod custom_models;
 pub mod custom_names;
 pub mod doors;
 pub mod dungeon_textures;
 pub mod encounters;
 pub mod export;
+pub mod exterior;
 pub mod merge;
 pub mod music;
 pub mod picking;

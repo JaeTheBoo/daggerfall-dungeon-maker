@@ -118,6 +118,16 @@ pub const MUSIC_FOLDER: &str = "Music";
 /// `.dfmod` with Unity makes a skybox material next to each one.
 pub const SKY_FOLDER: &str = "Sky";
 
+/// Folder inside the mod that holds the user's imported models the cells use
+/// (see [`crate::custom_models`]). Building the `.dfmod` with Unity makes a
+/// prefab of each, named after its id, which Daggerfall Unity puts wherever a
+/// cell uses that model.
+pub const MODELS_FOLDER: &str = "Models";
+
+/// Tag the cells give imported models: Daggerfall Unity gives the custom
+/// models of cells tagged so a collider, so the player cannot walk through them.
+const CUSTOM_MODEL_TAG: &str = "COL";
+
 /// A project cell an export adds to the game, and the block name it gets.
 #[derive(Debug, Clone)]
 pub struct ExportedCell {
@@ -163,6 +173,8 @@ pub struct DungeonCheck {
     pub skybox: bool,
     /// How many of its cells' objects are scaled (and can be), which only a `.dfmod` can show.
     pub scaled_objects: usize,
+    /// How many different models of the user's own its cells use, which only a `.dfmod` can carry.
+    pub custom_models: usize,
     /// What the game does differently from what the editor shows, which does
     /// not stop the export: doors it switches off, for example.
     pub notes: Vec<String>,
@@ -206,6 +218,13 @@ pub fn check_project(project: &Project, library: &mut Arena2Library) -> Vec<Dung
                         ));
                     }
                 }
+                for model_id in custom_models_used(project, dungeon) {
+                    if library.custom_model_files(model_id).is_none() {
+                        problems.push(format!(
+                            "It uses the custom model {model_id}, which is not imported on this computer"
+                        ));
+                    }
+                }
             }
             DungeonCheck {
                 id: dungeon.id,
@@ -219,8 +238,23 @@ pub fn check_project(project: &Project, library: &mut Arena2Library) -> Vec<Dung
                     .iter()
                     .map(|room| scaled_objects(&room.objects, &model_tags).len())
                     .sum(),
+                custom_models: custom_models_used(project, dungeon).len(),
                 notes,
             }
+        })
+        .collect()
+}
+
+/// The models of the user's own that the cells of `dungeon` use, by id.
+fn custom_models_used(project: &Project, dungeon: &ProjectDungeon) -> std::collections::BTreeSet<u32> {
+    used_project_rooms(project, dungeon)
+        .iter()
+        .flat_map(|room| &room.objects)
+        .filter_map(|object| match object.kind {
+            SceneObjectKind::Model { model_id, .. } if crate::custom_models::is_custom_model(model_id) => {
+                Some(model_id)
+            }
+            _ => None,
         })
         .collect()
 }
@@ -752,6 +786,20 @@ pub fn build_mod(
     let mut exported = Vec::new();
     let mut taken_location_files = HashSet::new();
     let mut copied_files = Vec::new();
+    // The user's models the cells use go into the mod, for its build to make prefabs of.
+    if for_dfmod {
+        let used: std::collections::BTreeSet<u32> =
+            ready.iter().flat_map(|dungeon| custom_models_used(project, dungeon)).collect();
+        for model_id in used {
+            let files = library.custom_model_files(model_id).ok_or("a custom model is no longer imported")?;
+            for source in files {
+                let name =
+                    source.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                copied_files
+                    .push(CopiedFile { path: format!("{MODELS_FOLDER}/{name}"), source: source.clone() });
+            }
+        }
+    }
     let mut music_entries = Vec::new();
     let mut sky_entries = Vec::new();
     let mut scaled_dungeons = Vec::new();
@@ -978,7 +1026,7 @@ pub fn build_mod(
 pub fn write_mod(mod_files: &ModFiles, folder: &Path) -> Result<PathBuf, String> {
     let mod_folder = folder.join(&mod_files.file_name);
     // Files of dungeons, cells, music and skies since removed must not linger.
-    for folder in [WORLD_DATA_FOLDER, MUSIC_FOLDER, SKY_FOLDER] {
+    for folder in [WORLD_DATA_FOLDER, MUSIC_FOLDER, SKY_FOLDER, MODELS_FOLDER] {
         let folder = mod_folder.join(folder);
         if folder.is_dir() {
             std::fs::remove_dir_all(&folder)
@@ -1180,8 +1228,10 @@ pub(crate) fn native_radius(radius: f32) -> u16 {
     (radius / WORLD_SCALE).round().clamp(0.0, f32::from(u16::MAX)) as u16
 }
 
-/// The object groups of a cell, as RDB blocks store them: the cell's own
-/// lists in order, then one more for the objects the user added.
+/// The object groups of a cell, as RDB blocks store them: one list for each
+/// quarter of the cell (see [`crate::scene::quarter_of`]) in order, then one
+/// more for any objects outside the quarters. The object lists the user made
+/// in the editor are not exported.
 pub fn object_groups(objects: &[SceneObject]) -> Vec<Vec<usize>> {
     let own_groups = objects
         .iter()
@@ -1204,8 +1254,12 @@ pub(crate) const fn object_position(index: usize) -> i32 {
     (index as i32 + 1) * OBJECT_POSITION_STRIDE
 }
 
-/// Tag for `model_id`, as Daggerfall's cells tag it.
+/// Tag for `model_id`, as Daggerfall's cells tag it; the user's own models
+/// get the tag that gives them a collider in the game.
 pub(crate) fn model_tag(model_id: u32, tags: &HashMap<u32, String>) -> String {
+    if crate::custom_models::is_custom_model(model_id) {
+        return CUSTOM_MODEL_TAG.to_string();
+    }
     tags.get(&model_id).cloned().unwrap_or_else(|| UNKNOWN_MODEL_TAG.to_string())
 }
 
@@ -1258,6 +1312,7 @@ mod tests {
             next: None,
             scale: None,
             prefab: None,
+            folder: None,
         };
         let objects = [object(1), object(ADDED_OBJECTS_GROUP), object(0)];
         assert_eq!(object_groups(&objects), vec![vec![2], vec![0], vec![1]]);

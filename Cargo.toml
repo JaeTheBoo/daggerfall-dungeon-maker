@@ -1,6 +1,6 @@
 [package]
 name = "daggerfall-dungeon-maker"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A CAD-style 3D viewer and editor for The Elder Scrolls II: Daggerfall dungeons and dungeon blocks."
 license = "MIT"
@@ -29,8 +29,19 @@ bytemuck = { version = "1.16", features = ["derive"] }
 glam = "0.29"
 # Native file and folder dialogs.
 rfd = "0.15"
-# Reading the PNG and JPG images used as dungeon skyboxes.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Reading the PNG and JPG images used as dungeon skyboxes, and the textures of
+# imported models (PNG, JPG, BMP or TGA), which are saved as PNG.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
+# Reading Wavefront OBJ models (and their MTL materials) the user imports.
+tobj = "4"
+# Reading glTF models (.gltf and .glb) the user imports: their texture
+# transforms and the older specular-glossiness and unlit materials too.
+gltf = { version = "1", features = [
+    "guess_mime_type",
+    "KHR_texture_transform",
+    "KHR_materials_pbrSpecularGlossiness",
+    "KHR_materials_unlit",
+] }
 # Logging facade and a simple console logger for debug builds.
 log = "0.4"
 env_logger = "0.11"

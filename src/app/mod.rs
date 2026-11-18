@@ -15,6 +15,7 @@ mod dungeon_browser;
 mod dungeon_view;
 mod entrance_picker;
 mod export_window;
+mod exterior_view;
 mod project_panel;
 mod room_browser;
 mod room_editor;
@@ -27,9 +28,11 @@ use std::path::{Path, PathBuf};
 use eframe::{egui, egui_wgpu};
 use glam::Vec3;
 
-use crate::arena2::{Arena2Library, DungeonDefinition, RDB_BLOCK_SIDE};
+use crate::arena2::{Arena2Library, Climate, DungeonDefinition, RDB_BLOCK_SIDE};
+use crate::blender::BlendConversion;
 use crate::catalog::AssetCatalog;
 use crate::connectors::OpeningsLeftOpen;
+use crate::custom_models::CustomModelLibrary;
 use crate::custom_names::CustomNames;
 use crate::dungeon_textures::{DungeonIdentity, TextureMode, TextureSetting};
 use crate::prefabs::PrefabLibrary;
@@ -43,6 +46,7 @@ use arena2_prompt::Arena2Prompt;
 use dungeon_browser::DungeonBrowser;
 use dungeon_view::{DungeonDetails, DungeonPropertiesAction, DungeonView, LocationWindowsRequest};
 use export_window::{ExportRequest, ExportWindow};
+use exterior_view::{ExteriorDetails, ExteriorOpen, ExteriorSubject, ExteriorView};
 use project_panel::{OpenedItem, PanelAction, ProjectPanel};
 use room_browser::RoomBrowser;
 use room_editor::{ContextCell, ContextDoors, DungeonContext, RoomEditor, UsedInEntry};
@@ -54,6 +58,8 @@ const ARENA2_FOLDER_STORAGE_KEY: &str = "arena2_folder";
 const CUSTOM_NAMES_STORAGE_KEY: &str = "custom_names";
 /// The user's prefabs, saved as JSON text (see [`PrefabLibrary::to_text`]).
 const PREFABS_STORAGE_KEY: &str = "prefabs";
+/// Folder of the application's data the user's imported models are kept in.
+const CUSTOM_MODELS_FOLDER: &str = "custom_models";
 /// Storage key of the openings Daggerfall's dungeons leave open, learned from the game data.
 const OPENINGS_STORAGE_KEY: &str = "openings_left_open";
 /// Storage key of the export window's settings (folders, Unity editor, platforms).
@@ -64,6 +70,8 @@ const PANEL_VIEW_STORAGE_KEY: &str = "project_panel_view";
 const PROJECT_FILE_STORAGE_KEY: &str = "project_file";
 /// Storage key of which textures dungeons are drawn with.
 const DUNGEON_TEXTURES_STORAGE_KEY: &str = "dungeon_textures";
+/// Storage key of the Blender program the user chose (Import > Locate Blender…).
+const BLENDER_STORAGE_KEY: &str = "blender_program";
 /// How long the pointer must rest on something before its explanation appears.
 const TOOLTIP_DELAY_SECONDS: f32 = 0.5;
 /// Name shown in window titles.
@@ -80,10 +88,13 @@ pub struct StartupOptions {
     pub arena2_folder: Option<PathBuf>,
     /// Project file to open instead of the one open last time.
     pub project_file: Option<PathBuf>,
-    /// Room to open once the game data has loaded, for example `N0000004.RDB`.
+    /// Room to open once the game data has loaded, for example `N0000004.RDB`
+    /// (or an outdoor cell, for example `TVRNAL01.RMB`).
     pub room_name: Option<String>,
     /// Dungeon to open once the game data has loaded, for example `Privateer's Hold`.
     pub dungeon_name: Option<String>,
+    /// Settlement to open once the game data has loaded, for example `Daggerfall`.
+    pub settlement_name: Option<String>,
 }
 
 /// What the main window is showing.
@@ -94,6 +105,8 @@ enum Workspace {
     Room(Box<RoomEditor>),
     /// A whole dungeon.
     Dungeon(Box<DungeonView>),
+    /// A settlement or an outdoor cell from Daggerfall, read-only.
+    Exterior(Box<ExteriorView>),
 }
 
 /// A room editor running in its own operating system window.
@@ -167,10 +180,22 @@ pub struct DungeonMakerApp {
     catalog: AssetCatalog,
     /// For each Daggerfall cell, the indices of the Daggerfall dungeons that use it.
     cell_usage: HashMap<String, Vec<usize>>,
+    /// For each Daggerfall outdoor cell (RMB block), the indices of the locations that use it.
+    outdoor_usage: std::sync::Arc<HashMap<String, Vec<usize>>>,
+    /// The index of the dungeon under each location, by region and location id.
+    dungeon_under: HashMap<(usize, u16), usize>,
     /// The user's own names for rooms and models, saved with the settings.
     custom_names: CustomNames,
     /// The user's prefabs, saved with the settings.
     prefabs: PrefabLibrary,
+    /// The models the user imported, kept in the application's data folder.
+    custom_models: CustomModelLibrary,
+    /// The Blender program the user chose to convert `.blend` files with,
+    /// saved with the settings; `None` to look for Blender where it is
+    /// usually installed.
+    blender_program: Option<PathBuf>,
+    /// A `.blend` file Blender is converting to import, in the background.
+    blend_conversion: Option<BlendConversion>,
     /// The user's own rooms and dungeons.
     project: Project,
     /// Where the project was last saved or opened from; `None` until it is saved.
@@ -247,6 +272,10 @@ impl DungeonMakerApp {
             }
             None => PrefabLibrary::default(),
         };
+        let (custom_models, model_problems) = match eframe::storage_dir(APPLICATION_NAME) {
+            Some(folder) => CustomModelLibrary::open(folder.join(CUSTOM_MODELS_FOLDER)),
+            None => (CustomModelLibrary::default(), Vec::new()),
+        };
 
         let mut project_panel = ProjectPanel::default();
         if let Some(view) =
@@ -271,8 +300,15 @@ impl DungeonMakerApp {
             renderer,
             catalog: AssetCatalog::default(),
             cell_usage: HashMap::new(),
+            outdoor_usage: std::sync::Arc::default(),
+            dungeon_under: HashMap::new(),
             custom_names,
             prefabs,
+            custom_models,
+            blender_program: stored_string(BLENDER_STORAGE_KEY)
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
+            blend_conversion: None,
             project,
             project_path: None,
             saved_project,
@@ -304,6 +340,9 @@ impl DungeonMakerApp {
             game_texture_mode: crate::dungeon_textures::game_texture_mode(),
             new_location_ids: None,
         };
+        if !model_problems.is_empty() {
+            app.error_message = Some(model_problems.join("\n"));
+        }
 
         if app.renderer.is_none() {
             app.error_message =
@@ -317,10 +356,17 @@ impl DungeonMakerApp {
         }
         if app.library.is_some() {
             if let Some(room_name) = startup_options.room_name {
-                app.open_room(&room_name.to_ascii_uppercase());
+                let room_name = room_name.to_ascii_uppercase();
+                match room_name.ends_with(".RMB") {
+                    true => app.open_outdoor_cell(&room_name),
+                    false => app.open_room(&room_name),
+                }
             }
             if let Some(dungeon_name) = startup_options.dungeon_name {
                 app.open_dungeon_named(&dungeon_name);
+            }
+            if let Some(settlement_name) = startup_options.settlement_name {
+                app.open_settlement_named(&settlement_name);
             }
         }
         app
@@ -343,7 +389,17 @@ impl DungeonMakerApp {
                         }
                     }
                 }
+                self.dungeon_under = dungeons
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, dungeon)| {
+                        Some(((dungeon.region_index, dungeon.classic?.location_id), index))
+                    })
+                    .collect();
                 self.project_panel.set_daggerfall_contents(room_names, dungeons);
+                self.list_outdoor_cells(&mut library);
+                // The user's own models show as if they were Daggerfall's.
+                self.custom_models.register(&mut library);
                 self.catalog = AssetCatalog::build(&mut library);
                 self.start_learning_openings(&library);
                 self.status_message = format!("Loaded game data from {}", folder.display());
@@ -358,6 +414,31 @@ impl DungeonMakerApp {
             }
             Err(error) => self.arena2_prompt.open(Some(error.to_string())),
         }
+    }
+
+    /// Lists Daggerfall's settlements and outdoor cells in the project panel,
+    /// noting the locations that use each cell.
+    fn list_outdoor_cells(&mut self, library: &mut Arena2Library) {
+        let locations = library.locations();
+        let mut usage: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut found_names: HashMap<&str, Option<String>> = HashMap::new();
+        for (index, location) in locations.iter().enumerate() {
+            for name in &location.exterior.block_names {
+                let found = found_names.entry(name).or_insert_with(|| library.rmb_block_found_name(name));
+                if let Some(found) = found {
+                    let users = usage.entry(found.clone()).or_default();
+                    if users.last() != Some(&index) {
+                        users.push(index);
+                    }
+                }
+            }
+        }
+        self.outdoor_usage = std::sync::Arc::new(usage);
+        self.project_panel.set_outdoor_contents(
+            locations,
+            library.rmb_block_names(),
+            self.outdoor_usage.clone(),
+        );
     }
 
     /// Gives the catalog the openings Daggerfall's dungeons leave open: the
@@ -414,6 +495,8 @@ impl DungeonMakerApp {
         match item {
             OpenedItem::DaggerfallRoom(room_name) => self.open_room(room_name),
             OpenedItem::DaggerfallDungeon(dungeon_index) => self.open_dungeon(*dungeon_index),
+            OpenedItem::DaggerfallSettlement(location_index) => self.open_settlement(*location_index),
+            OpenedItem::DaggerfallOutdoorCell(block_name) => self.open_outdoor_cell(block_name),
             OpenedItem::Project(id) => self.open_project_item(*id),
         }
     }
@@ -453,6 +536,49 @@ impl DungeonMakerApp {
             library,
         );
         self.show_dungeon(view, problems, OpenedItem::DaggerfallDungeon(dungeon_index));
+    }
+
+    /// Opens the Daggerfall location at `location_index` in the library's location list, read-only.
+    fn open_settlement(&mut self, location_index: usize) {
+        let Some(library) = self.library.as_mut() else { return };
+        let locations = library.locations();
+        let Some(location) = locations.get(location_index) else { return };
+        let climate = library
+            .world_map()
+            .and_then(|world| world.location_climate_at(location.map_pixel))
+            .map_or(Climate::DEFAULT, Climate::from_value);
+        let (view, problems) = ExteriorView::settlement(location_index, location, climate, library);
+        self.show_exterior(view, problems, OpenedItem::DaggerfallSettlement(location_index));
+    }
+
+    /// Opens the Daggerfall location called `name` (case-insensitive): the
+    /// largest of that name, as several share some names.
+    fn open_settlement_named(&mut self, name: &str) {
+        let Some(library) = self.library.as_mut() else { return };
+        let locations = library.locations();
+        let size = |index: usize| locations[index].exterior.block_names.len();
+        let found = (0..locations.len())
+            .filter(|&index| locations[index].name.eq_ignore_ascii_case(name))
+            .max_by_key(|&index| size(index));
+        match found {
+            Some(index) => self.open_settlement(index),
+            None => self.error_message = Some(format!("There is no location called '{name}'.")),
+        }
+    }
+
+    /// Opens the Daggerfall outdoor cell `block_name` (an RMB block), read-only.
+    fn open_outdoor_cell(&mut self, block_name: &str) {
+        let Some(library) = self.library.as_mut() else { return };
+        let (view, problems) = ExteriorView::cell(block_name, library);
+        self.show_exterior(view, problems, OpenedItem::DaggerfallOutdoorCell(block_name.to_string()));
+    }
+
+    /// Shows a loaded settlement or outdoor cell in the main window, reporting cells that could not be loaded.
+    fn show_exterior(&mut self, view: ExteriorView, problems: Vec<String>, item: OpenedItem) {
+        if !problems.is_empty() {
+            self.error_message = Some(format!("Some cells could not be loaded:\n{}", problems.join("\n")));
+        }
+        self.set_workspace(Workspace::Exterior(Box::new(view)), Some(item));
     }
 
     /// Opens the first Daggerfall dungeon whose name matches `dungeon_name` (case-insensitive).
@@ -592,6 +718,7 @@ impl DungeonMakerApp {
             match &mut self.workspace {
                 Workspace::Room(editor) => editor.release(render_state),
                 Workspace::Dungeon(view) => view.release(render_state),
+                Workspace::Exterior(view) => view.release(render_state),
                 Workspace::Empty => {}
             }
         }
@@ -641,7 +768,7 @@ impl DungeonMakerApp {
                     view.store_edited_rooms(&mut self.project);
                 }
             }
-            Workspace::Empty => {}
+            Workspace::Exterior(_) | Workspace::Empty => {}
         }
     }
 
@@ -696,7 +823,7 @@ impl DungeonMakerApp {
                 ProjectDungeonRoom::layout_of(library.dungeons().get(*index)?)
             }
             OpenedItem::Project(id) => self.project.dungeon(*id)?.rooms.clone(),
-            OpenedItem::DaggerfallRoom(_) => return None,
+            _ => return None,
         };
         let is_this_cell = |placement: &ProjectDungeonRoom| match project_room {
             Some(room_id) => placement.room == Some(room_id),
@@ -707,7 +834,7 @@ impl DungeonMakerApp {
         let here = &layout[here_index];
 
         let mut objects = Vec::new();
-        let mut outlines = vec![RoomOutline { origin: Vec3::ZERO, highlighted: false }];
+        let mut outlines = vec![RoomOutline::cell(Vec3::ZERO)];
         let mut cells = Vec::new();
         let model_tags = library.model_tags();
         let mut doors = ContextDoors {
@@ -745,7 +872,7 @@ impl DungeonMakerApp {
                 object.group_index = cell_index;
                 object
             }));
-            outlines.push(RoomOutline { origin: offset, highlighted: false });
+            outlines.push(RoomOutline::cell(offset));
             let label = match placement.room.and_then(|room_id| self.project.room(room_id)) {
                 Some(room) => format!("{} (your cell)", room.name),
                 None => placement.block_name.clone(),
@@ -787,7 +914,7 @@ impl DungeonMakerApp {
                 let dungeon = self.project.dungeon(*id)?;
                 crate::export::dungeon_identity(dungeon, &library.dungeons(), world.as_deref(), ids)
             }
-            OpenedItem::DaggerfallRoom(_) => None,
+            _ => None,
         }
     }
 
@@ -798,7 +925,7 @@ impl DungeonMakerApp {
                 Some(ProjectDungeonRoom::layout_of(self.library.as_mut()?.dungeons().get(*index)?))
             }
             OpenedItem::Project(id) => Some(self.project.dungeon(*id)?.rooms.clone()),
-            OpenedItem::DaggerfallRoom(_) => None,
+            _ => None,
         }
     }
 
@@ -974,7 +1101,7 @@ impl DungeonMakerApp {
                     location: DungeonLocation::copied_from(definition),
                 })
             }
-            OpenedItem::Project(_) => return None,
+            _ => return None,
         };
         let id = entry.id();
         self.status_message = format!("Created {} in the project", entry.name());
@@ -1005,7 +1132,7 @@ impl DungeonMakerApp {
                 editor.set_cell_category(category);
                 editor.set_status_message(message);
             }
-            Workspace::Dungeon(_) | Workspace::Empty => {}
+            Workspace::Dungeon(_) | Workspace::Exterior(_) | Workspace::Empty => {}
         }
         // Titles and names follow the copy from the next frame on.
         self.show_current_names();
@@ -1296,6 +1423,7 @@ impl DungeonMakerApp {
         match &mut self.workspace {
             Workspace::Room(editor) => editor.handle_shortcuts(context, library),
             Workspace::Dungeon(view) => view.handle_shortcuts(context, library),
+            Workspace::Exterior(view) => view.handle_shortcuts(context, library),
             Workspace::Empty => {}
         }
     }
@@ -1310,6 +1438,7 @@ impl DungeonMakerApp {
         egui::TopBottomPanel::top("menu_bar").show(context, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| self.file_menu(ui));
+                ui.menu_button("Import", |ui| self.import_menu(ui));
                 let library = self.library.as_mut();
                 if let (Workspace::Room(editor), Some(_)) = (&mut self.workspace, library.as_ref()) {
                     ui.menu_button("Edit", |ui| editor.edit_menu(ui));
@@ -1322,6 +1451,10 @@ impl DungeonMakerApp {
                             editor.view_menu(ui, library);
                         }
                         (Workspace::Dungeon(view), Some(library)) => {
+                            ui.separator();
+                            view.view_menu(ui, library);
+                        }
+                        (Workspace::Exterior(view), Some(library)) => {
                             ui.separator();
                             view.view_menu(ui, library);
                         }
@@ -1348,6 +1481,402 @@ impl DungeonMakerApp {
                 }
             });
         });
+    }
+
+    /// Adds the Import menu entries.
+    fn import_menu(&mut self, ui: &mut egui::Ui) {
+        let hover = "Imports a 3D model of your own (a Wavefront OBJ file with its MTL materials and their \
+                     textures, a glTF file: .gltf or .glb, or a Blender file: .blend, which Blender converts; \
+                     one unit is a metre) to place in cells like Daggerfall's models. It is listed under Custom \
+                     Models in the asset palette, and a .dfmod export takes it into the game.";
+        let converting = self.blend_conversion.is_some();
+        if ui.add_enabled(!converting, egui::Button::new("Import Model…")).on_hover_text(hover).clicked() {
+            ui.close_menu();
+            self.import_model();
+        }
+        let blender = match self.blender() {
+            Some(program) => format!("Now using {}.", program.display()),
+            None => "Blender was not found on this computer.".to_string(),
+        };
+        let hover = format!(
+            "Chooses the Blender program (blender.exe) that converts .blend files when they are imported. \
+             Blender is free from blender.org; it is found on its own where its installer or Steam puts it. \
+             {blender}"
+        );
+        if ui.button("Locate Blender…").on_hover_text(hover).clicked() {
+            ui.close_menu();
+            self.locate_blender();
+        }
+    }
+
+    /// The Blender program `.blend` files are converted with: the one the
+    /// user chose, or else one installed in the usual places.
+    fn blender(&self) -> Option<PathBuf> {
+        self.blender_program.clone().filter(|program| program.is_file()).or_else(crate::blender::find_blender)
+    }
+
+    /// Asks where Blender is, and keeps the answer. Returns whether one was chosen.
+    fn locate_blender(&mut self) -> bool {
+        let mut dialog = rfd::FileDialog::new().set_title("Where is Blender?");
+        if cfg!(windows) {
+            dialog = dialog.add_filter("Blender (blender.exe)", &["exe"]);
+        }
+        if let Some(folder) = self.blender().as_deref().and_then(Path::parent) {
+            dialog = dialog.set_directory(folder);
+        }
+        let Some(program) = dialog.pick_file() else { return false };
+        let program = crate::blender::blender_program(&program);
+        self.status_message = format!("Blender at {} converts .blend files", program.display());
+        self.blender_program = Some(program);
+        true
+    }
+
+    /// Asks for a model file (OBJ, glTF, GLB or .blend) and imports it as one of the user's models.
+    fn import_model(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Import a model")
+            .add_filter("3D model (OBJ, glTF, GLB, Blender)", &crate::custom_models::MODEL_EXTENSIONS)
+            .add_filter("Wavefront OBJ model", &["obj"])
+            .add_filter("glTF model", &["gltf", "glb"])
+            .add_filter("Blender file", &["blend"])
+            .pick_file()
+        else {
+            return;
+        };
+        if crate::blender::is_blend_file(&path) {
+            self.start_blend_conversion(&path);
+            return;
+        }
+        let result = self.custom_models.import(&path);
+        self.finish_import(result);
+    }
+
+    /// Starts Blender converting the `.blend` file at `path`, to import it once
+    /// it is done (see [`Self::poll_blend_conversion`]). Without Blender, offers
+    /// to locate it first.
+    fn start_blend_conversion(&mut self, path: &Path) {
+        let blender = match self.blender() {
+            Some(blender) => blender,
+            None => {
+                let answer = rfd::MessageDialog::new()
+                    .set_level(rfd::MessageLevel::Info)
+                    .set_title("Blender is needed")
+                    .set_description(
+                        "A .blend file is imported by Blender, which converts it to glTF without opening a \
+                         window. Blender was not found where its installer or Steam puts it.\n\nShow where \
+                         Blender (blender.exe) is? Blender is free from blender.org.",
+                    )
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show();
+                if answer != rfd::MessageDialogResult::Yes || !self.locate_blender() {
+                    return;
+                }
+                match self.blender() {
+                    Some(blender) => blender,
+                    None => return,
+                }
+            }
+        };
+        let Some(work_folder) = self.custom_models.conversions_folder() else {
+            self.error_message = Some("This system has no folder to keep imported models in".to_string());
+            return;
+        };
+        match BlendConversion::start(&blender, path, &work_folder) {
+            Ok(conversion) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                self.status_message = format!("Blender is converting {name} to import it…");
+                self.blend_conversion = Some(conversion);
+            }
+            Err(error) => self.error_message = Some(format!("Could not import the model: {error}")),
+        }
+    }
+
+    /// Imports the `.blend` file Blender was converting, once it is done.
+    fn poll_blend_conversion(&mut self, context: &egui::Context) {
+        let Some(conversion) = &self.blend_conversion else { return };
+        let Some(result) = conversion.poll() else {
+            context.request_repaint_after(std::time::Duration::from_millis(200));
+            return;
+        };
+        let source = conversion.source().to_path_buf();
+        let result = result.and_then(|converted| self.custom_models.import_converted(&converted, &source));
+        // Dropping the conversion removes the converted file, which the import has copied.
+        self.blend_conversion = None;
+        self.finish_import(result);
+    }
+
+    /// Shows the newly imported model everywhere, or tells what went wrong.
+    /// If the model names textures (or a material file) that could not be
+    /// read, offers to choose its texture image now.
+    fn finish_import(&mut self, result: Result<crate::custom_models::ImportOutcome, String>) {
+        let crate::custom_models::ImportOutcome { model, missing, missing_material_file, colour_only } =
+            match result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.error_message = Some(format!("Could not import the model: {error}"));
+                    self.status_message = "The model was not imported".to_string();
+                    return;
+                }
+            };
+        self.refresh_custom_model(&model);
+        // Listed under its file's name, which the user can change like any model's.
+        self.custom_names.set_model_name(model.id, &model.name);
+        if let Workspace::Room(editor) = &mut self.workspace {
+            editor.show_custom_models();
+        }
+        for window in &mut self.room_windows {
+            window.editor.show_custom_models();
+        }
+        let size = model.mesh.size();
+        self.status_message = format!(
+            "Imported {} as model {} ({:.1} × {:.1} × {:.1} m); it is under Custom Models in the asset palette",
+            model.name, model.id, size.x, size.y, size.z
+        );
+        // A missing MTL file is offered first: it names the textures, and tells the materials apart.
+        if let Some(material_file) = missing_material_file {
+            self.offer_material_file(&model, &material_file);
+        } else if !missing.is_empty() {
+            self.offer_texture(&model, &missing_reason(&missing));
+        } else if !colour_only.is_empty() {
+            self.offer_texture(&model, &colour_only_reason(&colour_only));
+        }
+    }
+
+    /// Asks whether to find the MTL file `material_file` the imported
+    /// `model` names, which was not found beside it, and uses the one chosen.
+    fn offer_material_file(&mut self, model: &crate::custom_models::CustomModel, material_file: &str) {
+        let answer = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("The model's material file was not found")
+            .set_description(format!(
+                "{} needs its material file {material_file}, which holds its materials and names their \
+                 textures, but it is not beside the model, so the model is drawn in plain colour. (An OBJ file \
+                 holds no image itself.)\n\nDo you want to find the MTL file now? You can also add it later: \
+                 right-click the model under Custom Models and choose Choose texture…, which takes an MTL file \
+                 as well as an image.",
+                model.name
+            ))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+        let chosen = match answer {
+            rfd::MessageDialogResult::Yes => self.pick_material_file(model.id, material_file),
+            _ => None,
+        };
+        match chosen {
+            Some(path) => self.apply_material_file(model.id, &path),
+            None => {
+                self.status_message = format!(
+                    "Imported {} without its material file {material_file}; to add it (or a texture), \
+                     right-click it under Custom Models and choose Choose texture…",
+                    model.name
+                )
+            }
+        }
+    }
+
+    /// Asks for an MTL file for the imported model `model_id`, starting
+    /// beside the file it was imported from.
+    fn pick_material_file(&self, model_id: u32, wanted: &str) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(format!("Find the material file {wanted}"))
+            .add_filter("MTL material file", &["mtl"]);
+        let source = self.custom_models.get(model_id).map(|model| PathBuf::from(&model.source));
+        if let Some(folder) = source.as_deref().and_then(Path::parent).filter(|folder| folder.is_dir()) {
+            dialog = dialog.set_directory(folder);
+        }
+        dialog.pick_file()
+    }
+
+    /// Gives the imported model `model_id` the materials of the MTL file at
+    /// `path` (reading the model again with it), and offers to choose a
+    /// texture for any it names that are still missing.
+    fn apply_material_file(&mut self, model_id: u32, path: &Path) {
+        let file = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        match self.custom_models.set_materials(model_id, path) {
+            Ok(outcome) => {
+                self.refresh_custom_model(&outcome.model);
+                let parts = outcome.model.parts.len();
+                let textured = outcome.model.parts.iter().filter(|part| part.textured).count();
+                self.status_message = format!(
+                    "{} now uses the materials of {file}: {textured} of its {parts} parts have a texture",
+                    outcome.model.name
+                );
+                if !outcome.missing.is_empty() {
+                    self.offer_texture(&outcome.model, &missing_reason(&outcome.missing));
+                } else if !outcome.colour_only.is_empty() {
+                    let reason = format!("{file} {}", colour_only_reason(&outcome.colour_only));
+                    self.offer_texture(&outcome.model, &reason);
+                }
+            }
+            Err(error) => self.error_message = Some(format!("Could not use {file}: {error}")),
+        }
+    }
+
+    /// Says why the imported `model` has no texture (`reason`, which follows
+    /// its name), and offers to choose its texture image.
+    fn offer_texture(&mut self, model: &crate::custom_models::CustomModel, reason: &str) {
+        let answer = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("The model has no texture")
+            .set_description(format!(
+                "{}: {reason}.\n\nWithout a texture it is drawn in plain colour. (A GLB file, or a .blend file \
+                 with its images packed, carries its textures inside.)\n\nChoose the texture image to draw it \
+                 with now? You can also do it later: right-click the model under Custom Models and choose \
+                 Change texture…",
+                model.name
+            ))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+        if answer == rfd::MessageDialogResult::Yes {
+            self.change_custom_texture(model.id, None);
+        } else {
+            self.status_message = format!(
+                "{} has no texture ({reason}); right-click it under Custom Models to choose one",
+                model.name
+            );
+        }
+    }
+
+    /// Does what the user asked with one of their imported models.
+    fn handle_custom_model_request(&mut self, request: room_editor::CustomModelRequest) {
+        match request {
+            room_editor::CustomModelRequest::ChangeTexture { model_id, part } => {
+                self.change_custom_texture(model_id, part)
+            }
+            room_editor::CustomModelRequest::Delete { model_id } => self.delete_custom_model(model_id),
+        }
+    }
+
+    /// Deletes the imported model `model_id`, after asking, and every copy of
+    /// it placed in the project's cells and prefabs (which could not be drawn
+    /// or exported without it).
+    fn delete_custom_model(&mut self, model_id: u32) {
+        let Some(model) = self.custom_models.get(model_id).cloned() else { return };
+        let name = self.custom_names.model_name(model_id).unwrap_or(&model.name).to_string();
+        // The open cell's or dungeon's latest changes count too.
+        self.store_workspace_changes();
+        let rooms: Vec<String> = self
+            .project
+            .rooms_using_model(model_id)
+            .into_iter()
+            .map(|(room, count)| match count {
+                1 => room.to_string(),
+                _ => format!("{room} ({count} copies)"),
+            })
+            .collect();
+        let prefabs: Vec<String> = self
+            .prefabs
+            .prefabs_using_model(model_id)
+            .into_iter()
+            .map(|prefab| format!("the prefab {prefab}"))
+            .collect();
+        let mut description = format!(
+            "Delete the model {name} (model {model_id}) from Custom Models? Its saved files are removed from the \
+             editor's data folder, which cannot be undone. The file it was imported from is not touched:\n{}",
+            model.source
+        );
+        let places: Vec<String> = rooms.iter().chain(&prefabs).cloned().collect();
+        if !places.is_empty() {
+            description.push_str(&format!(
+                "\n\nIt is placed in your project: {}. Those copies are removed too (save the project to keep \
+                 that); the open cell or dungeon is opened again without them.",
+                places.join(", ")
+            ));
+        }
+        let answer = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title(format!("Delete {name}?"))
+            .set_description(description)
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+        if answer != rfd::MessageDialogResult::Yes {
+            return;
+        }
+        if let Err(error) = self.custom_models.delete(model_id) {
+            self.error_message = Some(format!("Could not delete {name}: {error}"));
+            return;
+        }
+
+        // The project's copies: close what shows them, remove them, and show it again.
+        let reopen = (!rooms.is_empty()).then(|| self.opened_item.clone()).flatten();
+        if !rooms.is_empty() {
+            self.set_workspace(Workspace::Empty, None);
+        }
+        let removed = self.project.remove_model(model_id) + self.prefabs.remove_model(model_id);
+        if let Some(item) = reopen {
+            self.open_item(&item);
+        }
+
+        let textures: Vec<crate::arena2::TextureKey> = model.textures.iter().map(|(key, _)| *key).collect();
+        if let Some(library) = self.library.as_mut() {
+            library.remove_custom_model(model_id, &textures);
+        }
+        if let (Some(renderer), Some(render_state)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
+            renderer.forget_model(render_state, model_id, &textures);
+        }
+        self.custom_names.set_model_name(model_id, "");
+        let favorite = crate::custom_names::Favorite::Model { model_id };
+        if self.custom_names.is_favorite(favorite) {
+            self.custom_names.toggle_favorite(favorite);
+        }
+        if let Workspace::Room(editor) = &mut self.workspace {
+            editor.forget_custom_model(model_id);
+        }
+        for window in &mut self.room_windows {
+            window.editor.forget_custom_model(model_id);
+        }
+        self.status_message = match removed {
+            0 => format!("Deleted the model {name}"),
+            1 => format!("Deleted the model {name} and its copy in your project"),
+            count => format!("Deleted the model {name} and its {count} copies in your project"),
+        };
+    }
+
+    /// Asks for an image and draws part `part` of the imported model
+    /// `model_id` with it (for `None`, every part without a texture).
+    fn change_custom_texture(&mut self, model_id: u32, part: Option<usize>) {
+        let name = self
+            .custom_models
+            .get(model_id)
+            .map_or_else(|| format!("model {model_id}"), |model| model.name.clone());
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(format!("Choose the texture of {name}, or its MTL material file"))
+            .add_filter("Image or MTL material file", &["png", "jpg", "jpeg", "bmp", "tga", "mtl"])
+            .add_filter("Image (PNG, JPG, BMP, TGA)", &["png", "jpg", "jpeg", "bmp", "tga"])
+            .add_filter("MTL material file", &["mtl"]);
+        let source = self.custom_models.get(model_id).map(|model| PathBuf::from(&model.source));
+        if let Some(folder) = source.as_deref().and_then(Path::parent).filter(|folder| folder.is_dir()) {
+            dialog = dialog.set_directory(folder);
+        }
+        let Some(image) = dialog.pick_file() else { return };
+        // An MTL file gives the model its materials, with their own textures.
+        if image.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("mtl")) {
+            self.apply_material_file(model_id, &image);
+            return;
+        }
+        match self.custom_models.set_texture(model_id, part, &image) {
+            Ok(model) => {
+                self.refresh_custom_model(&model);
+                let file = image.file_name().unwrap_or_default().to_string_lossy();
+                self.status_message = format!("{} is now drawn with {file}", model.name);
+            }
+            Err(error) => {
+                self.error_message = Some(format!("Could not change the texture of {name}: {error}"))
+            }
+        }
+    }
+
+    /// Shows the imported `model` as it is now: in the game data's models,
+    /// and drawn afresh where it was drawn before.
+    fn refresh_custom_model(&mut self, model: &crate::custom_models::CustomModel) {
+        if let Some(library) = self.library.as_mut() {
+            library.add_custom_model(model.mesh.clone(), model.textures.clone(), model.files.clone());
+        }
+        if let (Some(renderer), Some(render_state)) = (self.renderer.as_mut(), self.render_state.as_ref()) {
+            let textures: Vec<crate::arena2::TextureKey> =
+                model.textures.iter().map(|(key, _)| *key).collect();
+            renderer.forget_model(render_state, model.id, &textures);
+        }
     }
 
     /// Adds the File menu entries.
@@ -1437,6 +1966,10 @@ impl DungeonMakerApp {
         let status = match &self.workspace {
             Workspace::Room(editor) => editor.status_message().to_string(),
             Workspace::Dungeon(view) => view.status_text(&self.custom_names),
+            Workspace::Exterior(view) => match self.library.as_ref() {
+                Some(library) => view.status_text(&self.custom_names, &library_locations(library)),
+                None => self.status_message.clone(),
+            },
             Workspace::Empty => self.status_message.clone(),
         };
         egui::TopBottomPanel::bottom("status_bar").show(context, |ui| ui.label(status));
@@ -1485,6 +2018,7 @@ impl DungeonMakerApp {
             catalog: &self.catalog,
             custom_names: &mut self.custom_names,
             prefabs: &mut self.prefabs,
+            custom_models: &self.custom_models,
             texture_setting: &mut self.texture_setting,
             game_texture_mode: self.game_texture_mode,
         };
@@ -1495,6 +2029,8 @@ impl DungeonMakerApp {
         let mut deleted_room = None;
         let mut moved_room = None;
         let mut merged_rooms: Option<Vec<usize>> = None;
+        let mut exterior_action = None;
+        let mut custom_model_request = None;
         match &mut self.workspace {
             Workspace::Room(editor) => {
                 editor.set_used_in(std::mem::take(&mut main_used_in));
@@ -1507,6 +2043,7 @@ impl DungeonMakerApp {
                         (dungeon, home)
                     });
                 cell_open_request = editor.take_cell_open_request();
+                custom_model_request = editor.take_custom_model_request();
                 if editor.take_blocked_edit() && self.copy_prompt.is_none() {
                     self.copy_prompt = Some(CopyPrompt { subject: CopySubject::Room, viewport: None });
                 }
@@ -1588,10 +2125,45 @@ impl DungeonMakerApp {
                     moved_room = Some(request);
                 }
             }
+            Workspace::Exterior(view) => {
+                let locations = resources.library.locations();
+                let (dungeon, used_in) = match &view.subject {
+                    ExteriorSubject::Settlement(index) => {
+                        let dungeon = locations.get(*index).and_then(|location| {
+                            self.dungeon_under.get(&(location.region_index, location.location_id)).copied()
+                        });
+                        (dungeon, Vec::new())
+                    }
+                    ExteriorSubject::Cell(name) => (None, self.outdoor_usage.get(name).cloned().unwrap_or_default()),
+                };
+                let dungeons = resources.library.dungeons();
+                let details = ExteriorDetails {
+                    locations: &locations,
+                    dungeon: dungeon
+                        .and_then(|index| Some((index, dungeons.get(index)?.name.as_str()))),
+                    used_in: &used_in,
+                };
+                exterior_action =
+                    view.show_properties(context, &details, resources.custom_names, resources.library);
+                egui::CentralPanel::default().frame(egui::Frame::none()).show(context, |ui| {
+                    if let Some(action) = view.show(ui, &mut resources) {
+                        exterior_action = Some(action);
+                    }
+                });
+            }
             Workspace::Empty => show_centered_hint(
                 context,
                 "Click a dungeon or double-click a cell in the project panel, or use File > Open cell… / Open dungeon…",
             ),
+        }
+        if let Some(request) = custom_model_request {
+            self.handle_custom_model_request(request);
+        }
+        match exterior_action {
+            Some(ExteriorOpen::Cell(name)) => self.open_outdoor_cell(&name),
+            Some(ExteriorOpen::Settlement(index)) => self.open_settlement(index),
+            Some(ExteriorOpen::Dungeon(index)) => self.open_dungeon(index),
+            None => {}
         }
         if let Some(room_index) = room_to_open {
             self.open_room_window(context, room_index);
@@ -1997,12 +2569,14 @@ impl DungeonMakerApp {
             catalog: &self.catalog,
             custom_names: &mut self.custom_names,
             prefabs: &mut self.prefabs,
+            custom_models: &self.custom_models,
             texture_setting: &mut self.texture_setting,
             game_texture_mode: self.game_texture_mode,
         };
 
         let prompt = self.copy_prompt;
         let mut copy_choice = None;
+        let mut custom_model_request = None;
         for ((window, used_in), unsaved) in
             self.room_windows.iter_mut().zip(window_used_in).zip(window_unsaved)
         {
@@ -2030,6 +2604,9 @@ impl DungeonMakerApp {
             if let Some(request) = window.editor.take_cell_open_request() {
                 cell_open_request = Some(request);
             }
+            if let Some(request) = window.editor.take_custom_model_request() {
+                custom_model_request = Some(request);
+            }
             if window.editor.take_blocked_edit() && self.copy_prompt.is_none() {
                 let subject = match self.opened_item {
                     Some(OpenedItem::DaggerfallDungeon(_)) => CopySubject::DungeonAndRoom,
@@ -2049,6 +2626,10 @@ impl DungeonMakerApp {
                     }
                 }
             }
+        }
+
+        if let Some(request) = custom_model_request {
+            self.handle_custom_model_request(request);
         }
 
         // The prompt belongs to a window that has since closed.
@@ -2254,6 +2835,11 @@ impl DungeonMakerApp {
                 Some(format!("{}{item_mark}", editor_title(editor, &self.custom_names)))
             }
             Workspace::Dungeon(view) => Some(format!("{}{item_mark}", view.description())),
+            Workspace::Exterior(view) => {
+                let locations =
+                    self.library.as_ref().map(library_locations).unwrap_or_else(|| std::sync::Arc::new([]));
+                Some(view.description(&locations))
+            }
             Workspace::Empty => None,
         };
         let project_mark = if self.has_unsaved_changes() { "*" } else { "" };
@@ -2273,6 +2859,7 @@ impl eframe::App for DungeonMakerApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(context);
         self.poll_openings_job(context);
+        self.poll_blend_conversion(context);
         self.handle_shortcuts(context);
         self.show_current_names();
         self.show_menu_bar(context);
@@ -2316,6 +2903,9 @@ impl eframe::App for DungeonMakerApp {
         eframe::set_value(storage, PANEL_VIEW_STORAGE_KEY, &self.project_panel.view);
         eframe::set_value(storage, EXPORT_SETTINGS_STORAGE_KEY, &self.export_window.settings);
         eframe::set_value(storage, DUNGEON_TEXTURES_STORAGE_KEY, &self.texture_setting);
+        let blender =
+            self.blender_program.as_ref().map(|path| path.display().to_string()).unwrap_or_default();
+        storage.set_string(BLENDER_STORAGE_KEY, blender);
         if let Some(openings) = &self.stored_openings {
             eframe::set_value(storage, OPENINGS_STORAGE_KEY, openings);
         }
@@ -2441,6 +3031,31 @@ fn show_room_window_contents(
     if context.input(|input| input.viewport().close_requested()) {
         window.is_open = false;
     }
+}
+
+/// Why a model has no texture: `missing` (what it names), which could not be found or read.
+fn missing_reason(missing: &[String]) -> String {
+    format!("these could not be found or read: {}", missing.join("; "))
+}
+
+/// Why a model has no texture: its materials `materials` give only a colour.
+fn colour_only_reason(materials: &[String]) -> String {
+    let names = materials.iter().map(|name| format!("'{name}'")).collect::<Vec<_>>().join(", ");
+    let (its, names_none) = match materials.len() {
+        1 => ("its material", "names no texture image"),
+        _ => ("its materials", "name no texture image"),
+    };
+    format!(
+        "{its} {names} {names_none}, only a colour, though the model has texture coordinates for one. (Blender \
+         names a material's image in an OBJ export only when an Image Texture node is plugged straight into the \
+         material's Base Color; colours from other nodes, painted vertices or procedural textures are not exported \
+         as an image.)"
+    )
+}
+
+/// Every location of the game, as the library last read them.
+fn library_locations(library: &Arena2Library) -> std::sync::Arc<[crate::arena2::LocationDefinition]> {
+    library.cached_locations()
 }
 
 /// Draws a hint in the middle of an otherwise empty window.

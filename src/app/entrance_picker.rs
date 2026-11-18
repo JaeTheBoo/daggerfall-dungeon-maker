@@ -3,7 +3,8 @@
 //! An entrance is the above-ground part of a location: a grid of RMB blocks
 //! with a dungeon door somewhere in it. Daggerfall's 4,000-odd dungeons share
 //! about 140 of them, so the window groups the dungeons by entrance. The
-//! selected entrance is drawn on a patch of ground, with its dungeon door
+//! selected entrance is drawn on its ground, in the climate of the dungeon's
+//! spot on the map (as the game draws it there), with its dungeon door
 //! highlighted.
 
 use std::collections::HashMap;
@@ -13,12 +14,13 @@ use glam::Vec3;
 
 use super::viewport_tools::{handle_camera_input, paint_scene, size_in_pixels, EditorResources};
 use crate::arena2::{
-    Arena2Library, DoorKind, DungeonDefinition, LocationExterior, TextureKey, RMB_BLOCK_SIDE,
+    Arena2Library, Climate, DoorKind, DungeonDefinition, LocationExterior, Season, RMB_BLOCK_SIDE,
 };
 use crate::camera::OrbitCamera;
+use crate::exterior::ClimateTextures;
 use crate::project::DungeonReference;
 use crate::render::{FrameRequest, ViewSettings, ViewportTarget};
-use crate::scene::{FlatData, ModelData, Scene, SceneObject, SceneObjectKind};
+use crate::scene::{Scene, SceneObject, SceneObjectKind};
 
 /// Colour of warnings.
 const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 190, 70);
@@ -145,13 +147,16 @@ pub struct EntranceRequest<'request> {
     pub current: Option<&'request DungeonReference>,
     /// Set for Daggerfall's own dungeons, whose entrance can only be looked at.
     pub read_only: bool,
+    /// The climate of the dungeon's spot on the map, which the entrance is drawn in.
+    pub climate: Climate,
 }
 
 /// The selected entrance, ready to draw.
 struct Preview {
     design_index: usize,
+    /// The climate it is drawn in.
+    climate: Climate,
     scene: Scene,
-    ground: Vec<(Vec3, f32)>,
     /// Indices of the models with a dungeon door.
     entrance_doors: Vec<usize>,
     /// Blocks that could not be loaded.
@@ -330,8 +335,10 @@ impl EntrancePicker {
             });
             return None;
         };
-        if self.preview.as_ref().map(|preview| preview.design_index) != Some(selected) {
-            let preview = build_preview(selected, &self.designs[selected], resources.library);
+        let shown = self.preview.as_ref().map(|preview| (preview.design_index, preview.climate));
+        if shown != Some((selected, request.climate)) {
+            let preview =
+                build_preview(selected, &self.designs[selected], request.climate, resources.library);
             if let Some((minimum, maximum)) = preview.scene.bounds(resources.library) {
                 self.camera.frame_bounds(minimum, maximum);
             }
@@ -417,7 +424,6 @@ impl EntrancePicker {
                 placement_preview: &[],
                 highlighted_objects: &[],
                 context_scene: None,
-                ground_squares: &preview.ground,
                 water_planes: &[],
                 room_outlines: &[],
                 settings: &self.view_settings,
@@ -426,6 +432,7 @@ impl EntrancePicker {
                 size_in_pixels: size_in_pixels(ui, rect),
                 sky: None,
                 dungeon_textures: None,
+                climate_textures: Some(ClimateTextures::new(preview.climate, Season::Summer)),
                 warned_objects: &[],
             };
             paint_scene(ui, rect, resources, &mut self.target, &request);
@@ -444,17 +451,20 @@ fn design_matches(design: &EntranceDesign, needle: &str, dungeons: &[DungeonDefi
         })
 }
 
-/// Builds the scene of `design`: its blocks side by side on squares of ground.
-fn build_preview(design_index: usize, design: &EntranceDesign, library: &mut Arena2Library) -> Preview {
-    let mut objects = Vec::new();
-    let mut ground = Vec::new();
+/// Builds the scene of `design` in `climate`: its blocks side by side on their ground.
+fn build_preview(
+    design_index: usize,
+    design: &EntranceDesign,
+    climate: Climate,
+    library: &mut Arena2Library,
+) -> Preview {
+    let mut objects: Vec<SceneObject> = Vec::new();
     let mut entrance_doors = Vec::new();
     let mut problems = Vec::new();
     let width = design.exterior.width.max(1);
     for (index, name) in design.exterior.block_names.iter().enumerate() {
         let corner =
             Vec3::new((index % width) as f32 * RMB_BLOCK_SIDE, 0.0, (index / width) as f32 * RMB_BLOCK_SIDE);
-        ground.push((corner, RMB_BLOCK_SIDE));
         let block = match library.rmb_block(name) {
             Ok(block) => block,
             Err(error) => {
@@ -462,61 +472,25 @@ fn build_preview(design_index: usize, design: &EntranceDesign, library: &mut Are
                 continue;
             }
         };
-        for model in &block.models {
-            let is_entrance = library
-                .model(model.model_id)
-                .and_then(|mesh| mesh.door_kind())
-                .is_some_and(|kind| kind == DoorKind::DungeonEntrance);
-            if is_entrance {
-                entrance_doors.push(objects.len());
+        for object in crate::exterior::cell_scene(&block, climate, Season::Summer, 0, library).objects {
+            if let SceneObjectKind::Model { model_id, .. } = object.kind {
+                let is_entrance = library
+                    .model(model_id)
+                    .and_then(|mesh| mesh.door_kind())
+                    .is_some_and(|kind| kind == DoorKind::DungeonEntrance);
+                if is_entrance {
+                    entrance_doors.push(objects.len());
+                }
             }
-            objects.push(preview_object(
-                format!("Model {}", model.model_id),
-                SceneObjectKind::Model { model_id: model.model_id, data: ModelData::default() },
-                corner + model.position,
-                Vec3::new(0.0, model.yaw_degrees, 0.0),
-                objects.len(),
-            ));
-        }
-        for flat in &block.flats {
-            // Flats stand on their position; the renderer centres them on it.
-            let height = library.billboard_world_size(flat.texture).map_or(0.0, |size| size.y);
-            objects.push(preview_object(
-                flat_name(flat.texture),
-                SceneObjectKind::Flat { texture: flat.texture, data: FlatData::default() },
-                corner + flat.base_position + Vec3::new(0.0, height / 2.0, 0.0),
-                Vec3::ZERO,
-                objects.len(),
-            ));
+            objects.push(SceneObject {
+                id: objects.len() as u32 + 1,
+                position: corner + object.position,
+                ..object
+            });
         }
     }
     let scene = Scene { block_name: design.block_list(usize::MAX), objects };
-    Preview { design_index, scene, ground, entrance_doors, problems }
-}
-
-fn flat_name(texture: TextureKey) -> String {
-    format!("Flat {}.{}", texture.archive, texture.record)
-}
-
-fn preview_object(
-    name: String,
-    kind: SceneObjectKind,
-    position: Vec3,
-    rotation_degrees: Vec3,
-    index: usize,
-) -> SceneObject {
-    SceneObject {
-        id: index as u32 + 1,
-        name,
-        group_index: 0,
-        kind,
-        position,
-        rotation_degrees,
-        visible: true,
-        next: None,
-        scale: None,
-        prefab: None,
-    }
+    Preview { design_index, climate, scene, entrance_doors, problems }
 }
 
 #[cfg(test)]

@@ -8,6 +8,10 @@
 //! record, one entry per location. Locations are matched up through the
 //! location ids in `MAPPITEM`, as Daggerfall Unity does. `MAPTABLE` also
 //! gives the location's position on the world map and its location type.
+//!
+//! Every location (town, home, temple, dungeon entrance…) is listed in its
+//! region's `MAPPITEM` record with the grid of RMB blocks above ground; see
+//! [`read_all_locations`].
 
 use std::collections::{HashMap, HashSet};
 
@@ -203,6 +207,30 @@ pub struct LocationBuilding {
     pub quality: u8,
 }
 
+/// A location of the world as `MAPS.BSA` defines it: a town, home, temple,
+/// tavern or dungeon entrance, with the RMB blocks that stand above ground.
+#[derive(Debug, Clone)]
+pub struct LocationDefinition {
+    /// Index of the region the location belongs to.
+    pub region_index: usize,
+    /// Human readable region name.
+    pub region_name: &'static str,
+    /// Location name as shown in game.
+    pub name: String,
+    /// The kind of location; `None` if unknown.
+    pub location_type: Option<LocationType>,
+    /// Where the location is on the world map.
+    pub map_pixel: MapPixel,
+    /// Id of the location's record, which a dungeon under it names as its exterior.
+    pub location_id: u16,
+    /// What stands above ground.
+    pub exterior: LocationExterior,
+    /// Whether a dungeon lies under the location.
+    pub has_dungeon: bool,
+    /// Whether the travel map shows the location from the start.
+    pub discovered: bool,
+}
+
 /// One RDB block placed on the dungeon grid.
 #[derive(Debug, Clone)]
 pub struct DungeonBlockPlacement {
@@ -240,6 +268,179 @@ pub fn read_all_dungeons(maps_archive: &BsaArchive) -> Vec<DungeonDefinition> {
         (first.region_name, first.name.as_str()).cmp(&(second.region_name, second.name.as_str()))
     });
     dungeons
+}
+
+/// Reads every location in every region of `MAPS.BSA` (towns, homes,
+/// temples, dungeon entrances…), sorted by region then name.
+///
+/// Regions and locations that fail to parse are logged and skipped.
+pub fn read_all_locations(maps_archive: &BsaArchive) -> Vec<LocationDefinition> {
+    let mut locations = Vec::new();
+    for (region_index, region_name) in REGION_NAMES.iter().enumerate() {
+        if let Err(error) = read_region_locations(maps_archive, region_index, region_name, &mut locations) {
+            log::warn!("could not read the locations of region {region_index}: {error}");
+        }
+    }
+    locations.sort_by(|first, second| {
+        (first.region_name, first.name.as_str()).cmp(&(second.region_name, second.name.as_str()))
+    });
+    locations
+}
+
+/// Reads every location of one region: its name and exterior from
+/// `MAPPITEM`, its map entry from `MAPTABLE`, and whether `MAPDITEM` has a
+/// dungeon under it.
+fn read_region_locations(
+    maps_archive: &BsaArchive,
+    region_index: usize,
+    region_name: &'static str,
+    locations: &mut Vec<LocationDefinition>,
+) -> Arena2Result<()> {
+    let record = |kind: &str| maps_archive.record_by_name(&format!("{kind}.{region_index:03}"));
+    let (Some(names), Some(items), Some(map_table)) =
+        (record("MAPNAMES"), record("MAPPITEM"), record("MAPTABLE"))
+    else {
+        return Ok(());
+    };
+    if names.is_empty() {
+        return Ok(());
+    }
+    // The exteriors that have a dungeon under them.
+    let mut with_dungeon = HashSet::new();
+    if let Some(dungeons) = record("MAPDITEM").filter(|record| !record.is_empty()) {
+        let mut offsets = ByteReader::new(dungeons);
+        let dungeon_count = offsets.read_u32()? as usize;
+        for _ in 0..dungeon_count {
+            let _record_offset = offsets.read_u32()?;
+            let _is_dungeon = offsets.read_u16()?;
+            with_dungeon.insert(offsets.read_u16()?);
+        }
+    }
+
+    let location_count = ByteReader::new(names).read_u32()? as usize;
+    let mut offset_table = ByteReader::new(items);
+    for location_index in 0..location_count {
+        let location_start = location_count * 4 + offset_table.read_u32()? as usize;
+        let read = || -> Arena2Result<LocationDefinition> {
+            let location_id = read_location_id(items, location_start)?;
+            let door_count = ByteReader::at(items, location_start).read_u32()? as usize;
+            let header = location_start + 4 + door_count * LOCATION_DOOR_SIZE;
+            let name = ByteReader::at(items, header + LOCATION_NAME_OFFSET)
+                .read_fixed_string(LOCATION_NAME_LENGTH)?;
+            let entry = MapTableEntry::read(map_table, location_index)?;
+            Ok(LocationDefinition {
+                region_index,
+                region_name,
+                name,
+                location_type: entry.location_type,
+                map_pixel: entry.pixel,
+                location_id,
+                exterior: read_exterior(items, location_start)?,
+                has_dungeon: with_dungeon.contains(&location_id),
+                discovered: entry.discovered,
+            })
+        };
+        match read() {
+            Ok(location) => locations.push(location),
+            Err(error) => log::warn!("skipping location {location_index} of region {region_index}: {error}"),
+        }
+    }
+    Ok(())
+}
+
+/// The kind of building an RMB block's name says it holds (for example
+/// "Tavern" for `TVRNAL01.RMB`), from the first four letters of its name.
+pub fn rmb_block_kind(block_name: &str) -> &'static str {
+    let prefix = block_name.get(..4).unwrap_or_default();
+    RMB_BLOCK_KINDS
+        .iter()
+        .find(|(known, _)| known.eq_ignore_ascii_case(prefix))
+        .map_or("Other", |(_, kind)| kind)
+}
+
+/// Kinds of RMB blocks, in the order the game numbers them, by the first four letters of their names.
+pub const RMB_BLOCK_KINDS: [(&str, &str); 44] = [
+    ("TVRN", "Tavern"),
+    ("GENR", "General store"),
+    ("RESI", "Residences"),
+    ("WEAP", "Weapon smith"),
+    ("ARMR", "Armorer"),
+    ("ALCH", "Alchemist"),
+    ("BANK", "Bank"),
+    ("BOOK", "Bookseller"),
+    ("CLOT", "Clothing store"),
+    ("FURN", "Furniture store"),
+    ("GEMS", "Gem store"),
+    ("LIBR", "Library"),
+    ("PAWN", "Pawn shop"),
+    ("TEMP", "Temple"),
+    ("PALA", "Palace"),
+    ("FARM", "Farm"),
+    ("DUNG", "Dungeon entrance"),
+    ("CAST", "Castle"),
+    ("MANR", "Manor"),
+    ("SHRI", "Shrine"),
+    ("RUIN", "Ruins"),
+    ("SHCK", "Shack"),
+    ("GRVE", "Graveyard"),
+    ("FILL", "Filler"),
+    ("KRAV", "Knightly order (Raven)"),
+    ("KDRA", "Knightly order (Dragon)"),
+    ("KOWL", "Knightly order (Owl)"),
+    ("KMOO", "Knightly order (Moon)"),
+    ("KCAN", "Knightly order (Candle)"),
+    ("KFLA", "Knightly order (Flame)"),
+    ("KHOR", "Knightly order (Horn)"),
+    ("KROS", "Knightly order (Rose)"),
+    ("KWHE", "Knightly order (Wheel)"),
+    ("KSCA", "Knightly order (Scarab)"),
+    ("KHAW", "Knightly order (Hawk)"),
+    ("MAGE", "Mages Guild"),
+    ("THIE", "Thieves Guild"),
+    ("DARK", "Dark Brotherhood"),
+    ("FIGH", "Fighters Guild"),
+    ("CUST", "Custom"),
+    ("WALL", "City walls"),
+    ("MARK", "Market"),
+    ("SHIP", "Ship"),
+    ("WITC", "Witches' coven"),
+];
+
+/// The name of building type `value` (Daggerfall Unity's `BuildingTypes`), as shown to the user.
+pub fn building_type_name(value: u8) -> String {
+    const NAMES: [&str; 25] = [
+        "Alchemist",
+        "House for sale",
+        "Armorer",
+        "Bank",
+        "Town building (4)",
+        "Bookseller",
+        "Clothing store",
+        "Furniture store",
+        "Gem store",
+        "General store",
+        "Library",
+        "Guild hall",
+        "Pawn shop",
+        "Weapon smith",
+        "Temple",
+        "Tavern",
+        "Palace",
+        "House",
+        "House",
+        "House",
+        "House",
+        "House",
+        "House",
+        "Town building (23)",
+        "Ship",
+    ];
+    match value {
+        0x74 | 0xdf | 0xf9 | 0xfa => "Special building".to_string(),
+        _ => NAMES
+            .get(usize::from(value))
+            .map_or_else(|| format!("Building type {value}"), |name| name.to_string()),
+    }
 }
 
 /// Reads all dungeons from one region's `MAPDITEM` record.
@@ -514,6 +715,17 @@ fn read_location_id(record: &[u8], position: usize) -> Arena2Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_block_kinds_and_building_types() {
+        assert_eq!(rmb_block_kind("TVRNAL01.RMB"), "Tavern");
+        assert_eq!(rmb_block_kind("kowlaa01.rmb"), "Knightly order (Owl)");
+        assert_eq!(rmb_block_kind("XYZ.RMB"), "Other");
+        assert_eq!(building_type_name(15), "Tavern");
+        assert_eq!(building_type_name(0x13), "House");
+        assert_eq!(building_type_name(0xf9), "Special building");
+        assert_eq!(building_type_name(99), "Building type 99");
+    }
 
     #[test]
     fn builds_rmb_block_names() {

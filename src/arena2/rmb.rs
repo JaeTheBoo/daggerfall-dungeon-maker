@@ -26,6 +26,8 @@ const MAX_BUILDINGS: usize = 32;
 const BUILDING_POSITION_SIZE: usize = 20;
 /// Size of one building data entry.
 const BUILDING_DATA_SIZE: usize = 26;
+/// Offset of the building type in a building data entry.
+const BUILDING_TYPE_OFFSET: usize = 24;
 /// Number of ground tiles along each side of a block.
 const GROUND_TILES: usize = 16;
 /// Side of one ground tile, in native units.
@@ -55,6 +57,28 @@ pub struct RmbBlock {
     pub name: String,
     pub models: Vec<RmbModel>,
     pub flats: Vec<RmbFlat>,
+    /// Its ground: 16 × 16 tiles, as stored (rows from the north, each from
+    /// the west), drawn with the ground textures of the location's climate.
+    pub ground: Vec<GroundTile>,
+    /// The type of each of its buildings (Daggerfall Unity's `BuildingTypes` numbers).
+    pub building_types: Vec<u8>,
+}
+
+/// One tile of an RMB block's ground.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GroundTile {
+    /// Record in the climate's ground texture archive.
+    pub record: u8,
+    /// Whether the texture is turned a quarter round.
+    pub rotated: bool,
+    /// Whether the texture is turned upside down.
+    pub flipped: bool,
+}
+
+impl GroundTile {
+    fn from_byte(byte: u8) -> Self {
+        Self { record: byte & 0x3f, rotated: byte & 0x40 != 0, flipped: byte & 0x80 != 0 }
+    }
 }
 
 /// A model placed in an RMB block.
@@ -109,19 +133,26 @@ pub fn parse_rmb_block(name: &str, data: &[u8]) -> Arena2Result<RmbBlock> {
         }
     }
     debug_assert_eq!(BUILDING_POSITION_SIZE, 20);
-    reader.skip(MAX_BUILDINGS * BUILDING_DATA_SIZE);
+    let building_data = reader.read_bytes(MAX_BUILDINGS * BUILDING_DATA_SIZE)?;
+    let building_types = (0..building_count)
+        .map(|building| building_data[building * BUILDING_DATA_SIZE + BUILDING_TYPE_OFFSET])
+        .collect();
     reader.skip(MAX_BUILDINGS * 4); // Unknown section.
     let mut building_sizes = [0usize; MAX_BUILDINGS];
     for size in &mut building_sizes {
         *size = reader.read_i32()?.max(0) as usize;
     }
     reader.skip(8); // Ground header.
-    reader.skip(GROUND_TILES * GROUND_TILES); // Ground tiles.
+    let ground = reader
+        .read_bytes(GROUND_TILES * GROUND_TILES)?
+        .iter()
+        .map(|&byte| GroundTile::from_byte(byte))
+        .collect();
     let scenery = reader.read_bytes(GROUND_TILES * GROUND_TILES)?;
     reader.skip(AUTOMAP_SIZE);
     reader.skip(13 + MAX_BUILDINGS * 13); // Block name and other names.
 
-    let mut block = RmbBlock { name: name.to_string(), ..RmbBlock::default() };
+    let mut block = RmbBlock { name: name.to_string(), ground, building_types, ..RmbBlock::default() };
     let to_world = |native: Vec3| native * WORLD_SCALE;
 
     // Buildings: their outside models turn with the building, their flats do not.

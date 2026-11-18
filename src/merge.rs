@@ -15,7 +15,9 @@
 //!   dropped, as the game drops them.
 //!
 //! Object ids are numbered afresh, with the links between a cell's objects
-//! kept; each cell's object lists (groups) stay apart.
+//! kept. Objects are listed by the quarter of the merged cell they end up in
+//! (see [`crate::scene::quarter_of`]); each cell's placed prefabs and the
+//! object lists the user made stay apart.
 
 use std::collections::HashMap;
 
@@ -23,8 +25,8 @@ use glam::Vec3;
 
 use crate::arena2::RDB_BLOCK_SIDE;
 use crate::scene::{
-    ObjectId, PrefabMember, Scene, SceneObject, SceneObjectKind, ADDED_OBJECTS_GROUP, MARKER_TEXTURE_ARCHIVE,
-    START_MARKER_RECORD,
+    quarter_of, ObjectFolder, ObjectId, PrefabMember, Scene, SceneObject, SceneObjectKind,
+    MARKER_TEXTURE_ARCHIVE, START_MARKER_RECORD,
 };
 
 /// The most different models one cell can use.
@@ -91,8 +93,8 @@ pub fn merge_cells(sources: &[MergeSource<'_>]) -> Result<MergedCell, String> {
 
     let mut objects = Vec::new();
     let mut next_id: ObjectId = 1;
-    let mut group_base = 0;
     let mut next_prefab = 1;
+    let mut next_folder = 1;
     for &index in &order {
         let source = &sources[index];
         let offset = Vec3::new(
@@ -114,12 +116,14 @@ pub fn merge_cells(sources: &[MergeSource<'_>]) -> Result<MergedCell, String> {
                 (object.id, id)
             })
             .collect();
-        let groups = kept
-            .iter()
-            .map(|object| object.group_index)
-            .filter(|&group| group != ADDED_OBJECTS_GROUP)
-            .max()
-            .map_or(0, |group| group + 1);
+        // Each cell's object lists are numbered afresh, so two cells' lists stay apart.
+        let mut folders: HashMap<u32, u32> = HashMap::new();
+        for folder in kept.iter().filter_map(|object| object.folder.as_ref()) {
+            folders.entry(folder.id).or_insert_with(|| {
+                next_folder += 1;
+                next_folder - 1
+            });
+        }
         // Each cell's placed prefabs are numbered afresh, so two cells' prefabs stay apart.
         let mut prefabs: HashMap<u32, u32> = HashMap::new();
         for member in kept.iter().filter_map(|object| object.prefab.as_ref()) {
@@ -133,11 +137,11 @@ pub fn merge_cells(sources: &[MergeSource<'_>]) -> Result<MergedCell, String> {
                 id: ids[&object.id],
                 next: object.next.and_then(|next| ids.get(&next).copied()),
                 position: object.position + offset,
-                group_index: if object.group_index == ADDED_OBJECTS_GROUP {
-                    ADDED_OBJECTS_GROUP
-                } else {
-                    group_base + object.group_index
-                },
+                group_index: quarter_of(object.position + offset),
+                folder: object
+                    .folder
+                    .as_ref()
+                    .map(|folder| ObjectFolder { id: folders[&folder.id], ..folder.clone() }),
                 prefab: object
                     .prefab
                     .as_ref()
@@ -145,7 +149,6 @@ pub fn merge_cells(sources: &[MergeSource<'_>]) -> Result<MergedCell, String> {
                 ..object.clone()
             }
         }));
-        group_base += groups;
     }
 
     let models = distinct_models(&objects);
@@ -208,6 +211,7 @@ mod tests {
             next,
             scale: None,
             prefab: None,
+            folder: None,
         }
     }
 
@@ -226,6 +230,7 @@ mod tests {
             next: None,
             scale: None,
             prefab: None,
+            folder: None,
         }
     }
 
@@ -253,7 +258,7 @@ mod tests {
         assert_eq!(ids, [1, 2, 3, 4]);
         assert_eq!(merged.objects[1].next, Some(3));
         assert_eq!(merged.objects[3].next, None);
-        // Object lists stay apart: the first cell used groups 0 and 1, so the second's start at 2.
+        // Objects are listed by the quarter they are in: past the merged cell's east edge.
         assert_eq!(merged.objects[3].group_index, 2);
         assert!(merged.warnings.is_empty());
     }

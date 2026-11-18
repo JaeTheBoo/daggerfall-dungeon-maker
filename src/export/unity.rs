@@ -29,8 +29,11 @@ const BUILD_OUTPUT_FOLDER: &str = "DungeonMakerBuild";
 const BUILDER_SCRIPT: &str = r#"// Written by Daggerfall Dungeon Maker, which replaces it before each build.
 // Builds a Daggerfall Unity mod (.dfmod) from every file in a folder, as
 // Daggerfall Unity's Mod Builder does. Images in its Sky folder first get a
-// skybox material each, which the mod's sky script shows in game.
+// skybox material each, which the mod's sky script shows in game, and the
+// models in its Models folder a prefab each, named after the model's id, which
+// Daggerfall Unity puts wherever a cell uses that model.
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using UnityEditor;
@@ -47,6 +50,7 @@ public static class DungeonMakerModBuilder
 
         AssetDatabase.Refresh(ImportAssetOptions.ForceUpdate);
         MakeSkyboxes(assetFolder + "/Sky");
+        MakeModels(assetFolder + "/Models");
         string[] assets = Directory.GetFiles(assetFolder, "*", SearchOption.AllDirectories)
             .Where(path => !path.EndsWith(".meta", StringComparison.Ordinal))
             .Select(path => path.Replace('\\', '/'))
@@ -106,6 +110,96 @@ public static class DungeonMakerModBuilder
             material.SetFloat("_Mapping", 1f);
             material.SetFloat("_ImageType", 0f);
             AssetDatabase.CreateAsset(material, Path.ChangeExtension(image, ".mat"));
+        }
+        AssetDatabase.SaveAssets();
+    }
+
+    // An imported model's geometry, as Daggerfall Dungeon Maker saves it.
+    [Serializable]
+    class SubmeshFile
+    {
+        public string texture;
+        public float[] positions;
+        public float[] normals;
+        public float[] uvs;
+        public int[] indices;
+    }
+
+    [Serializable]
+    class ModelFile
+    {
+        public int id;
+        public string name;
+        public SubmeshFile[] submeshes;
+    }
+
+    // A prefab for each model in `folder` (each a "<id>_model.json" file and
+    // its images), named after the model's id: its mesh, a material for each
+    // of its images, and a collider.
+    static void MakeModels(string folder)
+    {
+        if (!Directory.Exists(folder))
+            return;
+        string[] files = Directory.GetFiles(folder, "*_model.json").Select(path => path.Replace('\\', '/')).ToArray();
+        if (files.Length == 0)
+            return;
+        Shader shader = Shader.Find("Standard");
+        if (shader == null)
+            throw new Exception("Unity has no Standard shader to make the models' materials with");
+        foreach (string file in files)
+        {
+            ModelFile model = JsonUtility.FromJson<ModelFile>(File.ReadAllText(file));
+            string id = model.id.ToString();
+            var vertices = new List<Vector3>();
+            var normals = new List<Vector3>();
+            var uvs = new List<Vector2>();
+            var parts = new List<int[]>();
+            foreach (SubmeshFile part in model.submeshes)
+            {
+                int first = vertices.Count;
+                for (int vertex = 0; vertex < part.positions.Length / 3; vertex++)
+                {
+                    vertices.Add(new Vector3(part.positions[3 * vertex], part.positions[3 * vertex + 1], part.positions[3 * vertex + 2]));
+                    normals.Add(new Vector3(part.normals[3 * vertex], part.normals[3 * vertex + 1], part.normals[3 * vertex + 2]));
+                    uvs.Add(new Vector2(part.uvs[2 * vertex], part.uvs[2 * vertex + 1]));
+                }
+                parts.Add(part.indices.Select(index => index + first).ToArray());
+            }
+            var mesh = new Mesh { name = id };
+            mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
+            mesh.SetVertices(vertices);
+            mesh.SetNormals(normals);
+            mesh.SetUVs(0, uvs);
+            mesh.subMeshCount = parts.Count;
+            for (int part = 0; part < parts.Count; part++)
+                mesh.SetTriangles(parts[part], part);
+            mesh.RecalculateBounds();
+            AssetDatabase.CreateAsset(mesh, folder + "/" + id + "_mesh.asset");
+
+            var materials = new Material[model.submeshes.Length];
+            for (int part = 0; part < model.submeshes.Length; part++)
+            {
+                string image = folder + "/" + model.submeshes[part].texture;
+                var importer = AssetImporter.GetAtPath(image) as TextureImporter;
+                if (importer != null)
+                {
+                    importer.textureType = TextureImporterType.Default;
+                    importer.wrapMode = TextureWrapMode.Repeat;
+                    importer.SaveAndReimport();
+                }
+                var material = new Material(shader) { name = id + "_material_" + part };
+                material.SetTexture("_MainTex", AssetDatabase.LoadAssetAtPath<Texture2D>(image));
+                material.SetFloat("_Glossiness", 0f);
+                AssetDatabase.CreateAsset(material, folder + "/" + material.name + ".mat");
+                materials[part] = material;
+            }
+
+            var made = new GameObject(id);
+            made.AddComponent<MeshFilter>().sharedMesh = mesh;
+            made.AddComponent<MeshRenderer>().sharedMaterials = materials;
+            made.AddComponent<MeshCollider>().sharedMesh = mesh;
+            PrefabUtility.SaveAsPrefabAsset(made, folder + "/" + id + ".prefab");
+            UnityEngine.Object.DestroyImmediate(made);
         }
         AssetDatabase.SaveAssets();
     }
@@ -308,7 +402,8 @@ fn build(request: &BuildRequest, step: &dyn Fn(String)) -> Result<Vec<PathBuf>, 
 }
 
 /// Copies the mod's files from `mod_folder` to `destination`: the manifest,
-/// the scripts, the world data, the music and the skies (not the readme or earlier builds).
+/// the scripts, the world data, the music, the skies and the user's models
+/// (not the readme or earlier builds).
 fn copy_mod_files(mod_folder: &Path, destination: &Path, file_name: &str) -> Result<(), String> {
     create_folder(destination)?;
     let manifest = format!("{file_name}{}", super::MANIFEST_EXTENSION);
@@ -320,7 +415,7 @@ fn copy_mod_files(mod_folder: &Path, destination: &Path, file_name: &str) -> Res
             copy_file(&entry.path(), &destination.join(entry.file_name()))?;
         }
     }
-    for folder in [super::WORLD_DATA_FOLDER, super::MUSIC_FOLDER, super::SKY_FOLDER] {
+    for folder in [super::WORLD_DATA_FOLDER, super::MUSIC_FOLDER, super::SKY_FOLDER, super::MODELS_FOLDER] {
         let source = mod_folder.join(folder);
         let Ok(entries) = std::fs::read_dir(&source) else { continue };
         create_folder(&destination.join(folder))?;

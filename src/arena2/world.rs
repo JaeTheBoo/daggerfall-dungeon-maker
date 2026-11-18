@@ -295,6 +295,95 @@ pub fn region_name(region_index: usize) -> &'static str {
     REGION_NAMES.get(region_index).copied().unwrap_or("Unknown region")
 }
 
+/// A climate of the world (a `CLIMATE.PAK` value), and how Daggerfall Unity
+/// draws a location outdoors in it (`MapsFile.GetWorldClimateSettings`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Climate {
+    /// The `CLIMATE.PAK` value, 223 to 232.
+    pub value: u8,
+    pub name: &'static str,
+    /// The climate's base (`DFLocation.ClimateBaseType`), which picks the
+    /// variant of buildings' textures: [`Climate::DESERT`], [`Climate::MOUNTAIN`],
+    /// [`Climate::TEMPERATE`] or [`Climate::SWAMP`].
+    pub base: u16,
+    /// Texture archive of the ground tiles in summer.
+    pub ground_archive: u16,
+    /// Texture archive of the trees, rocks and plants in summer.
+    pub nature_archive: u16,
+}
+
+impl Climate {
+    /// Climate bases: what is added to a texture set's number for its variant in the climate.
+    pub const DESERT: u16 = 0;
+    pub const MOUNTAIN: u16 = 100;
+    pub const TEMPERATE: u16 = 300;
+    pub const SWAMP: u16 = 400;
+
+    /// Every climate, by `CLIMATE.PAK` value.
+    pub const ALL: [Self; 10] = [
+        Self::new(223, "Ocean", Self::SWAMP, 402, 504),
+        Self::new(224, "Desert", Self::DESERT, 2, 503),
+        Self::new(225, "Hot desert", Self::DESERT, 2, 503),
+        Self::new(226, "Mountain", Self::MOUNTAIN, 102, 510),
+        Self::new(227, "Rainforest", Self::SWAMP, 402, 500),
+        Self::new(228, "Swamp", Self::SWAMP, 402, 502),
+        Self::new(229, "Subtropical", Self::DESERT, 2, 501),
+        Self::new(230, "Mountain woods", Self::TEMPERATE, 102, 506),
+        Self::new(231, "Woodlands", Self::TEMPERATE, 302, 504),
+        Self::new(232, "Haunted woodlands", Self::TEMPERATE, 302, 508),
+    ];
+    /// The climate Daggerfall Unity uses where there is none: woodlands.
+    pub const DEFAULT: Self = Self::ALL[8];
+
+    const fn new(value: u8, name: &'static str, base: u16, ground_archive: u16, nature_archive: u16) -> Self {
+        Self { value, name, base, ground_archive, nature_archive }
+    }
+
+    /// The climate with `CLIMATE.PAK` value `value`, or the default one for an unknown value.
+    pub fn from_value(value: u8) -> Self {
+        Self::ALL.into_iter().find(|climate| climate.value == value).unwrap_or(Self::DEFAULT)
+    }
+
+    /// The archive of the ground tiles in `season`: in winter the snowy one,
+    /// except in deserts (`TerrainMaterialProvider.GetClimateInfo`).
+    pub fn ground_archive_in(self, season: Season) -> u16 {
+        match season == Season::Winter && self.base != Self::DESERT {
+            true => self.ground_archive + 1,
+            false => self.ground_archive,
+        }
+    }
+
+    /// The archive of the trees, rocks and plants in `season`: in winter the
+    /// snowy one, for the sets that have one (`ClimateSwaps.GetNatureArchive`).
+    pub fn nature_archive_in(self, season: Season) -> u16 {
+        match season == Season::Winter && matches!(self.nature_archive, 504 | 506 | 508 | 510) {
+            true => self.nature_archive + 1,
+            false => self.nature_archive,
+        }
+    }
+}
+
+/// The season a location is drawn in. Daggerfall Unity draws locations in
+/// summer, or in winter (with snow) during the winter months.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Season {
+    #[default]
+    Summer,
+    Winter,
+}
+
+impl Season {
+    pub const ALL: [Self; 2] = [Self::Summer, Self::Winter];
+
+    /// Name shown to the user.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Summer => "Summer",
+            Self::Winter => "Winter",
+        }
+    }
+}
+
 /// Unpacks `POLITIC.PAK`: a row offset table, then each row run-length
 /// encoded as (count `u16`, value `u8`) runs. Returns the map's pixels, row by row.
 fn read_politic(data: &[u8]) -> Arena2Result<Vec<u8>> {

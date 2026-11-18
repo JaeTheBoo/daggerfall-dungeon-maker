@@ -27,8 +27,8 @@ use crate::arena2::{region_name, DungeonDefinition, LocationType, MapPixel, Text
 use crate::encounters::DungeonType;
 use crate::music::DungeonSong;
 use crate::scene::{
-    FlatData, LightData, ModelData, ObjectAction, ObjectId, PrefabMember, Scene, SceneObject,
-    SceneObjectKind, ADDED_OBJECTS_GROUP,
+    quarter_of, FlatData, LightData, ModelData, ObjectAction, ObjectFolder, ObjectId, PrefabMember, Scene,
+    SceneObject, SceneObjectKind, ADDED_OBJECTS_GROUP,
 };
 
 /// File extension of project files, without the dot.
@@ -665,6 +665,44 @@ impl Project {
             .collect()
     }
 
+    /// The project's cells that hold model `model_id`, with how many copies each holds.
+    pub fn rooms_using_model(&self, model_id: u32) -> Vec<(&str, usize)> {
+        let mut rooms = Vec::new();
+        collect_rooms(&self.entries, &mut rooms);
+        rooms
+            .into_iter()
+            .map(|room| {
+                (room.name.as_str(), room.objects.iter().filter(|object| object.is_model(model_id)).count())
+            })
+            .filter(|&(_, count)| count > 0)
+            .collect()
+    }
+
+    /// Removes every copy of model `model_id` from the project's cells (and
+    /// the links to them). Returns how many were removed.
+    pub fn remove_model(&mut self, model_id: u32) -> usize {
+        let mut removed = 0;
+        for_each_room_mut(&mut self.entries, &mut |room| {
+            let gone: Vec<_> = room
+                .objects
+                .iter()
+                .filter(|object| object.is_model(model_id))
+                .map(|object| object.id)
+                .collect();
+            if gone.is_empty() {
+                return;
+            }
+            room.objects.retain(|object| !object.is_model(model_id));
+            for object in &mut room.objects {
+                if object.next.is_some_and(|next| gone.contains(&next)) {
+                    object.next = None;
+                }
+            }
+            removed += gone.len();
+        });
+        removed
+    }
+
     /// Makes every dungeon that uses the project room `room_id` use the Daggerfall room again.
     pub fn stop_using_room(&mut self, room_id: ItemId) {
         for_each_dungeon_mut(&mut self.entries, &mut |dungeon| {
@@ -872,6 +910,26 @@ fn for_each_dungeon_mut(entries: &mut [ProjectEntry], action: &mut impl FnMut(&m
     }
 }
 
+fn collect_rooms<'project>(entries: &'project [ProjectEntry], rooms: &mut Vec<&'project ProjectRoom>) {
+    for entry in entries {
+        match entry {
+            ProjectEntry::Folder(folder) => collect_rooms(&folder.entries, rooms),
+            ProjectEntry::Room(room) => rooms.push(room),
+            ProjectEntry::Dungeon(_) => {}
+        }
+    }
+}
+
+fn for_each_room_mut(entries: &mut [ProjectEntry], action: &mut impl FnMut(&mut ProjectRoom)) {
+    for entry in entries {
+        match entry {
+            ProjectEntry::Folder(folder) => for_each_room_mut(&mut folder.entries, action),
+            ProjectEntry::Room(room) => action(room),
+            ProjectEntry::Dungeon(_) => {}
+        }
+    }
+}
+
 fn collect_room_ids(entries: &[ProjectEntry], ids: &mut Vec<ItemId>) {
     for entry in entries {
         match entry {
@@ -1060,6 +1118,15 @@ pub(crate) struct ObjectFile {
     /// The placed prefab it is part of; absent when it is not part of one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prefab: Option<PrefabMemberFile>,
+    /// The object list the user put it in; absent when it is in none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    folder: Option<FolderFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FolderFile {
+    id: u32,
+    name: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1191,6 +1258,11 @@ impl EntryFile {
                     let mut objects: Vec<SceneObject> =
                         objects.into_iter().map(ObjectFile::into_object).collect();
                     Scene::ensure_object_ids(&mut objects);
+                    // Objects are listed by the quarter they are in, also those saved
+                    // before placed and moved objects joined their quarter.
+                    for object in &mut objects {
+                        object.group_index = quarter_of(object.position);
+                    }
                     objects
                 },
             }),
@@ -1258,6 +1330,10 @@ impl ObjectFile {
                 .prefab
                 .as_ref()
                 .map(|member| PrefabMemberFile { instance: member.instance, name: member.name.clone() }),
+            folder: object
+                .folder
+                .as_ref()
+                .map(|folder| FolderFile { id: folder.id, name: folder.name.clone() }),
         }
     }
 
@@ -1296,6 +1372,7 @@ impl ObjectFile {
             visible: self.visible,
             scale: self.scale.map(Vec3::from_array),
             prefab: self.prefab.map(|member| PrefabMember { instance: member.instance, name: member.name }),
+            folder: self.folder.map(|folder| ObjectFolder { id: folder.id, name: folder.name }),
         }
     }
 }
@@ -1308,7 +1385,8 @@ mod tests {
         vec![
             SceneObject {
                 name: "Model 55000".to_string(),
-                group_index: 0,
+                // The north-west quarter, where it stands.
+                group_index: 4,
                 kind: SceneObjectKind::Model {
                     model_id: 55000,
                     data: ModelData {
@@ -1324,10 +1402,11 @@ mod tests {
                 next: Some(3),
                 scale: None,
                 prefab: None,
+                folder: Some(ObjectFolder { id: 1, name: "Gate".to_string() }),
             },
             SceneObject {
                 name: "Torch".to_string(),
-                group_index: ADDED_OBJECTS_GROUP,
+                group_index: 0,
                 kind: SceneObjectKind::Flat {
                     texture: TextureKey::new(199, 16),
                     data: FlatData { flags: 2, faction_or_mobile_id: 0x3507, action: 99 },
@@ -1339,10 +1418,11 @@ mod tests {
                 next: None,
                 scale: Some(Vec3::new(2.0, 0.5, 1.0)),
                 prefab: None,
+                folder: None,
             },
             SceneObject {
                 name: "Light".to_string(),
-                group_index: 2,
+                group_index: 0,
                 kind: SceneObjectKind::Light { radius: 7.5, data: LightData { unknown_1: 3, unknown_2: 0 } },
                 position: Vec3::ZERO,
                 rotation_degrees: Vec3::ZERO,
@@ -1351,6 +1431,7 @@ mod tests {
                 next: None,
                 scale: None,
                 prefab: Some(PrefabMember { instance: 2, name: "Lit alcove".to_string() }),
+                folder: None,
             },
         ]
     }
@@ -1363,6 +1444,28 @@ mod tests {
             category: CellCategory::Interior,
             objects: sample_objects(),
         })
+    }
+
+    #[test]
+    fn removes_every_copy_of_a_model_and_the_links_to_it() {
+        let mut project = Project::default();
+        let mut hall = room(&mut project, "Hall");
+        // The torch triggers the model, which is removed.
+        if let ProjectEntry::Room(room) = &mut hall {
+            room.objects[1].next = Some(1);
+        }
+        project.add(hall, None);
+        let folder = project.add_folder("Crypts", None);
+        let crypt = room(&mut project, "Crypt");
+        project.add(crypt, Some(folder));
+
+        assert_eq!(project.rooms_using_model(55000), [("Hall", 1), ("Crypt", 1)]);
+        assert!(project.rooms_using_model(12345).is_empty());
+        assert_eq!(project.remove_model(55000), 2);
+        assert!(project.rooms_using_model(55000).is_empty());
+        let ProjectEntry::Room(hall) = &project.entries[0] else { panic!("the hall first") };
+        assert_eq!(hall.objects.len(), 2);
+        assert!(hall.objects.iter().all(|object| object.next.is_none()));
     }
 
     #[test]
@@ -1491,6 +1594,24 @@ mod tests {
         assert_eq!(folder.entries.len(), 1);
         let ProjectEntry::Room(loaded_room) = &folder.entries[0] else { panic!("room expected") };
         assert_eq!(loaded_room.objects, sample_objects());
+    }
+
+    #[test]
+    fn objects_are_listed_by_their_quarter() {
+        let mut project = Project::default();
+        let entry = room(&mut project, "Hall");
+        let id = entry.id();
+        project.add(entry, None);
+        // Saved before placed objects joined their quarter: in the added objects, and moved out of list 0.
+        let mut older: serde_json::Value = serde_json::from_str(&project.to_file_text()).unwrap();
+        let objects = older["entries"][0]["objects"].as_array_mut().unwrap();
+        objects[0].as_object_mut().unwrap().remove("group");
+        objects[2]["group"] = 0.into();
+        objects[2]["position"] = serde_json::json!([40.0, 0.0, 40.0]);
+        let loaded = Project::from_file_text(&older.to_string()).unwrap();
+        let groups: Vec<usize> =
+            loaded.room(id).unwrap().objects.iter().map(|object| object.group_index).collect();
+        assert_eq!(groups, [4, 0, 5]);
     }
 
     #[test]

@@ -405,6 +405,14 @@ impl ExportWindow {
             .filter(|check| check.scaled_objects > 0 && selected.contains(&check.id))
             .map(|check| format!("{} ({})", check.name, check.scaled_objects))
             .collect();
+        // And those using models of the user's own, which loose files cannot carry.
+        let custom_models: Vec<String> = self
+            .checks
+            .iter()
+            .flatten()
+            .filter(|check| check.custom_models > 0 && selected.contains(&check.id))
+            .map(|check| check.name.clone())
+            .collect();
         let settings = &mut self.settings;
         ui.horizontal(|ui| {
             ui.label("Folder");
@@ -458,6 +466,16 @@ impl ExportWindow {
                         "⚠ Scaled objects do not export in loose files, only in a .dfmod: the scaled objects \
                          in {} will be at their usual size. Build a .dfmod with Unity to scale them.",
                         scaled.join(", ")
+                    ))
+                    .color(ui.visuals().warn_fg_color),
+                );
+            }
+            if !custom_models.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "⚠ Custom models are not supported in loose files: {} will be missing them in the game. \
+                         Build a .dfmod with Unity to take your models into the game.",
+                        custom_models.join(", ")
                     ))
                     .color(ui.visuals().warn_fg_color),
                 );

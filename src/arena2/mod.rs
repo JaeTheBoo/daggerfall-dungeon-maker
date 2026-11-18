@@ -27,13 +27,15 @@ pub use error::{Arena2Error, Arena2Result};
 pub use hmi::{parse_hmi, MidiEvent, MidiSong};
 pub use library::Arena2Library;
 pub use maps::{
-    ClassicLocation, DungeonBlockPlacement, DungeonDefinition, LocationBuilding, LocationExterior,
-    REGION_NAMES,
+    building_type_name, rmb_block_kind, ClassicLocation, DungeonBlockPlacement, DungeonDefinition,
+    LocationBuilding, LocationDefinition, LocationExterior, REGION_NAMES, RMB_BLOCK_KINDS,
 };
 pub use mesh::{DoorKind, MeshVertex, ModelMesh, SubMesh};
-pub use rmb::{RmbBlock, RmbFlat, RmbModel, RMB_BLOCK_SIDE};
+pub use rmb::{GroundTile, RmbBlock, RmbFlat, RmbModel, PREVIEW_NATURE_ARCHIVE, RMB_BLOCK_SIDE};
 pub use texture::RgbaImage;
-pub use world::{region_name, LocationType, MapPixel, WorldLocation, WorldMap, MAP_HEIGHT, MAP_WIDTH};
+pub use world::{
+    region_name, Climate, LocationType, MapPixel, Season, WorldLocation, WorldMap, MAP_HEIGHT, MAP_WIDTH,
+};
 
 use glam::{IVec3, Vec3};
 

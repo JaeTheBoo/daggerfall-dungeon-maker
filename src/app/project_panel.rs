@@ -1,7 +1,12 @@
 //! The project panel: every room and dungeon that can be opened.
 //!
-//! A switch at the top shows either **Dungeons** or **Cells** (rooms), and a
-//! toggle shows or hides Daggerfall's own. The **Daggerfall** list holds the
+//! A toggle at the very top chooses between **Dungeons** and **Settlements**.
+//! For dungeons, a switch below shows either **Dungeons** or **Cells**
+//! (rooms), and a toggle shows or hides Daggerfall's own. For settlements, it
+//! shows either **Settlements** (every location of the world: towns, homes,
+//! temples, dungeon entrances…, by region and type) or **Cells** (the outdoor
+//! cells, RMB blocks, they are built from, by kind); these are Daggerfall's
+//! own and open read-only. The **Daggerfall** list holds the
 //! game's own dungeons (grouped by region) or rooms; they open read-only.
 //! Below it are the project's own: loose at the top level, or in folders the
 //! user creates (folders show in both, with what they hold of each kind).
@@ -13,13 +18,14 @@
 //! adds a copy there. A cell (the project's or Daggerfall's) can also be dragged
 //! into the dungeon view, which adds it to the open dungeon.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use super::room_browser::category_description;
-use crate::arena2::DungeonDefinition;
+use crate::arena2::{rmb_block_kind, DungeonDefinition, LocationDefinition, LocationType, RMB_BLOCK_KINDS};
 use crate::custom_names::CustomNames;
 use crate::project::{ItemId, Project, ProjectEntry};
 
@@ -35,6 +41,11 @@ pub enum OpenedItem {
     DaggerfallRoom(String),
     /// A dungeon from Daggerfall, by index in the library's dungeon list.
     DaggerfallDungeon(usize),
+    /// A settlement (any location of the world) from Daggerfall, by index in
+    /// the library's location list.
+    DaggerfallSettlement(usize),
+    /// An outdoor cell from Daggerfall, by RMB block name.
+    DaggerfallOutdoorCell(String),
     /// A room or dungeon of the project.
     Project(ItemId),
 }
@@ -91,15 +102,52 @@ struct RegionGroup {
     dungeons: std::ops::Range<usize>,
 }
 
+/// A region's locations, by type.
+struct LocationRegion {
+    name: &'static str,
+    count: usize,
+    /// Each type's name (plural) and its locations, as indices into the location list.
+    kinds: Vec<(&'static str, Vec<usize>)>,
+}
+
+/// Location types in the order the panel lists them, with their plural names.
+const LOCATION_KINDS: [(Option<LocationType>, &str); 16] = [
+    (Some(LocationType::City), "Cities"),
+    (Some(LocationType::Hamlet), "Hamlets"),
+    (Some(LocationType::Village), "Villages"),
+    (Some(LocationType::Tavern), "Taverns"),
+    (Some(LocationType::Temple), "Temples"),
+    (Some(LocationType::Cult), "Cults"),
+    (Some(LocationType::Coven), "Covens"),
+    (Some(LocationType::WealthyHome), "Wealthy homes"),
+    (Some(LocationType::PoorHome), "Poor homes"),
+    (Some(LocationType::Farm), "Farms"),
+    (Some(LocationType::LargeDungeon), "Large dungeons"),
+    (Some(LocationType::MediumDungeon), "Medium dungeons"),
+    (Some(LocationType::SmallDungeon), "Small dungeons"),
+    (Some(LocationType::Graveyard), "Graveyards"),
+    (Some(LocationType::Ship), "Ships"),
+    (None, "Other"),
+];
+
 /// Which kind of item the panel lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum PanelSection {
     #[default]
     Dungeons,
     Cells,
+    /// Every location of the world (Settlements on the panel's top toggle).
+    Settlements,
+    /// The outdoor cells (RMB blocks) locations are built from.
+    OutdoorCells,
 }
 
 impl PanelSection {
+    /// Whether the section is one of the settlements' (rather than the dungeons').
+    pub fn is_outdoor(self) -> bool {
+        matches!(self, Self::Settlements | Self::OutdoorCells)
+    }
+
     /// The section listing `entry`, or `None` for folders, which show in both.
     fn of(entry: &ProjectEntry) -> Option<Self> {
         match entry {
@@ -140,6 +188,14 @@ pub struct ProjectPanel {
     room_names: Vec<String>,
     dungeons: Arc<[DungeonDefinition]>,
     regions: Vec<RegionGroup>,
+    /// Every location of the world, and the same grouped by region and type.
+    locations: Arc<[LocationDefinition]>,
+    location_regions: Vec<LocationRegion>,
+    /// Every outdoor cell (RMB block name), and the same grouped by kind (as indices into it).
+    outdoor_cells: Vec<String>,
+    outdoor_kinds: Vec<(&'static str, Vec<usize>)>,
+    /// The locations using each outdoor cell, as indices into `locations`.
+    outdoor_usage: Arc<HashMap<String, Vec<usize>>>,
 }
 
 impl Default for ProjectPanel {
@@ -154,6 +210,11 @@ impl Default for ProjectPanel {
             room_names: Vec::new(),
             dungeons: Arc::new([]),
             regions: Vec::new(),
+            locations: Arc::new([]),
+            location_regions: Vec::new(),
+            outdoor_cells: Vec::new(),
+            outdoor_kinds: Vec::new(),
+            outdoor_usage: Arc::default(),
         }
     }
 }
@@ -174,6 +235,52 @@ impl ProjectPanel {
         self.dungeons = dungeons;
     }
 
+    /// Sets the Daggerfall settlements and outdoor cells listed, after the game data is loaded.
+    ///
+    /// `locations` must be sorted by region, as the library returns them;
+    /// `usage` gives the locations using each outdoor cell.
+    pub fn set_outdoor_contents(
+        &mut self,
+        locations: Arc<[LocationDefinition]>,
+        outdoor_cells: Vec<String>,
+        usage: Arc<HashMap<String, Vec<usize>>>,
+    ) {
+        self.location_regions.clear();
+        for (index, location) in locations.iter().enumerate() {
+            if self.location_regions.last().is_none_or(|region| region.name != location.region_name) {
+                let kinds = LOCATION_KINDS.iter().map(|&(_, name)| (name, Vec::new())).collect();
+                self.location_regions.push(LocationRegion { name: location.region_name, count: 0, kinds });
+            }
+            let region = self.location_regions.last_mut().expect("a region was just added");
+            let kind = LOCATION_KINDS
+                .iter()
+                .position(|&(kind, _)| kind == location.location_type)
+                .unwrap_or(LOCATION_KINDS.len() - 1);
+            region.kinds[kind].1.push(index);
+            region.count += 1;
+        }
+        for region in &mut self.location_regions {
+            region.kinds.retain(|(_, indices)| !indices.is_empty());
+        }
+
+        let mut kinds: Vec<(&'static str, Vec<usize>)> = Vec::new();
+        for (index, name) in outdoor_cells.iter().enumerate() {
+            let kind = rmb_block_kind(name);
+            match kinds.iter_mut().find(|(known, _)| *known == kind) {
+                Some((_, indices)) => indices.push(index),
+                None => kinds.push((kind, vec![index])),
+            }
+        }
+        // In the order the game numbers the kinds, then any others.
+        let order =
+            |kind: &str| RMB_BLOCK_KINDS.iter().position(|(_, known)| *known == kind).unwrap_or(usize::MAX);
+        kinds.sort_by_key(|(kind, _)| order(kind));
+        self.outdoor_kinds = kinds;
+        self.outdoor_cells = outdoor_cells;
+        self.locations = locations;
+        self.outdoor_usage = usage;
+    }
+
     /// Why a new item of the section shown cannot be called `name`, if it cannot:
     /// the name is taken by something in the project, or by one of Daggerfall's
     /// own dungeons or cells of the same kind.
@@ -191,10 +298,13 @@ impl ProjectPanel {
             PanelSection::Cells => self.room_names.iter().any(|block| {
                 block.eq_ignore_ascii_case(name) || block.trim_end_matches(".RDB").eq_ignore_ascii_case(name)
             }),
+            PanelSection::Settlements | PanelSection::OutdoorCells => false,
         };
         let kind = match self.view.section {
             PanelSection::Dungeons => "dungeon",
             PanelSection::Cells => "cell",
+            PanelSection::Settlements => "settlement",
+            PanelSection::OutdoorCells => "outdoor cell",
         };
         taken_in_daggerfall.then(|| format!("Daggerfall already has a {kind} called \"{name}\""))
     }
@@ -227,6 +337,8 @@ impl ProjectPanel {
             let section = match opened {
                 Some(OpenedItem::DaggerfallDungeon(_)) => Some(PanelSection::Dungeons),
                 Some(OpenedItem::DaggerfallRoom(_)) => Some(PanelSection::Cells),
+                Some(OpenedItem::DaggerfallSettlement(_)) => Some(PanelSection::Settlements),
+                Some(OpenedItem::DaggerfallOutdoorCell(_)) => Some(PanelSection::OutdoorCells),
                 Some(OpenedItem::Project(id)) => project.find(*id).and_then(PanelSection::of),
                 None => None,
             };
@@ -236,14 +348,22 @@ impl ProjectPanel {
         }
 
         egui::SidePanel::left("project_panel").resizable(true).default_width(250.0).show(context, |ui| {
+            let outdoor = self.view.section.is_outdoor();
             ui.horizontal(|ui| {
                 ui.heading(project_title);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("New folder").on_hover_text("Add a folder for organising the project").clicked() {
+                    if !outdoor
+                        && ui.button("New folder").on_hover_text("Add a folder for organising the project").clicked()
+                    {
                         changes.push(TreeChange::NewFolder(None));
                     }
                 });
             });
+            self.show_mode_toggle(ui);
+            if self.view.section.is_outdoor() {
+                self.show_outdoor(ui, custom_names, opened, &mut action);
+                return;
+            }
             ui.horizontal(|ui| {
                 for (section, name, hover) in [
                     (PanelSection::Dungeons, "Dungeons", "List dungeons"),
@@ -263,7 +383,7 @@ impl ProjectPanel {
             });
             let (hint, kind) = match self.view.section {
                 PanelSection::Dungeons => ("Search, or name a new dungeon", "dungeon"),
-                PanelSection::Cells => ("Search, or name a new cell", "cell"),
+                _ => ("Search, or name a new cell", "cell"),
             };
             ui.horizontal(|ui| {
                 // The + button sits at the right; the search field takes the rest of the row.
@@ -287,7 +407,7 @@ impl ProjectPanel {
                 if can_create && (button.clicked() || entered) {
                     let id = match self.view.section {
                         PanelSection::Dungeons => project.add_empty_dungeon(&name),
-                        PanelSection::Cells => project.add_empty_room(&name),
+                        _ => project.add_empty_room(&name),
                     };
                     self.search_text.clear();
                     action = Some(PanelAction::Created(id));
@@ -319,9 +439,7 @@ impl ProjectPanel {
                             PanelSection::Dungeons => {
                                 "Your dungeons appear here. Change one of Daggerfall's dungeons to make a copy."
                             }
-                            PanelSection::Cells => {
-                                "Your cells appear here. Change one of Daggerfall's cells to make a copy."
-                            }
+                            _ => "Your cells appear here. Change one of Daggerfall's cells to make a copy.",
                         };
                         ui.label(egui::RichText::new(hint).weak());
                     }
@@ -383,6 +501,242 @@ impl ProjectPanel {
         }
     }
 
+    /// Draws the toggle at the top choosing between dungeons and settlements.
+    fn show_mode_toggle(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(4.0, 2.0)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let outdoor = self.view.section.is_outdoor();
+                let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                for (is_outdoor, name, hover) in [
+                    (false, "Dungeons", "Dungeons and the cells (RDB blocks) they are built from"),
+                    (
+                        true,
+                        "Settlements",
+                        "Every location of the world (towns, homes, temples, dungeon entrances…) and the \
+                         outdoor cells (RMB blocks) they are built from",
+                    ),
+                ] {
+                    let text = egui::RichText::new(name).strong().size(15.0);
+                    let button = egui::SelectableLabel::new(outdoor == is_outdoor, text);
+                    if ui
+                        .add_sized([width, ui.spacing().interact_size.y + 4.0], button)
+                        .on_hover_text(hover)
+                        .clicked()
+                        && outdoor != is_outdoor
+                    {
+                        self.view.section =
+                            if is_outdoor { PanelSection::Settlements } else { PanelSection::Dungeons };
+                    }
+                }
+            });
+        });
+    }
+
+    /// Draws the settlements' side of the panel: the Settlements and Cells
+    /// sections, a search field and Daggerfall's settlements or outdoor cells.
+    fn show_outdoor(
+        &mut self,
+        ui: &mut egui::Ui,
+        custom_names: &CustomNames,
+        opened: Option<&OpenedItem>,
+        action: &mut Option<PanelAction>,
+    ) {
+        ui.horizontal(|ui| {
+            for (section, name, hover) in [
+                (
+                    PanelSection::Settlements,
+                    "Settlements",
+                    "List every location of the world, by region and type",
+                ),
+                (
+                    PanelSection::OutdoorCells,
+                    "Cells",
+                    "List the outdoor cells (RMB blocks) locations are built from",
+                ),
+            ] {
+                let selected = self.view.section == section;
+                let text = egui::RichText::new(name).strong();
+                if ui.selectable_label(selected, text).on_hover_text(hover).clicked() {
+                    self.view.section = section;
+                }
+            }
+        });
+        let hint = match self.view.section {
+            PanelSection::Settlements => "Search by name, region or type",
+            _ => "Search by cell, kind or your name",
+        };
+        ui.add_sized(
+            [ui.available_width(), ui.spacing().interact_size.y],
+            egui::TextEdit::singleline(&mut self.search_text).hint_text(hint),
+        );
+        ui.separator();
+        let search = self.search_text.trim().to_lowercase();
+        let section = self.view.section;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt(("project_panel_list", section)).show(
+            ui,
+            |ui| {
+                if self.locations.is_empty() && self.outdoor_cells.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Choose your ARENA2 folder (with MAPS.BSA) to list the settlements.")
+                            .weak(),
+                    );
+                    return;
+                }
+                match section {
+                    PanelSection::Settlements => self.show_settlement_list(ui, &search, opened, action),
+                    _ => self.show_outdoor_cell_list(ui, &search, custom_names, opened, action),
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Daggerfall's settlements and outdoor cells open read-only. Your own are not supported yet.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            },
+        );
+    }
+
+    /// Draws Daggerfall's locations: by region and type, or the matches of `search`.
+    fn show_settlement_list(
+        &self,
+        ui: &mut egui::Ui,
+        search: &str,
+        opened: Option<&OpenedItem>,
+        action: &mut Option<PanelAction>,
+    ) {
+        if !search.is_empty() {
+            let matches = (0..self.locations.len()).filter(|&index| {
+                let location = &self.locations[index];
+                location.name.to_lowercase().contains(search)
+                    || location.region_name.to_lowercase().contains(search)
+                    || location.location_type.is_some_and(|kind| kind.name().to_lowercase().contains(search))
+            });
+            show_limited(ui, matches, |ui, index| self.show_settlement_row(ui, index, true, opened, action));
+            return;
+        }
+        let header = format!("Daggerfall ({})", self.locations.len());
+        egui::CollapsingHeader::new(header).id_salt("daggerfall_settlements").default_open(true).show(
+            ui,
+            |ui| {
+                for region in &self.location_regions {
+                    let header = format!("{} ({})", region.name, region.count);
+                    egui::CollapsingHeader::new(header).id_salt(("settlement_region", region.name)).show(
+                        ui,
+                        |ui| {
+                            for (kind, indices) in &region.kinds {
+                                let header = format!("{kind} ({})", indices.len());
+                                egui::CollapsingHeader::new(header)
+                                    .id_salt(("settlement_kind", region.name, *kind))
+                                    .show(ui, |ui| {
+                                        for &index in indices {
+                                            self.show_settlement_row(ui, index, false, opened, action);
+                                        }
+                                    });
+                            }
+                        },
+                    );
+                }
+            },
+        );
+    }
+
+    /// Draws one location row; `show_region` adds its region and type, for search results.
+    fn show_settlement_row(
+        &self,
+        ui: &mut egui::Ui,
+        index: usize,
+        show_region: bool,
+        opened: Option<&OpenedItem>,
+        action: &mut Option<PanelAction>,
+    ) {
+        let location = &self.locations[index];
+        let kind = location.location_type.map_or("Location", |kind| kind.name());
+        let label = match show_region {
+            true => format!("{}   ·   {kind}   ·   {}", location.name, location.region_name),
+            false => location.name.clone(),
+        };
+        let dungeon = if location.has_dungeon { " · has a dungeon" } else { "" };
+        let item = OpenedItem::DaggerfallSettlement(index);
+        let response = ui.selectable_label(opened == Some(&item), label).on_hover_text(format!(
+            "{kind} · {} × {} cells{dungeon}\nClick to open (read-only)",
+            location.exterior.width, location.exterior.height
+        ));
+        outdoor_item_interaction(&response, item, false, opened, action);
+    }
+
+    /// Draws Daggerfall's outdoor cells: by kind, or the matches of `search`.
+    fn show_outdoor_cell_list(
+        &self,
+        ui: &mut egui::Ui,
+        search: &str,
+        custom_names: &CustomNames,
+        opened: Option<&OpenedItem>,
+        action: &mut Option<PanelAction>,
+    ) {
+        if !search.is_empty() {
+            let matches = self.outdoor_cells.iter().filter(|name| {
+                name.to_lowercase().contains(search)
+                    || rmb_block_kind(name).to_lowercase().contains(search)
+                    || custom_names.room_name_matches(name, search)
+            });
+            show_limited(ui, matches, |ui, name| {
+                self.show_outdoor_cell_row(ui, name, custom_names, opened, action)
+            });
+            return;
+        }
+        let header = format!("Daggerfall ({})", self.outdoor_cells.len());
+        egui::CollapsingHeader::new(header).id_salt("daggerfall_outdoor_cells").default_open(true).show(
+            ui,
+            |ui| {
+                for (kind, indices) in &self.outdoor_kinds {
+                    let header = format!("{kind} ({})", indices.len());
+                    egui::CollapsingHeader::new(header).id_salt(("outdoor_cell_kind", *kind)).show(
+                        ui,
+                        |ui| {
+                            for &index in indices {
+                                self.show_outdoor_cell_row(
+                                    ui,
+                                    &self.outdoor_cells[index],
+                                    custom_names,
+                                    opened,
+                                    action,
+                                );
+                            }
+                        },
+                    );
+                }
+            },
+        );
+    }
+
+    /// Draws one outdoor cell row, with the user's name for it if it has one.
+    fn show_outdoor_cell_row(
+        &self,
+        ui: &mut egui::Ui,
+        name: &str,
+        custom_names: &CustomNames,
+        opened: Option<&OpenedItem>,
+        action: &mut Option<PanelAction>,
+    ) {
+        let label = match custom_names.room_name(name) {
+            Some(custom_name) => format!("{name}   {custom_name}"),
+            None => name.to_string(),
+        };
+        let users = self.outdoor_usage.get(name).map_or(0, Vec::len);
+        let used = match users {
+            0 => "used by no location".to_string(),
+            1 => "used in 1 location".to_string(),
+            count => format!("used in {count} locations"),
+        };
+        let item = OpenedItem::DaggerfallOutdoorCell(name.to_string());
+        let response = ui
+            .selectable_label(opened == Some(&item), label)
+            .on_hover_text(format!("{} · {used}\nDouble-click to open (read-only)", rmb_block_kind(name)));
+        outdoor_item_interaction(&response, item, true, opened, action);
+    }
+
     /// Draws the read-only list of Daggerfall's own dungeons or rooms.
     fn show_daggerfall_list(
         &self,
@@ -419,7 +773,7 @@ impl ProjectPanel {
                         self.show_daggerfall_dungeon(ui, index, true, opened, action);
                     });
                 }
-                PanelSection::Cells => {
+                _ => {
                     let room_matches = self.room_names.iter().filter(|name| {
                         name.to_lowercase().contains(search) || custom_names.room_name_matches(name, search)
                     });
@@ -450,7 +804,7 @@ impl ProjectPanel {
                     },
                 );
             }
-            PanelSection::Cells => {
+            _ => {
                 let header = format!("Daggerfall ({})", self.room_names.len());
                 egui::CollapsingHeader::new(header).id_salt("daggerfall_rooms").default_open(true).show(
                     ui,
@@ -661,6 +1015,26 @@ fn show_daggerfall_room(
     daggerfall_item_interaction(&response, item, opened, action);
 }
 
+/// Clicking opens a settlement, double-clicking an outdoor cell (`is_cell`);
+/// right-clicking offers to open it. They cannot be copied into the project yet.
+fn outdoor_item_interaction(
+    response: &egui::Response,
+    item: OpenedItem,
+    is_cell: bool,
+    opened: Option<&OpenedItem>,
+    action: &mut Option<PanelAction>,
+) {
+    if opens_item(response, !is_cell) && opened != Some(&item) {
+        *action = Some(PanelAction::Open(item.clone()));
+    }
+    response.context_menu(|ui| {
+        if ui.button("Open (read-only)").clicked() {
+            *action = Some(PanelAction::Open(item.clone()));
+            ui.close_menu();
+        }
+    });
+}
+
 /// Whether `response` opens its item: one click for a dungeon, a double-click for a cell.
 fn opens_item(response: &egui::Response, is_dungeon: bool) -> bool {
     if is_dungeon {
@@ -849,7 +1223,7 @@ fn show_drag_preview(context: &egui::Context, project: &Project, dungeons: &[Dun
         DragPayload::Daggerfall(OpenedItem::DaggerfallDungeon(index)) => {
             dungeons.get(*index).map(|dungeon| format!("Copy of {}", dungeon.name))
         }
-        DragPayload::Daggerfall(OpenedItem::Project(_)) => None,
+        DragPayload::Daggerfall(_) => None,
     };
     let Some(name) = name else { return };
     egui::Area::new(egui::Id::new("project_drag_preview"))
@@ -912,5 +1286,47 @@ mod tests {
         assert_eq!(shown(PanelSection::Dungeons, "hall"), Vec::<&str>::new());
         assert_eq!(shown(PanelSection::Dungeons, "cells"), Vec::<&str>::new());
         assert!(project.find(empty).is_some());
+    }
+
+    #[test]
+    fn groups_settlements_by_region_and_type_and_outdoor_cells_by_kind() {
+        let location = |name: &str, region_name: &'static str, location_type| LocationDefinition {
+            region_index: 0,
+            region_name,
+            name: name.to_string(),
+            location_type,
+            map_pixel: crate::arena2::MapPixel::new(0, 0),
+            location_id: 0,
+            exterior: crate::arena2::LocationExterior {
+                width: 1,
+                height: 1,
+                block_names: vec!["TVRNAL01.RMB".to_string()],
+                buildings: Vec::new(),
+            },
+            has_dungeon: false,
+            discovered: false,
+        };
+        let locations: Arc<[LocationDefinition]> = Arc::new([
+            location("Ashby", "Alcaire", Some(LocationType::Farm)),
+            location("Wayrest", "Alcaire", Some(LocationType::City)),
+            location("Yarn", "Alcaire", None),
+            location("Kirk", "Betony", Some(LocationType::Village)),
+        ]);
+        let cells =
+            ["XYZW0001.RMB", "TVRNAL01.RMB", "FARMAA02.RMB", "TVRNAM03.RMB"].map(String::from).to_vec();
+        let mut panel = ProjectPanel::default();
+        panel.set_outdoor_contents(locations, cells, Arc::default());
+
+        let regions: Vec<(&str, usize)> =
+            panel.location_regions.iter().map(|region| (region.name, region.count)).collect();
+        assert_eq!(regions, [("Alcaire", 3), ("Betony", 1)]);
+        assert_eq!(
+            panel.location_regions[0].kinds,
+            [("Cities", vec![1]), ("Farms", vec![0]), ("Other", vec![2])]
+        );
+        assert_eq!(panel.location_regions[1].kinds, [("Villages", vec![3])]);
+        // Kinds in the game's order, unknown ones last.
+        assert_eq!(panel.outdoor_kinds, [("Tavern", vec![1, 3]), ("Farm", vec![2]), ("Other", vec![0])]);
+        assert!(PanelSection::OutdoorCells.is_outdoor() && !PanelSection::Cells.is_outdoor());
     }
 }

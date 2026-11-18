@@ -8,6 +8,7 @@ use crate::arena2::{Arena2Library, RDB_BLOCK_SIDE};
 use crate::camera::OrbitCamera;
 use crate::catalog::AssetCatalog;
 use crate::connectors::{is_on_cell_edge, unclosed_faces, OpenFace, UnclosedFace};
+use crate::custom_models::CustomModelLibrary;
 use crate::custom_names::CustomNames;
 use crate::dungeon_textures::{DungeonIdentity, DungeonTextures, TextureMode, TextureSetting};
 use crate::prefabs::PrefabLibrary;
@@ -31,6 +32,8 @@ pub struct EditorResources<'resources> {
     pub custom_names: &'resources mut CustomNames,
     /// The user's prefabs, listed in the asset palette and made from any editor.
     pub prefabs: &'resources mut PrefabLibrary,
+    /// The models the user imported, listed in the asset palette.
+    pub custom_models: &'resources CustomModelLibrary,
     /// Which textures dungeons are drawn with (View > Dungeon textures).
     pub texture_setting: &'resources mut TextureSetting,
     /// The texture mode in Daggerfall Unity's own settings, if they were found.

@@ -9,8 +9,14 @@
 //! together: selecting one selects them all, so they move, turn, copy and
 //! delete as one. Their own properties cannot be changed until the prefab is
 //! broken up (**Break Prefab** in their right-click menu).
+//!
+//! The outliner lists the object lists the user made (folders, see
+//! [`ObjectFolder`]) first, then the rest of the objects by the quarter of the
+//! cell they are in, as Daggerfall lists them ([`crate::scene::quarter_of`]).
+//! Objects join the quarter they are placed, pasted or moved into.
 
 mod asset_palette;
+pub use asset_palette::CustomModelRequest;
 mod history;
 mod panels;
 mod viewport;
@@ -27,8 +33,8 @@ use crate::encounters::{enemy_chances, DungeonType, EncounterTable, EnemyChance}
 use crate::project::CellCategory;
 use crate::render::{RoomOutline, ViewSettings, ViewportTarget};
 use crate::scene::{
-    ActionMotion, ObjectAction, ObjectId, PrefabMember, Scene, SceneObject, SceneObjectKind,
-    ADDED_OBJECTS_GROUP, OPEN_DOOR_ACTION, OUTSIDE_CELL_TOLERANCE,
+    quarter_of, ActionMotion, ObjectAction, ObjectFolder, ObjectId, PrefabMember, Scene, SceneObject,
+    SceneObjectKind, OPEN_DOOR_ACTION, OUTSIDE_CELL_TOLERANCE,
 };
 use asset_palette::{AssetPalette, PREFAB_COLOR, PREFAB_MARK};
 use history::{EditHistory, SceneEdit};
@@ -165,8 +171,28 @@ pub struct RoomEditor {
     dungeon_identity: Option<DungeonIdentity>,
     /// The cell's doors (object indexes) the game switches off, refreshed every frame.
     switched_off_doors: Vec<usize>,
-    /// The name typed for a new prefab in a right-click menu.
-    prefab_name: String,
+    /// What is typed in the open right-click menu.
+    menu_text: ObjectMenuText,
+    /// Whether the rename typed in the open right-click menu has its undo step yet.
+    rename_recorded: bool,
+    /// The name typed for an object list in its right-click menu in the outliner.
+    folder_rename: String,
+    /// The object clicked last without Shift, where Shift+click in the
+    /// outliner selects from. Kept by id, so edits to the cell do not move it.
+    selection_anchor: Option<ObjectId>,
+    /// The outliner's rows drawn this frame, in order (rows under a closed heading are not drawn).
+    outliner_shown: Vec<usize>,
+    /// A row clicked in the outliner this frame and the keys held, handled
+    /// once every row is drawn.
+    outliner_click: Option<(usize, egui::Modifiers)>,
+}
+
+/// A heading of the outliner.
+pub(super) enum OutlinerSection {
+    /// An object list the user made.
+    Folder(ObjectFolder),
+    /// A quarter of the cell (a group index), for the objects in no object list.
+    Quarter(usize),
 }
 
 /// The cells around the edited one in a dungeon, shown faded for context.
@@ -240,42 +266,194 @@ pub(super) struct ObjectMenuInfo {
     selected: usize,
     /// Whether the selected objects can become a prefab: several, not all one prefab already.
     can_create_prefab: bool,
+    /// Whether the menu can rename what is selected: one object, or one prefab.
+    can_rename: bool,
+    /// The name of the object list the object is in, if it is in one.
+    folder: Option<String>,
+}
+
+/// What is typed in an object's right-click menu, kept while it is open.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ObjectMenuText {
+    /// The new name of the object, or of the prefab it is part of.
+    pub rename: String,
+    /// The name of a new prefab.
+    pub prefab_name: String,
+    /// The name of a new object list.
+    pub list_name: String,
 }
 
 /// What the user chose in an object's right-click menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ObjectMenuChoice {
+    /// The name typed under Rename changed: rename the object (or its prefab) to it.
+    Rename,
+    Duplicate,
+    Delete,
+    /// Select every object inside the box of what is selected.
+    SelectAllWithin,
     TieAction,
     RemoveActions,
     /// Make the selected objects a prefab, called as typed in the menu.
     CreatePrefab,
     /// Turn the prefab the object is part of back into separate objects.
     BreakPrefab,
+    /// Put every object inside the box of what is selected in a new object list, called as typed.
+    CreateObjectList,
+    /// Take the selected objects out of their object lists.
+    LeaveObjectList,
+}
+
+/// What the user chose in an object list's right-click menu in the outliner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FolderMenuChoice {
+    /// The name typed under Rename changed.
+    Rename,
+    SelectAll,
+    Delete,
+}
+
+/// Marks the object lists the user made, in the outliner.
+pub(super) const FOLDER_MARK: &str = "🗀";
+
+/// Draws the entries of the right-click menu of the object list `folder`;
+/// `name` is the name typed for it. Returns the user's choice.
+pub(super) fn folder_menu(
+    ui: &mut egui::Ui,
+    folder: &ObjectFolder,
+    name: &mut String,
+) -> Option<FolderMenuChoice> {
+    let mut choice = None;
+    ui.label(egui::RichText::new(format!("{FOLDER_MARK} {}", folder.name)).weak());
+    ui.horizontal(|ui| {
+        ui.label("Rename");
+        let field = ui.add(egui::TextEdit::singleline(name).desired_width(150.0));
+        if field.changed() {
+            choice = Some(FolderMenuChoice::Rename);
+        }
+        if field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            ui.close_menu();
+        }
+    });
+    if ui.button("Select All").on_hover_text("Selects every object in the list").clicked() {
+        choice = Some(FolderMenuChoice::SelectAll);
+    }
+    let hover = "Removes the list; its objects stay in the cell, listed by the quarter they are in again";
+    if ui.button("Delete List").on_hover_text(hover).clicked() {
+        choice = Some(FolderMenuChoice::Delete);
+    }
+    if choice.is_some_and(|choice| choice != FolderMenuChoice::Rename) {
+        ui.close_menu();
+    }
+    choice
 }
 
 /// Draws the entries of an object's right-click menu: what can be done with
 /// the object, or with the prefab it is part of, and with the selection when
-/// several objects are selected. `prefab_name` is the name typed for a new
-/// prefab. Returns the user's choice.
+/// several objects are selected. `text` holds what is typed in the menu.
+/// Returns the user's choice.
 pub(super) fn object_menu(
     ui: &mut egui::Ui,
     info: &ObjectMenuInfo,
-    prefab_name: &mut String,
+    text: &mut ObjectMenuText,
 ) -> Option<ObjectMenuChoice> {
     let mut choice = None;
+    let several = info.selected > 1;
     match &info.prefab {
         Some(prefab) => {
             ui.label(egui::RichText::new(format!("{PREFAB_MARK} Prefab: {prefab}")).color(PREFAB_COLOR));
+        }
+        None if several => {
+            ui.label(egui::RichText::new(format!("{} objects selected", info.selected)).weak());
+        }
+        None => {
+            ui.label(egui::RichText::new(&info.name).weak());
+        }
+    }
+
+    // What can be done with any selection.
+    if info.can_rename {
+        ui.horizontal(|ui| {
+            ui.label("Rename");
+            let hover = match info.prefab {
+                Some(_) => "The prefab's name, as the outliner and the pointer show it",
+                None => "The object's name, as the outliner shows it",
+            };
+            let field = ui
+                .add(egui::TextEdit::singleline(&mut text.rename).desired_width(150.0))
+                .on_hover_text(hover);
+            if field.changed() {
+                choice = Some(ObjectMenuChoice::Rename);
+            }
+            if field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                ui.close_menu();
+            }
+        });
+    }
+    let what = match (&info.prefab, several) {
+        (Some(_), _) => "the prefab",
+        (None, true) => "the selected objects",
+        (None, false) => "the object",
+    };
+    let duplicate = egui::Button::new("Duplicate").shortcut_text("Ctrl+D");
+    if ui
+        .add(duplicate)
+        .on_hover_text(format!("Adds a copy of {what} next to it, and selects the copy"))
+        .clicked()
+    {
+        choice = Some(ObjectMenuChoice::Duplicate);
+    }
+    let delete = egui::Button::new("Delete").shortcut_text("Del");
+    if ui.add(delete).on_hover_text(format!("Removes {what} from the cell; Ctrl+Z brings it back")).clicked()
+    {
+        choice = Some(ObjectMenuChoice::Delete);
+    }
+    let within = match (&info.prefab, several) {
+        (Some(_), _) => "the box around the prefab (the green one)",
+        (None, true) => "the box around the selected objects",
+        (None, false) => "the object's box (the one drawn around it when it is selected)",
+    };
+    let included = if several || info.prefab.is_some() { "the selection" } else { "the object" };
+    if ui
+        .button("Select All Within")
+        .on_hover_text(format!("Selects every object whose middle is inside {within}, {included} included"))
+        .clicked()
+    {
+        choice = Some(ObjectMenuChoice::SelectAllWithin);
+    }
+
+    // Object lists.
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("List name");
+        ui.add(egui::TextEdit::singleline(&mut text.list_name).desired_width(130.0))
+            .on_hover_text("The name of the new object list");
+    });
+    let hover = format!(
+        "Puts every object whose middle is inside {within}, {included} included, in a new object list: a folder \
+         in the outliner, to keep the cell organised. The game never sees object lists."
+    );
+    if ui.button("Create Object List").on_hover_text(hover).clicked() {
+        choice = Some(ObjectMenuChoice::CreateObjectList);
+    }
+    if let Some(folder) = &info.folder {
+        let hover = "Takes the selected objects out of their object lists; they stay in the cell";
+        if ui.button(format!("Remove from {FOLDER_MARK} {folder}")).on_hover_text(hover).clicked() {
+            choice = Some(ObjectMenuChoice::LeaveObjectList);
+        }
+    }
+
+    match &info.prefab {
+        Some(_) => {
+            ui.separator();
             let hover = "Turns the prefab back into separate objects, each of which can then be changed";
             if ui.button("Break Prefab").on_hover_text(hover).clicked() {
                 choice = Some(ObjectMenuChoice::BreakPrefab);
             }
         }
-        None if info.selected > 1 => {
-            ui.label(egui::RichText::new(format!("{} objects selected", info.selected)).weak());
-        }
+        None if several => {}
         None => {
-            ui.label(egui::RichText::new(&info.name).weak());
+            ui.separator();
             if info.can_tie
                 && ui
                     .button("Tie action to…")
@@ -300,7 +478,7 @@ pub(super) fn object_menu(
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Name");
-            ui.add(egui::TextEdit::singleline(prefab_name).desired_width(140.0))
+            ui.add(egui::TextEdit::singleline(&mut text.prefab_name).desired_width(140.0))
                 .on_hover_text("The name of the new prefab");
         });
         let hover = format!(
@@ -312,7 +490,8 @@ pub(super) fn object_menu(
             choice = Some(ObjectMenuChoice::CreatePrefab);
         }
     }
-    if choice.is_some() {
+    // The menu stays open while a name is typed.
+    if choice.is_some_and(|choice| choice != ObjectMenuChoice::Rename) {
         ui.close_menu();
     }
     choice
@@ -360,7 +539,12 @@ impl RoomEditor {
             dungeon_context: None,
             dungeon_identity: None,
             switched_off_doors: Vec::new(),
-            prefab_name: String::new(),
+            menu_text: ObjectMenuText::default(),
+            rename_recorded: false,
+            folder_rename: String::new(),
+            selection_anchor: None,
+            outliner_shown: Vec::new(),
+            outliner_click: None,
         };
         editor.frame_room(library);
         if let Some((minimum, _)) = editor.scene.bounds(library) {
@@ -612,12 +796,27 @@ impl RoomEditor {
             prefab: object.prefab.as_ref().map(|member| member.name.clone()),
             selected: selected.len(),
             can_create_prefab: selected.len() > 1 && self.selected_prefab().is_none(),
+            can_rename: selected.len() <= 1 || self.selected_prefab().is_some(),
+            folder: object.folder.as_ref().map(|folder| folder.name.clone()),
         })
     }
 
-    /// Gets a right-click menu ready to open: the name it offers a new prefab.
-    pub(super) fn prepare_object_menu(&mut self, resources: &EditorResources<'_>) {
-        self.prefab_name = resources.prefabs.new_name();
+    /// Gets the right-click menu of object `index` ready to open: the name it
+    /// shows to rename the object (or its prefab), and the one it offers a new prefab.
+    pub(super) fn prepare_object_menu(&mut self, index: Option<usize>, resources: &EditorResources<'_>) {
+        let object = index.and_then(|index| self.scene.objects.get(index));
+        self.menu_text = ObjectMenuText {
+            rename: match object {
+                Some(SceneObject { prefab: Some(member), .. }) => member.name.clone(),
+                Some(object) => {
+                    panels::object_display_name(object, resources.custom_names, resources.catalog)
+                }
+                None => String::new(),
+            },
+            prefab_name: resources.prefabs.new_name(),
+            list_name: self.scene.new_folder_name(),
+        };
+        self.rename_recorded = false;
     }
 
     /// Carries out the choice made in the right-click menu of object `index`.
@@ -628,11 +827,72 @@ impl RoomEditor {
         resources: &mut EditorResources<'_>,
     ) {
         match choice {
+            ObjectMenuChoice::Rename => self.rename_from_menu(index),
+            ObjectMenuChoice::Duplicate => self.duplicate_selection(),
+            ObjectMenuChoice::Delete => self.delete_selection(),
+            ObjectMenuChoice::SelectAllWithin => self.select_all_within(index, resources),
             ObjectMenuChoice::TieAction => self.start_tying(index, resources),
             ObjectMenuChoice::RemoveActions => self.remove_actions_triggering(index, resources),
             ObjectMenuChoice::CreatePrefab => self.create_prefab(resources),
             ObjectMenuChoice::BreakPrefab => self.break_prefab(index),
+            ObjectMenuChoice::CreateObjectList => self.create_object_list(index, resources),
+            ObjectMenuChoice::LeaveObjectList => self.leave_object_lists(),
         }
+    }
+
+    /// Carries out the choice made in the right-click menu of the object list `id`.
+    pub(super) fn apply_folder_menu(&mut self, choice: FolderMenuChoice, id: u32) {
+        let members = self.scene.folder_members(id);
+        match choice {
+            FolderMenuChoice::Rename => {
+                if !self.can_edit() {
+                    return;
+                }
+                if !self.rename_recorded {
+                    self.record_replacements(&members);
+                    self.rename_recorded = true;
+                }
+                for &index in &members {
+                    if let Some(folder) = self.scene.objects[index].folder.as_mut() {
+                        folder.name = self.folder_rename.clone();
+                    }
+                }
+                self.status_message = format!("Renamed the object list to {}", self.folder_rename.trim());
+            }
+            FolderMenuChoice::SelectAll => {
+                self.status_message = format!("Selected the {} objects of the list", members.len());
+                self.select_objects(members);
+                self.viewport.selection_changed_in_viewport = true;
+            }
+            FolderMenuChoice::Delete => {
+                if !self.can_edit() {
+                    return;
+                }
+                self.record_replacements(&members);
+                for &index in &members {
+                    self.scene.objects[index].folder = None;
+                }
+                self.status_message = format!(
+                    "Removed the object list; its {} objects are listed by quarter again",
+                    members.len()
+                );
+            }
+        }
+    }
+
+    /// Gets the right-click menu of the object list `folder` ready to open.
+    pub(super) fn prepare_folder_menu(&mut self, folder: &ObjectFolder) {
+        self.folder_rename = folder.name.clone();
+        self.rename_recorded = false;
+    }
+
+    /// Records, as one undo step, the objects `indices` as they are, before they are changed.
+    fn record_replacements(&mut self, indices: &[usize]) {
+        let reverts = indices
+            .iter()
+            .map(|&index| SceneEdit::Replace { index, object: self.scene.objects[index].clone() })
+            .collect();
+        self.history.record(SceneEdit::Group(reverts));
     }
 
     /// The placed prefab that is selected, when the selection is exactly one
@@ -654,7 +914,7 @@ impl RoomEditor {
             self.status_message = "Select at least two objects to make a prefab of them".to_string();
             return;
         }
-        let name = match self.prefab_name.trim() {
+        let name = match self.menu_text.prefab_name.trim() {
             "" => resources.prefabs.new_name(),
             name => name.to_string(),
         };
@@ -693,6 +953,156 @@ impl RoomEditor {
             "Created the prefab {name} from {} objects; it is in the Prefabs tab of the asset palette",
             indices.len()
         );
+    }
+
+    /// Renames object `index` (or the placed prefab it is part of) to the name
+    /// typed in its right-click menu. The whole rename, however many letters
+    /// are typed, is one undo step. A model given a blank name goes back to
+    /// being listed by its model's name, and other objects to their usual name.
+    fn rename_from_menu(&mut self, index: usize) {
+        let Some(object) = self.scene.objects.get(index) else { return };
+        let indices = match &object.prefab {
+            Some(member) => self.scene.prefab_members(member.instance),
+            None => vec![index],
+        };
+        if !self.can_edit() {
+            return;
+        }
+        let name = self.menu_text.rename.clone();
+        if !self.rename_recorded {
+            let reverts = indices
+                .iter()
+                .map(|&index| SceneEdit::Replace { index, object: self.scene.objects[index].clone() })
+                .collect();
+            self.history.record(SceneEdit::Group(reverts));
+            self.rename_recorded = true;
+        }
+        for &index in &indices {
+            let object = &mut self.scene.objects[index];
+            match object.prefab.as_mut() {
+                Some(member) => member.name = name.clone(),
+                None if name.trim().is_empty() => object.name = default_object_name(object),
+                None => object.name = name.clone(),
+            }
+        }
+        let what = if indices.len() > 1 { "the prefab" } else { "the object" };
+        self.status_message = format!("Renamed {what} to {}", name.trim());
+    }
+
+    /// The objects whose middle is inside the box of what is selected (`index`
+    /// was right-clicked): one model's own box, turned with it, or the box
+    /// around a prefab or several objects. Only objects the view shows count;
+    /// prefabs the box reaches into come whole. Returns them, what was
+    /// selected first and `index` last, or `None` for a lone flat or light,
+    /// which has no box.
+    fn objects_within(&self, index: usize, library: &mut Arena2Library) -> Option<Vec<usize>> {
+        let selected = self.selected_indices();
+        let object = self.scene.objects.get(index)?;
+        let contains: Box<dyn Fn(Vec3) -> bool> = match (selected.len(), &object.kind) {
+            (0 | 1, SceneObjectKind::Model { model_id, .. }) => {
+                let mesh = library.model(*model_id)?;
+                let to_local = object.model_matrix().inverse();
+                let (minimum, maximum) = (
+                    mesh.bounds_min - Vec3::splat(BOX_TOLERANCE),
+                    mesh.bounds_max + Vec3::splat(BOX_TOLERANCE),
+                );
+                Box::new(move |point| {
+                    let local = to_local.transform_point3(point);
+                    local.cmpge(minimum).all() && local.cmple(maximum).all()
+                })
+            }
+            (0 | 1, _) => return None,
+            _ => {
+                let (minimum, maximum) = self.scene.bounds_of(&selected, library)?;
+                let (minimum, maximum) =
+                    (minimum - Vec3::splat(BOX_TOLERANCE), maximum + Vec3::splat(BOX_TOLERANCE));
+                Box::new(move |point| point.cmpge(minimum).all() && point.cmple(maximum).all())
+            }
+        };
+        let mut found: Vec<usize> = selected;
+        for (other, candidate) in self.scene.objects.iter().enumerate() {
+            if !found.contains(&other)
+                && self.is_shown(candidate)
+                && contains(object_middle(candidate, library))
+            {
+                found.push(other);
+            }
+        }
+        found.retain(|&other| other != index);
+        found.push(index);
+        Some(self.with_whole_prefabs(found))
+    }
+
+    /// Selects every object inside the box of what is selected (see
+    /// [`Self::objects_within`]); what was selected stays selected.
+    fn select_all_within(&mut self, index: usize, resources: &mut EditorResources<'_>) {
+        let before = self.selected_indices().len().max(1);
+        let Some(found) = self.objects_within(index, resources.library) else {
+            self.status_message =
+                "Only models have a box to select within; right-click a model, a prefab or several objects"
+                    .to_string();
+            return;
+        };
+        let total = found.len();
+        self.select_objects(found);
+        self.viewport.selection_changed_in_viewport = true;
+        self.status_message = format!(
+            "Selected {total} objects within the box ({} more than before)",
+            total.saturating_sub(before)
+        );
+    }
+
+    /// Puts every object inside the box of what is selected (see
+    /// [`Self::objects_within`]; a lone flat or light on its own) in a new
+    /// object list, called as typed in the right-click menu, and selects them.
+    /// Objects already in a list move to the new one. One undo step.
+    fn create_object_list(&mut self, index: usize, resources: &mut EditorResources<'_>) {
+        let members =
+            self.objects_within(index, resources.library).unwrap_or_else(|| self.selected_indices());
+        if members.is_empty() || !self.can_edit() {
+            return;
+        }
+        let name = match self.menu_text.list_name.trim() {
+            "" => self.scene.new_folder_name(),
+            name => name.to_string(),
+        };
+        let folder = ObjectFolder { id: self.scene.new_folder_id(), name: name.clone() };
+        self.record_replacements(&members);
+        for &index in &members {
+            self.scene.objects[index].folder = Some(folder.clone());
+        }
+        self.status_message = format!("Made the object list {name} of {} objects", members.len());
+        self.select_objects(members);
+        self.viewport.selection_changed_in_viewport = true;
+    }
+
+    /// Takes the selected objects out of their object lists (one undo step).
+    fn leave_object_lists(&mut self) {
+        let indices: Vec<usize> = self
+            .selected_indices()
+            .into_iter()
+            .filter(|&index| self.scene.objects[index].folder.is_some())
+            .collect();
+        if indices.is_empty() || !self.can_edit() {
+            return;
+        }
+        self.record_replacements(&indices);
+        for &index in &indices {
+            self.scene.objects[index].folder = None;
+        }
+        self.status_message = format!("Took {} objects out of their object lists", indices.len());
+    }
+
+    /// Whether the view shows `object`: it is visible, and its kind is shown (View menu).
+    pub(super) fn is_shown(&self, object: &SceneObject) -> bool {
+        let settings = &self.view_settings;
+        object.visible
+            && match object.kind {
+                SceneObjectKind::Model { .. } => settings.show_models,
+                SceneObjectKind::Flat { .. } if object.is_marker() => settings.show_markers,
+                SceneObjectKind::Flat { .. } => settings.show_flats,
+                SceneObjectKind::Light { .. } => settings.show_lights,
+            }
     }
 
     /// Turns the placed prefab object `index` is part of back into separate
@@ -1094,7 +1504,8 @@ impl RoomEditor {
     }
 
     /// Adds object `index` to the selection, or takes it out if it is selected
-    /// (Shift+click); with it, the rest of the prefab it is part of.
+    /// (Ctrl+click, or Shift+click in the viewport); with it, the rest of the
+    /// prefab it is part of.
     pub(super) fn toggle_selected(&mut self, index: usize) {
         let mut indices = self.selected_indices();
         let prefab = self.scene.prefab_of(index);
@@ -1105,6 +1516,105 @@ impl RoomEditor {
             indices.push(index);
         }
         self.select_objects(indices);
+    }
+
+    /// Shows the Custom Models tab of the asset palette, for example once a model was imported.
+    pub fn show_custom_models(&mut self) {
+        self.palette.show_custom_models();
+    }
+
+    /// What the user asked to do with one of their imported models in the asset palette, once.
+    pub fn take_custom_model_request(&mut self) -> Option<asset_palette::CustomModelRequest> {
+        self.palette.take_model_request()
+    }
+
+    /// Stops placing the imported model `model_id`, which was deleted.
+    pub fn forget_custom_model(&mut self, model_id: u32) {
+        self.palette.forget_model(model_id);
+    }
+
+    /// Makes object `index` the one Shift+click in the outliner selects from.
+    pub(super) fn set_selection_anchor(&mut self, index: usize) {
+        self.selection_anchor = self.scene.objects.get(index).map(|object| object.id);
+    }
+
+    /// The outliner's headings in order, each with its objects in order: the
+    /// object lists the user made, oldest first, then the quarters of the cell
+    /// with the objects in no list.
+    pub(super) fn outliner_sections(&self) -> Vec<(OutlinerSection, Vec<usize>)> {
+        let mut sections: Vec<(OutlinerSection, Vec<usize>)> = self
+            .scene
+            .folders()
+            .into_iter()
+            .map(|folder| {
+                let members = self.scene.folder_members(folder.id);
+                (OutlinerSection::Folder(folder), members)
+            })
+            .collect();
+        let unlisted: Vec<usize> = (0..self.scene.objects.len())
+            .filter(|&index| self.scene.objects[index].folder.is_none())
+            .collect();
+        let mut groups: Vec<usize> =
+            unlisted.iter().map(|&index| self.scene.objects[index].group_index).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        for group_index in groups {
+            let rows = unlisted
+                .iter()
+                .copied()
+                .filter(|&index| self.scene.objects[index].group_index == group_index)
+                .collect();
+            sections.push((OutlinerSection::Quarter(group_index), rows));
+        }
+        sections
+    }
+
+    /// Handles the row clicked in the outliner this frame, once every row is
+    /// drawn: a click selects the row; Ctrl+click adds it to the selection or
+    /// takes it out; Shift+click selects every row shown from the one clicked
+    /// last without Shift to this one (Ctrl+Shift+click adds them).
+    pub(super) fn apply_outliner_click(&mut self) -> bool {
+        let Some((index, modifiers)) = self.outliner_click.take() else { return false };
+        if index >= self.scene.objects.len() {
+            return false;
+        }
+        if !modifiers.shift {
+            match modifiers.command {
+                true => self.toggle_selected(index),
+                false => self.select_objects(vec![index]),
+            }
+            self.set_selection_anchor(index);
+            return true;
+        }
+        let anchor = self
+            .selection_anchor
+            .and_then(|id| self.scene.objects.iter().position(|object| object.id == id))
+            .or(self.selected_object)
+            .filter(|&anchor| anchor < self.scene.objects.len());
+        let order: Vec<usize> = self.outliner_sections().into_iter().flat_map(|(_, rows)| rows).collect();
+        let position = |row: usize| order.iter().position(|&other| other == row);
+        let (Some(anchor), Some(to)) = (anchor, position(index)) else {
+            self.select_objects(vec![index]);
+            self.set_selection_anchor(index);
+            return true;
+        };
+        let from = position(anchor).unwrap_or(to);
+        let mut range: Vec<usize> = order[from.min(to)..=from.max(to)]
+            .iter()
+            .copied()
+            .filter(|row| self.outliner_shown.contains(row) || *row == anchor)
+            .collect();
+        // The row clicked becomes the main selection.
+        range.retain(|&row| row != index);
+        range.push(index);
+        if modifiers.command {
+            let mut selection = self.selected_indices();
+            selection.retain(|row| !range.contains(row));
+            selection.extend(range);
+            range = selection;
+        }
+        self.select_objects(range);
+        true
     }
 
     /// Says in the status bar that this cannot be done with several objects
@@ -1236,8 +1746,9 @@ impl RoomEditor {
     /// Adds copies of `originals`, moved by `offset`, with new ids, as one
     /// undo step, and selects them. Links between the copies follow them;
     /// links to other objects are kept only in the cell they came from
-    /// (`same_cell`), where those objects are. In another cell the copies go
-    /// into the list of added objects, as the cell's own lists differ.
+    /// (`same_cell`), where those objects are. Copies are listed by the quarter
+    /// they land in; in another cell, they join the object list of the same
+    /// name as the one they were in, or a new one.
     fn insert_copies(&mut self, originals: &[SceneObject], offset: Vec3, same_cell: bool) {
         let mut next_id = self.scene.new_object_id();
         let ids: std::collections::HashMap<ObjectId, ObjectId> = originals
@@ -1251,14 +1762,33 @@ impl RoomEditor {
         // Copied prefabs are placed prefabs of their own, apart from the originals.
         let mut next_prefab = self.scene.new_prefab_instance();
         let mut prefabs = std::collections::HashMap::new();
+        // In another cell, copies join the object list of the same name, or a new one.
+        let known_folders = self.scene.folders();
+        let mut next_folder = self.scene.new_folder_id();
+        let mut folders: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         let start = self.scene.objects.len();
         for original in originals {
             let mut copy = original.clone();
             copy.id = ids[&original.id];
             copy.next = original.next.and_then(|next| ids.get(&next).copied().or(same_cell.then_some(next)));
             copy.position += offset;
-            if !same_cell {
-                copy.group_index = ADDED_OBJECTS_GROUP;
+            copy.group_index = quarter_of(copy.position);
+            if let (false, Some(folder)) = (same_cell, copy.folder.as_mut()) {
+                let id = match folders.get(&folder.id) {
+                    Some(&id) => id,
+                    None => {
+                        let same_name = known_folders
+                            .iter()
+                            .find(|known| known.name.trim().eq_ignore_ascii_case(folder.name.trim()));
+                        let id = same_name.map(|known| known.id).unwrap_or_else(|| {
+                            next_folder += 1;
+                            next_folder - 1
+                        });
+                        folders.insert(folder.id, id);
+                        id
+                    }
+                };
+                folder.id = id;
             }
             if let Some(member) = copy.prefab.as_mut() {
                 member.instance = *prefabs.entry(member.instance).or_insert_with(|| {
@@ -1323,6 +1853,7 @@ impl RoomEditor {
             let object = &mut self.scene.objects[index];
             let from_middle = object.position - middle;
             object.position = middle + turn * from_middle;
+            object.group_index = quarter_of(object.position);
             if matches!(object.kind, SceneObjectKind::Model { .. }) {
                 object.set_rotation(turn * object.rotation());
             }
@@ -1354,6 +1885,29 @@ impl RoomEditor {
         }
         let count = self.scene.objects.len();
         self.selection_set.retain(|&index| index < count);
+    }
+}
+
+/// How far past a box an object's middle may be and still count as inside it, in world units.
+const BOX_TOLERANCE: f32 = 0.01;
+
+/// The middle of `object` in the cell: the middle of a model's box, or where a flat or light is.
+pub(super) fn object_middle(object: &SceneObject, library: &mut Arena2Library) -> Vec3 {
+    match object.kind {
+        SceneObjectKind::Model { model_id, .. } => library
+            .model(model_id)
+            .map_or(object.position, |mesh| object.model_matrix().transform_point3(mesh.bounds_center())),
+        _ => object.position,
+    }
+}
+
+/// The name an object is given when its name is cleared: a model's default
+/// name (so it is listed by its model's name), a flat's description, or "Light".
+fn default_object_name(object: &SceneObject) -> String {
+    match object.kind {
+        SceneObjectKind::Model { model_id, .. } => crate::scene::default_model_object_name(model_id),
+        SceneObjectKind::Flat { texture, .. } => crate::catalog::flat_description(texture),
+        SceneObjectKind::Light { .. } => "Light".to_string(),
     }
 }
 

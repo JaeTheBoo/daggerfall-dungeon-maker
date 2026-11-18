@@ -209,9 +209,11 @@ impl DungeonTextures {
 /// and tapestries and banners without an action, keep the standard ones.
 pub fn uses_dungeon_textures(object: &SceneObject) -> bool {
     match object.kind {
+        // The user's imported models keep their own materials, in the game too.
         SceneObjectKind::Model { model_id, .. } => {
             model_id != EXIT_DOOR_MODEL_ID
                 && !(TAPESTRY_MODEL_IDS.contains(&model_id) && !object.has_action())
+                && !crate::custom_models::is_custom_model(model_id)
         }
         _ => false,
     }
