@@ -3,10 +3,11 @@
 //! A toggle at the very top chooses between **Dungeons** and **Settlements**.
 //! For dungeons, a switch below shows either **Dungeons** or **Cells**
 //! (rooms), and a toggle shows or hides Daggerfall's own. For settlements, it
-//! shows either **Settlements** (every location of the world: towns, homes,
-//! temples, dungeon entrances…, by region and type) or **Cells** (the outdoor
-//! cells, RMB blocks, they are built from, by kind); these are Daggerfall's
-//! own and open read-only. The **Daggerfall** list holds the
+//! shows **Settlements** (every location of the world: towns, homes,
+//! temples, dungeon entrances…, by region and type), **Cells** (the outdoor
+//! cells, RMB blocks, they are built from, by kind) or **Interiors** (the
+//! insides of the cells' buildings, by type and cell kind); these are
+//! Daggerfall's own and open read-only. The **Daggerfall** list holds the
 //! game's own dungeons (grouped by region) or rooms; they open read-only.
 //! Below it are the project's own: loose at the top level, or in folders the
 //! user creates (folders show in both, with what they hold of each kind).
@@ -24,8 +25,11 @@ use std::sync::Arc;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
+use super::interior_view::InteriorKey;
 use super::room_browser::category_description;
-use crate::arena2::{rmb_block_kind, DungeonDefinition, LocationDefinition, LocationType, RMB_BLOCK_KINDS};
+use crate::arena2::{
+    building_type_name, rmb_block_kind, DungeonDefinition, LocationDefinition, LocationType, RMB_BLOCK_KINDS,
+};
 use crate::custom_names::CustomNames;
 use crate::project::{ItemId, Project, ProjectEntry};
 
@@ -46,6 +50,8 @@ pub enum OpenedItem {
     DaggerfallSettlement(usize),
     /// An outdoor cell from Daggerfall, by RMB block name.
     DaggerfallOutdoorCell(String),
+    /// The inside of a building of one of Daggerfall's outdoor cells.
+    DaggerfallInterior(InteriorKey),
     /// A room or dungeon of the project.
     Project(ItemId),
 }
@@ -110,6 +116,10 @@ struct LocationRegion {
     kinds: Vec<(&'static str, Vec<usize>)>,
 }
 
+/// The buildings of one type, by cell kind: the type's name, and each kind's
+/// name with its buildings (as indices into the panel's list of interiors).
+type InteriorGroup = (String, Vec<(&'static str, Vec<usize>)>);
+
 /// Location types in the order the panel lists them, with their plural names.
 const LOCATION_KINDS: [(Option<LocationType>, &str); 16] = [
     (Some(LocationType::City), "Cities"),
@@ -140,12 +150,14 @@ pub enum PanelSection {
     Settlements,
     /// The outdoor cells (RMB blocks) locations are built from.
     OutdoorCells,
+    /// The insides of the outdoor cells' buildings.
+    Interiors,
 }
 
 impl PanelSection {
     /// Whether the section is one of the settlements' (rather than the dungeons').
     pub fn is_outdoor(self) -> bool {
-        matches!(self, Self::Settlements | Self::OutdoorCells)
+        matches!(self, Self::Settlements | Self::OutdoorCells | Self::Interiors)
     }
 
     /// The section listing `entry`, or `None` for folders, which show in both.
@@ -196,6 +208,10 @@ pub struct ProjectPanel {
     outdoor_kinds: Vec<(&'static str, Vec<usize>)>,
     /// The locations using each outdoor cell, as indices into `locations`.
     outdoor_usage: Arc<HashMap<String, Vec<usize>>>,
+    /// Every building with an inside, with its type.
+    interiors: Vec<(InteriorKey, u8)>,
+    /// The same by building type (by name), then by cell kind, as indices into `interiors`.
+    interior_groups: Vec<InteriorGroup>,
 }
 
 impl Default for ProjectPanel {
@@ -215,6 +231,8 @@ impl Default for ProjectPanel {
             outdoor_cells: Vec::new(),
             outdoor_kinds: Vec::new(),
             outdoor_usage: Arc::default(),
+            interiors: Vec::new(),
+            interior_groups: Vec::new(),
         }
     }
 }
@@ -281,6 +299,30 @@ impl ProjectPanel {
         self.outdoor_usage = usage;
     }
 
+    /// Sets the buildings with an inside listed under Interiors, with their types.
+    pub fn set_interiors(&mut self, interiors: Vec<(InteriorKey, u8)>) {
+        let mut types: Vec<u8> = interiors.iter().map(|(_, building_type)| *building_type).collect();
+        types.sort_unstable();
+        types.dedup();
+        self.interior_groups = types
+            .into_iter()
+            .map(|building_type| {
+                let mut kinds: Vec<(&'static str, Vec<usize>)> = Vec::new();
+                for (index, (key, _)) in
+                    interiors.iter().enumerate().filter(|(_, (_, kind))| *kind == building_type)
+                {
+                    let kind = rmb_block_kind(&key.block);
+                    match kinds.iter_mut().find(|(known, _)| *known == kind) {
+                        Some((_, indices)) => indices.push(index),
+                        None => kinds.push((kind, vec![index])),
+                    }
+                }
+                (building_type_name(building_type), kinds)
+            })
+            .collect();
+        self.interiors = interiors;
+    }
+
     /// Why a new item of the section shown cannot be called `name`, if it cannot:
     /// the name is taken by something in the project, or by one of Daggerfall's
     /// own dungeons or cells of the same kind.
@@ -298,13 +340,14 @@ impl ProjectPanel {
             PanelSection::Cells => self.room_names.iter().any(|block| {
                 block.eq_ignore_ascii_case(name) || block.trim_end_matches(".RDB").eq_ignore_ascii_case(name)
             }),
-            PanelSection::Settlements | PanelSection::OutdoorCells => false,
+            PanelSection::Settlements | PanelSection::OutdoorCells | PanelSection::Interiors => false,
         };
         let kind = match self.view.section {
             PanelSection::Dungeons => "dungeon",
             PanelSection::Cells => "cell",
             PanelSection::Settlements => "settlement",
             PanelSection::OutdoorCells => "outdoor cell",
+            PanelSection::Interiors => "interior",
         };
         taken_in_daggerfall.then(|| format!("Daggerfall already has a {kind} called \"{name}\""))
     }
@@ -339,6 +382,7 @@ impl ProjectPanel {
                 Some(OpenedItem::DaggerfallRoom(_)) => Some(PanelSection::Cells),
                 Some(OpenedItem::DaggerfallSettlement(_)) => Some(PanelSection::Settlements),
                 Some(OpenedItem::DaggerfallOutdoorCell(_)) => Some(PanelSection::OutdoorCells),
+                Some(OpenedItem::DaggerfallInterior(_)) => Some(PanelSection::Interiors),
                 Some(OpenedItem::Project(id)) => project.find(*id).and_then(PanelSection::of),
                 None => None,
             };
@@ -553,6 +597,11 @@ impl ProjectPanel {
                     "Cells",
                     "List the outdoor cells (RMB blocks) locations are built from",
                 ),
+                (
+                    PanelSection::Interiors,
+                    "Interiors",
+                    "List the insides of the outdoor cells' buildings, by type and cell kind",
+                ),
             ] {
                 let selected = self.view.section == section;
                 let text = egui::RichText::new(name).strong();
@@ -563,6 +612,7 @@ impl ProjectPanel {
         });
         let hint = match self.view.section {
             PanelSection::Settlements => "Search by name, region or type",
+            PanelSection::Interiors => "Search by cell, building type or cell kind",
             _ => "Search by cell, kind or your name",
         };
         ui.add_sized(
@@ -584,6 +634,7 @@ impl ProjectPanel {
                 }
                 match section {
                     PanelSection::Settlements => self.show_settlement_list(ui, &search, opened, action),
+                    PanelSection::Interiors => self.show_interior_list(ui, &search, custom_names, opened, action),
                     _ => self.show_outdoor_cell_list(ui, &search, custom_names, opened, action),
                 }
                 ui.add_space(6.0);
@@ -709,6 +760,95 @@ impl ProjectPanel {
                 }
             },
         );
+    }
+
+    /// Draws the buildings with an inside: by type and cell kind, or the matches of `search`.
+    fn show_interior_list(
+        &self,
+        ui: &mut egui::Ui,
+        search: &str,
+        custom_names: &CustomNames,
+        opened: Option<&OpenedItem>,
+        action: &mut Option<PanelAction>,
+    ) {
+        if !search.is_empty() {
+            let matches = self.interiors.iter().filter(|(key, building_type)| {
+                key.block.to_lowercase().contains(search)
+                    || building_type_name(*building_type).to_lowercase().contains(search)
+                    || rmb_block_kind(&key.block).to_lowercase().contains(search)
+                    || custom_names.room_name_matches(&key.block, search)
+            });
+            show_limited(ui, matches, |ui, (key, building_type)| {
+                self.show_interior_row(ui, key, *building_type, true, custom_names, opened, action)
+            });
+            return;
+        }
+        let header = format!("Daggerfall ({})", self.interiors.len());
+        egui::CollapsingHeader::new(header).id_salt("daggerfall_interiors").default_open(true).show(
+            ui,
+            |ui| {
+                for (type_name, kinds) in &self.interior_groups {
+                    let count: usize = kinds.iter().map(|(_, indices)| indices.len()).sum();
+                    egui::CollapsingHeader::new(format!("{type_name} ({count})"))
+                        .id_salt(("interior_type", type_name.as_str()))
+                        .show(ui, |ui| {
+                            for (kind, indices) in kinds {
+                                egui::CollapsingHeader::new(format!("{kind} ({})", indices.len()))
+                                    .id_salt(("interior_kind", type_name.as_str(), *kind))
+                                    .show(ui, |ui| {
+                                        for &index in indices {
+                                            let (key, building_type) = &self.interiors[index];
+                                            self.show_interior_row(
+                                                ui,
+                                                key,
+                                                *building_type,
+                                                false,
+                                                custom_names,
+                                                opened,
+                                                action,
+                                            );
+                                        }
+                                    });
+                            }
+                        });
+                }
+            },
+        );
+    }
+
+    /// Draws one building row: its cell and place there; `show_type` adds its type, for search results.
+    #[allow(clippy::too_many_arguments)]
+    fn show_interior_row(
+        &self,
+        ui: &mut egui::Ui,
+        key: &InteriorKey,
+        building_type: u8,
+        show_type: bool,
+        custom_names: &CustomNames,
+        opened: Option<&OpenedItem>,
+        action: &mut Option<PanelAction>,
+    ) {
+        let mut label = key.label();
+        if let Some(custom_name) = custom_names.room_name(&key.block) {
+            label = format!("{label}   {custom_name}");
+        }
+        if show_type {
+            label = format!("{label}   ·   {}", building_type_name(building_type));
+        }
+        let users = self.outdoor_usage.get(&key.block).map_or(0, Vec::len);
+        let used = match users {
+            0 => "its cell is used by no location".to_string(),
+            1 => "its cell is used in 1 location".to_string(),
+            count => format!("its cell is used in {count} locations"),
+        };
+        let item = OpenedItem::DaggerfallInterior(key.clone());
+        let response = ui.selectable_label(opened == Some(&item), label).on_hover_text(format!(
+            "{} in {} ({}) · {used}\nDouble-click to open (read-only)",
+            building_type_name(building_type),
+            key.block,
+            rmb_block_kind(&key.block)
+        ));
+        outdoor_item_interaction(&response, item, true, opened, action);
     }
 
     /// Draws one outdoor cell row, with the user's name for it if it has one.
@@ -1297,11 +1437,14 @@ mod tests {
             location_type,
             map_pixel: crate::arena2::MapPixel::new(0, 0),
             location_id: 0,
+            index_in_region: 0,
+            map_id: 0,
             exterior: crate::arena2::LocationExterior {
                 width: 1,
                 height: 1,
                 block_names: vec!["TVRNAL01.RMB".to_string()],
                 buildings: Vec::new(),
+                port_town: false,
             },
             has_dungeon: false,
             discovered: false,

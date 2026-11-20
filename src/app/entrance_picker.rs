@@ -4,8 +4,8 @@
 //! with a dungeon door somewhere in it. Daggerfall's 4,000-odd dungeons share
 //! about 140 of them, so the window groups the dungeons by entrance. The
 //! selected entrance is drawn on its ground, in the climate of the dungeon's
-//! spot on the map (as the game draws it there), with its dungeon door
-//! highlighted.
+//! spot on the map (as the game draws it there), with the model holding its
+//! dungeon door highlighted and a red box round the door.
 
 use std::collections::HashMap;
 
@@ -16,11 +16,12 @@ use super::viewport_tools::{handle_camera_input, paint_scene, size_in_pixels, Ed
 use crate::arena2::{
     Arena2Library, Climate, DoorKind, DungeonDefinition, LocationExterior, Season, RMB_BLOCK_SIDE,
 };
+use crate::buildings::door_boxes;
 use crate::camera::OrbitCamera;
 use crate::exterior::ClimateTextures;
 use crate::project::DungeonReference;
-use crate::render::{FrameRequest, ViewSettings, ViewportTarget};
-use crate::scene::{Scene, SceneObject, SceneObjectKind};
+use crate::render::{EntranceBox, EntranceKind, FrameRequest, ViewSettings, ViewportTarget};
+use crate::scene::{box_corners, Scene, SceneObject, SceneObjectKind};
 
 /// Colour of warnings.
 const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 190, 70);
@@ -159,6 +160,8 @@ struct Preview {
     scene: Scene,
     /// Indices of the models with a dungeon door.
     entrance_doors: Vec<usize>,
+    /// The red boxes round the dungeon doors.
+    door_boxes: Vec<EntranceBox>,
     /// Blocks that could not be loaded.
     problems: Vec<String>,
 }
@@ -434,6 +437,8 @@ impl EntrancePicker {
                 dungeon_textures: None,
                 climate_textures: Some(ClimateTextures::new(preview.climate, Season::Summer)),
                 warned_objects: &[],
+                entrance_boxes: &preview.door_boxes,
+                lighting: crate::lighting::GameLighting::Off,
             };
             paint_scene(ui, rect, resources, &mut self.target, &request);
         });
@@ -460,6 +465,7 @@ fn build_preview(
 ) -> Preview {
     let mut objects: Vec<SceneObject> = Vec::new();
     let mut entrance_doors = Vec::new();
+    let mut boxes = Vec::new();
     let mut problems = Vec::new();
     let width = design.exterior.width.max(1);
     for (index, name) in design.exterior.block_names.iter().enumerate() {
@@ -473,24 +479,28 @@ fn build_preview(
             }
         };
         for object in crate::exterior::cell_scene(&block, climate, Season::Summer, 0, library).objects {
+            let object =
+                SceneObject { id: objects.len() as u32 + 1, position: corner + object.position, ..object };
             if let SceneObjectKind::Model { model_id, .. } = object.kind {
-                let is_entrance = library
+                let doors = library
                     .model(model_id)
-                    .and_then(|mesh| mesh.door_kind())
-                    .is_some_and(|kind| kind == DoorKind::DungeonEntrance);
-                if is_entrance {
+                    .map(|mesh| door_boxes(&mesh, DoorKind::DungeonEntrance))
+                    .unwrap_or_default();
+                if !doors.is_empty() {
                     entrance_doors.push(objects.len());
                 }
+                let matrix = object.model_matrix();
+                boxes.extend(doors.into_iter().map(|(minimum, maximum)| EntranceBox {
+                    corners: box_corners(minimum, maximum).map(|corner| matrix.transform_point3(corner)),
+                    highlighted: false,
+                    kind: EntranceKind::DungeonEntrance,
+                }));
             }
-            objects.push(SceneObject {
-                id: objects.len() as u32 + 1,
-                position: corner + object.position,
-                ..object
-            });
+            objects.push(object);
         }
     }
     let scene = Scene { block_name: design.block_list(usize::MAX), objects };
-    Preview { design_index, climate, scene, entrance_doors, problems }
+    Preview { design_index, climate, scene, entrance_doors, door_boxes: boxes, problems }
 }
 
 #[cfg(test)]
@@ -510,6 +520,7 @@ mod tests {
                 height: 1,
                 block_names: blocks.iter().map(|name| name.to_string()).collect(),
                 buildings: Vec::new(),
+                port_town: false,
             }),
             classic: None,
             blocks: Vec::new(),

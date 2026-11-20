@@ -10,11 +10,16 @@ use glam::Vec2;
 use super::blocks::{parse_rdb_block, read_model_tags, RdbBlock};
 use super::bsa::BsaArchive;
 use super::error::{read_file, Arena2Error, Arena2Result};
+use super::factions::{read_factions, Faction};
+use super::flats_cfg::FlatsConfig;
 use super::maps::{
     read_all_dungeons, read_all_location_ids, read_all_locations, DungeonDefinition, LocationDefinition,
 };
 use super::mesh::{parse_model, ModelMesh};
 use super::rmb::{parse_rmb_block, RmbBlock};
+use super::sounds::SoundEffects;
+use super::spells::read_spell_names;
+use super::text::TextRecords;
 use super::texture::{read_archive_name, Palette, RgbaImage, TextureArchive, ARCHIVE_HEADER_SIZE};
 use super::world::WorldMap;
 use super::{TextureKey, WORLD_SCALE};
@@ -36,9 +41,37 @@ const MIDI_FILE: &str = "MIDI.BSA";
 const CLIMATE_FILE: &str = "CLIMATE.PAK";
 /// Palette used by all `TEXTURE.###` files.
 const TEXTURE_PALETTE_FILE: &str = "ART_PAL.COL";
+/// Daggerfall's sound effects. Optional, like the next three files: they
+/// only name what an action plays, shows or casts, and who a person is.
+const SOUNDS_FILE: &str = "DAGGER.SND";
+/// Daggerfall's text records, which some actions show.
+const TEXT_FILE: &str = "TEXT.RSC";
+/// Daggerfall's standard spells, which "Cast spell" actions cast.
+const SPELLS_FILE: &str = "SPELLS.STD";
+/// Daggerfall's factions, which flats of people can name.
+const FACTIONS_FILE: &str = "FACTION.TXT";
+/// What each image of a person shows, and their gender outdoors.
+const FLATS_FILE: &str = "FLATS.CFG";
 
 /// Files that must be present for a folder to be accepted as `ARENA2`.
 pub const REQUIRED_FILES: [&str; 3] = [MODELS_FILE, BLOCKS_FILE, TEXTURE_PALETTE_FILE];
+
+/// What cells' actions and flats refer to by number: the sounds an action
+/// plays, the text records and spells some actions show or cast, and the
+/// factions flats of people belong to. Cheap to clone.
+#[derive(Clone, Default)]
+pub struct GameReferences {
+    /// `DAGGER.SND`, if it was found.
+    pub sounds: Option<Arc<SoundEffects>>,
+    /// `TEXT.RSC`, if it was found.
+    pub texts: Option<Arc<TextRecords>>,
+    /// The name of every spell of `SPELLS.STD`, by its number.
+    pub spells: Arc<std::collections::BTreeMap<u8, String>>,
+    /// The factions of `FACTION.TXT`, by id.
+    pub factions: Arc<std::collections::BTreeMap<u16, Faction>>,
+    /// `FLATS.CFG`: what each image of a person shows (empty if it was not found).
+    pub flats: Arc<FlatsConfig>,
+}
 
 /// Provides access to the game data in an `ARENA2` folder.
 ///
@@ -66,6 +99,8 @@ pub struct Arena2Library {
     world_map_cache: Option<Arc<WorldMap>>,
     model_tag_cache: Option<Arc<HashMap<u32, String>>>,
     location_id_cache: std::sync::OnceLock<Arc<HashSet<u16>>>,
+    /// Sounds, text records, spells and factions, read the first time they are needed.
+    references: std::sync::OnceLock<GameReferences>,
     /// Models the user imported (see [`crate::custom_models`]), shown as if they were Daggerfall's.
     custom_models: HashMap<u32, Arc<ModelMesh>>,
     /// The images of the imported models' materials.
@@ -135,6 +170,7 @@ impl Arena2Library {
             world_map_cache: None,
             model_tag_cache: None,
             location_id_cache: std::sync::OnceLock::new(),
+            references: std::sync::OnceLock::new(),
             custom_models: HashMap::new(),
             custom_textures: HashMap::new(),
             custom_model_files: HashMap::new(),
@@ -313,6 +349,20 @@ impl Arena2Library {
         self.texture_archive(archive).map_or(0, TextureArchive::record_count)
     }
 
+    /// Like [`Self::texture_record_count`], but reads only the archive's
+    /// header, without loading the archive.
+    pub fn texture_record_count_in_header(&self, archive: u16) -> usize {
+        let mut count = [0u8; 2];
+        let read = self
+            .files_by_name
+            .get(&texture_file_name(archive))
+            .and_then(|path| std::fs::File::open(path).and_then(|mut file| file.read_exact(&mut count)).ok());
+        match read {
+            Some(()) => usize::try_from(i16::from_le_bytes(count)).unwrap_or(0),
+            None => 0,
+        }
+    }
+
     /// Returns the identifier of every model in `ARCH3D.BSA`, sorted ascending.
     pub fn model_ids(&self) -> Vec<u32> {
         let mut model_ids: Vec<u32> =
@@ -383,6 +433,44 @@ impl Arena2Library {
         self.location_id_cache
             .get_or_init(|| {
                 Arc::new(self.maps_archive.as_ref().map(read_all_location_ids).unwrap_or_default())
+            })
+            .clone()
+    }
+
+    /// Daggerfall's sounds, text records, spells and factions, which cells'
+    /// actions and flats refer to by number. Read from the folder the first
+    /// time; a file that is missing or does not read is left empty.
+    pub fn references(&self) -> GameReferences {
+        self.references
+            .get_or_init(|| {
+                let read = |name: &str| {
+                    let path = self.files_by_name.get(name)?;
+                    read_file(path).map_err(|error| log::warn!("could not read {name}: {error}")).ok()
+                };
+                let sounds = read(SOUNDS_FILE).and_then(|data| {
+                    SoundEffects::from_bytes(data)
+                        .map_err(|error| log::warn!("could not read {SOUNDS_FILE}: {error}"))
+                        .ok()
+                });
+                let texts = read(TEXT_FILE).and_then(|data| {
+                    TextRecords::from_bytes(&data)
+                        .map_err(|error| log::warn!("could not read {TEXT_FILE}: {error}"))
+                        .ok()
+                });
+                let spells = read(SPELLS_FILE).map(|data| read_spell_names(&data)).unwrap_or_default();
+                let factions = read(FACTIONS_FILE)
+                    .map(|data| read_factions(&String::from_utf8_lossy(&data)))
+                    .unwrap_or_default();
+                let flats = read(FLATS_FILE)
+                    .map(|data| FlatsConfig::parse(&String::from_utf8_lossy(&data)))
+                    .unwrap_or_default();
+                GameReferences {
+                    sounds: sounds.map(Arc::new),
+                    texts: texts.map(Arc::new),
+                    spells: Arc::new(spells),
+                    factions: Arc::new(factions),
+                    flats: Arc::new(flats),
+                }
             })
             .clone()
     }

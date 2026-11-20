@@ -16,6 +16,9 @@ mod dungeon_view;
 mod entrance_picker;
 mod export_window;
 mod exterior_view;
+mod interior_view;
+mod kept_texture;
+mod playtest_ui;
 mod project_panel;
 mod room_browser;
 mod room_editor;
@@ -30,6 +33,7 @@ use glam::Vec3;
 
 use crate::arena2::{Arena2Library, Climate, DungeonDefinition, RDB_BLOCK_SIDE};
 use crate::blender::BlendConversion;
+use crate::buildings::{settlement_buildings, BuildingNamer};
 use crate::catalog::AssetCatalog;
 use crate::connectors::OpeningsLeftOpen;
 use crate::custom_models::CustomModelLibrary;
@@ -42,11 +46,15 @@ use crate::project::{
 };
 use crate::render::{RoomOutline, SceneRenderer};
 use crate::scene::Scene;
+use crate::unity_install::UnityText;
 use arena2_prompt::Arena2Prompt;
 use dungeon_browser::DungeonBrowser;
-use dungeon_view::{DungeonDetails, DungeonPropertiesAction, DungeonView, LocationWindowsRequest};
+use dungeon_view::{
+    DungeonDetails, DungeonIds, DungeonPropertiesAction, DungeonView, LocationWindowsRequest,
+};
 use export_window::{ExportRequest, ExportWindow};
 use exterior_view::{ExteriorDetails, ExteriorOpen, ExteriorSubject, ExteriorView};
+use interior_view::{BuildingPlace, InteriorKey, InteriorOpen, InteriorUse, InteriorView};
 use project_panel::{OpenedItem, PanelAction, ProjectPanel};
 use room_browser::RoomBrowser;
 use room_editor::{ContextCell, ContextDoors, DungeonContext, RoomEditor, UsedInEntry};
@@ -66,6 +74,10 @@ const OPENINGS_STORAGE_KEY: &str = "openings_left_open";
 const EXPORT_SETTINGS_STORAGE_KEY: &str = "export_settings";
 /// Storage key of what the project panel shows.
 const PANEL_VIEW_STORAGE_KEY: &str = "project_panel_view";
+/// Storage key of Daggerfall Unity's install folder (File > Set Daggerfall Unity folder…).
+const UNITY_FOLDER_STORAGE_KEY: &str = "daggerfall_unity_folder";
+/// Size of the window showing a building's inside.
+const INTERIOR_WINDOW_SIZE: [f32; 2] = [1150.0, 740.0];
 /// Storage key under which the last project file is remembered, to reopen it on the next run.
 const PROJECT_FILE_STORAGE_KEY: &str = "project_file";
 /// Storage key of which textures dungeons are drawn with.
@@ -95,6 +107,9 @@ pub struct StartupOptions {
     pub dungeon_name: Option<String>,
     /// Settlement to open once the game data has loaded, for example `Daggerfall`.
     pub settlement_name: Option<String>,
+    /// Building inside to open once the game data has loaded: an outdoor
+    /// cell and the building's place in it (from 1), for example `TVRNAL01.RMB:2`.
+    pub interior: Option<String>,
 }
 
 /// What the main window is showing.
@@ -107,6 +122,8 @@ enum Workspace {
     Dungeon(Box<DungeonView>),
     /// A settlement or an outdoor cell from Daggerfall, read-only.
     Exterior(Box<ExteriorView>),
+    /// The inside of one of Daggerfall's buildings, read-only.
+    Interior(Box<InteriorView>),
 }
 
 /// A room editor running in its own operating system window.
@@ -215,6 +232,9 @@ pub struct DungeonMakerApp {
     dungeon_browser: DungeonBrowser,
     project_panel: ProjectPanel,
     export_window: ExportWindow,
+    /// Testing in Daggerfall Unity: the Test button's questions, the test
+    /// being readied and the game running it.
+    playtest: playtest_ui::PlaytestState,
     /// The learned openings, as saved with the settings.
     stored_openings: Option<StoredOpenings>,
     /// Learning the openings in the background: the folder and where the result arrives.
@@ -238,6 +258,15 @@ pub struct DungeonMakerApp {
     /// The location ids an export gives the project's new dungeons, with what
     /// they were worked out from (each new dungeon and its map pixel).
     new_location_ids: Option<(Vec<NewDungeonPlace>, HashMap<ItemId, u16>)>,
+    /// Daggerfall Unity's install folder, saved with the settings: its word
+    /// lists name the buildings of settlements.
+    unity_folder: Option<PathBuf>,
+    /// Daggerfall Unity's word lists, read from `unity_folder`.
+    unity_text: Option<std::sync::Arc<UnityText>>,
+    /// A building's inside, shown in a window of its own.
+    interior_window: Option<Box<InteriorView>>,
+    /// The settlements using each building, worked out when it is first opened.
+    interior_uses: HashMap<InteriorKey, Vec<InteriorUse>>,
 }
 
 impl DungeonMakerApp {
@@ -321,6 +350,7 @@ impl DungeonMakerApp {
             dungeon_browser: DungeonBrowser::default(),
             project_panel,
             export_window,
+            playtest: Default::default(),
             stored_openings: creation_context
                 .storage
                 .and_then(|storage| eframe::get_value(storage, OPENINGS_STORAGE_KEY)),
@@ -339,7 +369,14 @@ impl DungeonMakerApp {
                 .unwrap_or_default(),
             game_texture_mode: crate::dungeon_textures::game_texture_mode(),
             new_location_ids: None,
+            unity_folder: stored_string(UNITY_FOLDER_STORAGE_KEY)
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
+            unity_text: None,
+            interior_window: None,
+            interior_uses: HashMap::new(),
         };
+        app.load_unity_text();
         if !model_problems.is_empty() {
             app.error_message = Some(model_problems.join("\n"));
         }
@@ -364,6 +401,22 @@ impl DungeonMakerApp {
             }
             if let Some(dungeon_name) = startup_options.dungeon_name {
                 app.open_dungeon_named(&dungeon_name);
+            }
+            if let Some(interior) = startup_options.interior {
+                match interior
+                    .rsplit_once(':')
+                    .and_then(|(block, number)| Some((block, number.parse::<usize>().ok()?)))
+                {
+                    Some((block, number)) if number > 0 => app.open_interior(&InteriorKey {
+                        block: block.to_ascii_uppercase(),
+                        record: number - 1,
+                    }),
+                    _ => {
+                        app.error_message = Some(format!(
+                            "'{interior}' is not a building: use a cell and a number, as TVRNAL01.RMB:2"
+                        ))
+                    }
+                }
             }
             if let Some(settlement_name) = startup_options.settlement_name {
                 app.open_settlement_named(&settlement_name);
@@ -434,11 +487,216 @@ impl DungeonMakerApp {
             }
         }
         self.outdoor_usage = std::sync::Arc::new(usage);
-        self.project_panel.set_outdoor_contents(
-            locations,
-            library.rmb_block_names(),
-            self.outdoor_usage.clone(),
-        );
+        let block_names = library.rmb_block_names();
+        // Every building with an inside, by its cell and place in it.
+        let mut interiors = Vec::new();
+        for name in &block_names {
+            let Ok(block) = library.rmb_block(name) else { continue };
+            for (record, building) in block.buildings.iter().enumerate() {
+                if building.has_interior() {
+                    interiors
+                        .push((InteriorKey { block: name.clone(), record }, building.data.building_type));
+                }
+            }
+        }
+        self.interior_uses.clear();
+        self.project_panel.set_outdoor_contents(locations, block_names, self.outdoor_usage.clone());
+        self.project_panel.set_interiors(interiors);
+    }
+
+    /// Reads Daggerfall Unity's word lists, which name buildings, from its
+    /// install folder: the one saved, or else one found where it is usually unzipped.
+    fn load_unity_text(&mut self) {
+        let mods = self.export_window.settings.mods_folder.trim();
+        let hints: Vec<PathBuf> = self
+            .unity_folder
+            .iter()
+            .cloned()
+            .chain((!mods.is_empty()).then(|| PathBuf::from(mods)))
+            .collect();
+        let Some(folder) = crate::unity_install::find_install_folder(&hints) else { return };
+        match UnityText::load(&folder) {
+            Ok(text) => {
+                self.unity_text = Some(std::sync::Arc::new(text));
+                self.unity_folder = Some(folder);
+            }
+            Err(error) => log::warn!("could not read Daggerfall Unity's text: {error}"),
+        }
+    }
+
+    /// Asks for Daggerfall Unity's install folder and reads its word lists from it.
+    fn choose_unity_folder(&mut self) {
+        let mut dialog = rfd::FileDialog::new().set_title("Daggerfall Unity's folder");
+        if let Some(folder) = &self.unity_folder {
+            dialog = dialog.set_directory(folder);
+        }
+        let Some(chosen) = dialog.pick_folder() else { return };
+        let Some(folder) = crate::unity_install::resolve_install_folder(&chosen) else {
+            self.error_message = Some(format!(
+                "{} is not Daggerfall Unity's folder: it has no DaggerfallUnity_Data/StreamingAssets/Text folder \
+                 with Daggerfall Unity's word lists.",
+                chosen.display()
+            ));
+            return;
+        };
+        match UnityText::load(&folder) {
+            Ok(text) => {
+                self.unity_text = Some(std::sync::Arc::new(text));
+                self.status_message =
+                    format!("Building names now come from Daggerfall Unity in {}", folder.display());
+                self.unity_folder = Some(folder);
+                self.interior_uses.clear();
+                // A settlement open shows its buildings' names from now on.
+                if let Some(OpenedItem::DaggerfallSettlement(index)) = self.opened_item.clone() {
+                    self.open_settlement(index);
+                }
+            }
+            Err(error) => self.error_message = Some(error),
+        }
+    }
+
+    /// The settlements whose cells use the building `key`, with what the
+    /// building is in each (its data and name), worked out once and kept.
+    fn interior_uses_of(&mut self, key: &InteriorKey) -> Vec<InteriorUse> {
+        if let Some(uses) = self.interior_uses.get(key) {
+            return uses.clone();
+        }
+        let Some(library) = self.library.as_mut() else { return Vec::new() };
+        let locations = library.locations();
+        let users = self.outdoor_usage.get(&key.block).cloned().unwrap_or_default();
+        // Each cell read once, though settlements share many.
+        let mut blocks: HashMap<String, Option<crate::arena2::RmbBlock>> = HashMap::new();
+        for &location_index in &users {
+            for name in &locations[location_index].exterior.block_names {
+                if !blocks.contains_key(name) {
+                    let block = library.rmb_block(name).ok();
+                    blocks.insert(name.clone(), block);
+                }
+            }
+        }
+        let references = library.references();
+        let namer = BuildingNamer { unity: self.unity_text.as_deref(), references: &references };
+        let mut uses = Vec::new();
+        for &location_index in &users {
+            let location = &locations[location_index];
+            let cells: Vec<Option<&crate::arena2::RmbBlock>> = location
+                .exterior
+                .block_names
+                .iter()
+                .map(|name| blocks.get(name).and_then(Option::as_ref))
+                .collect();
+            let buildings = settlement_buildings(location, &cells);
+            let width = location.exterior.width.max(1);
+            for (cell, block) in cells.iter().enumerate() {
+                let is_this = block.is_some_and(|block| block.name.eq_ignore_ascii_case(&key.block));
+                if let Some(data) = buildings[cell].get(key.record).filter(|_| is_this) {
+                    let name = namer.name(data, &location.name, location.region_index);
+                    let building_key = crate::people::building_key(cell % width, cell / width, key.record);
+                    uses.push(InteriorUse { location_index, data: *data, name, building_key });
+                }
+            }
+        }
+        self.interior_uses.insert(key.clone(), uses.clone());
+        uses
+    }
+
+    /// Opens the inside of the building `key` in the main window, read-only.
+    fn open_interior(&mut self, key: &InteriorKey) {
+        let uses = self.interior_uses_of(key);
+        let Some(library) = self.library.as_mut() else { return };
+        match InteriorView::open(key.clone(), None, Climate::DEFAULT, self.unity_text.as_deref(), library) {
+            Ok(mut view) => {
+                view.uses = Some(uses);
+                self.set_workspace(
+                    Workspace::Interior(Box::new(view)),
+                    Some(OpenedItem::DaggerfallInterior(key.clone())),
+                );
+            }
+            Err(error) => self.error_message = Some(error),
+        }
+    }
+
+    /// Opens the inside of the building `key` in a window of its own, as it
+    /// stands in `place` (if it was opened from a settlement), in `climate`.
+    fn open_interior_window(&mut self, key: InteriorKey, place: Option<BuildingPlace>, climate: Climate) {
+        let uses = self.interior_uses_of(&key);
+        let Some(library) = self.library.as_mut() else { return };
+        match InteriorView::open(key, place, climate, self.unity_text.as_deref(), library) {
+            Ok(mut view) => {
+                view.uses = Some(uses);
+                self.close_interior_window();
+                self.interior_window = Some(Box::new(view));
+            }
+            Err(error) => self.error_message = Some(error),
+        }
+    }
+
+    /// Closes the window showing a building's inside, releasing its GPU images.
+    fn close_interior_window(&mut self) {
+        if let (Some(mut view), Some(render_state)) =
+            (self.interior_window.take(), self.render_state.as_ref())
+        {
+            view.release(render_state);
+        }
+    }
+
+    /// Draws the window showing a building's inside, if one is open.
+    fn show_interior_window(&mut self, context: &egui::Context) {
+        let mut close = false;
+        let mut action = None;
+        {
+            let (Some(view), Some(library)) = (self.interior_window.as_mut(), self.library.as_mut()) else {
+                return;
+            };
+            let locations = library.locations();
+            let references = library.references();
+            let mut resources = EditorResources {
+                library,
+                render_state: self.render_state.as_ref(),
+                renderer: self.renderer.as_mut(),
+                catalog: &self.catalog,
+                custom_names: &mut self.custom_names,
+                prefabs: &mut self.prefabs,
+                custom_models: &self.custom_models,
+                texture_setting: &mut self.texture_setting,
+                game_texture_mode: self.game_texture_mode,
+                unity: self.unity_text.as_deref(),
+            };
+            let builder = egui::ViewportBuilder::default()
+                .with_title(format!("Inside {} - {APPLICATION_NAME}", view.description()))
+                .with_inner_size(INTERIOR_WINDOW_SIZE);
+            context.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("interior_window"),
+                builder,
+                |window_context, _class| {
+                    view.handle_shortcuts(window_context, resources.library);
+                    egui::TopBottomPanel::bottom("interior_window_status")
+                        .show(window_context, |ui| ui.label(view.status_text()));
+                    egui::SidePanel::right("interior_window_properties")
+                        .resizable(true)
+                        .default_width(300.0)
+                        .show(window_context, |ui| {
+                            ui.heading(view.description());
+                            ui.separator();
+                            action = view.show_properties(ui, &locations, &references);
+                        });
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::none())
+                        .show(window_context, |ui| view.show_viewport(ui, &mut resources));
+                    if window_context.input(|input| input.viewport().close_requested()) {
+                        close = true;
+                    }
+                },
+            );
+        }
+        if close {
+            self.close_interior_window();
+        }
+        match action {
+            Some(InteriorOpen::Settlement(index)) => self.open_settlement(index),
+            Some(InteriorOpen::Cell(name)) => self.open_outdoor_cell(&name),
+            None => {}
+        }
     }
 
     /// Gives the catalog the openings Daggerfall's dungeons leave open: the
@@ -497,6 +755,7 @@ impl DungeonMakerApp {
             OpenedItem::DaggerfallDungeon(dungeon_index) => self.open_dungeon(*dungeon_index),
             OpenedItem::DaggerfallSettlement(location_index) => self.open_settlement(*location_index),
             OpenedItem::DaggerfallOutdoorCell(block_name) => self.open_outdoor_cell(block_name),
+            OpenedItem::DaggerfallInterior(key) => self.open_interior(key),
             OpenedItem::Project(id) => self.open_project_item(*id),
         }
     }
@@ -547,7 +806,9 @@ impl DungeonMakerApp {
             .world_map()
             .and_then(|world| world.location_climate_at(location.map_pixel))
             .map_or(Climate::DEFAULT, Climate::from_value);
-        let (view, problems) = ExteriorView::settlement(location_index, location, climate, library);
+        let references = library.references();
+        let namer = BuildingNamer { unity: self.unity_text.as_deref(), references: &references };
+        let (view, problems) = ExteriorView::settlement(location_index, location, climate, &namer, library);
         self.show_exterior(view, problems, OpenedItem::DaggerfallSettlement(location_index));
     }
 
@@ -719,6 +980,7 @@ impl DungeonMakerApp {
                 Workspace::Room(editor) => editor.release(render_state),
                 Workspace::Dungeon(view) => view.release(render_state),
                 Workspace::Exterior(view) => view.release(render_state),
+                Workspace::Interior(view) => view.release(render_state),
                 Workspace::Empty => {}
             }
         }
@@ -731,6 +993,7 @@ impl DungeonMakerApp {
     /// Closes the workspace and every room window.
     fn close_everything(&mut self) {
         self.set_workspace(Workspace::Empty, None);
+        self.close_interior_window();
     }
 
     /// Closes every room window, releasing their GPU images.
@@ -768,7 +1031,7 @@ impl DungeonMakerApp {
                     view.store_edited_rooms(&mut self.project);
                 }
             }
-            Workspace::Exterior(_) | Workspace::Empty => {}
+            Workspace::Exterior(_) | Workspace::Interior(_) | Workspace::Empty => {}
         }
     }
 
@@ -916,6 +1179,36 @@ impl DungeonMakerApp {
             }
             _ => None,
         }
+    }
+
+    /// Where `dungeon` stands, which the names of the people in it are made
+    /// from: a Daggerfall dungeon's place, or the one a replacement takes;
+    /// a new dungeon's is not known until the game loads it.
+    fn dungeon_person_place(
+        &mut self,
+        dungeon: &OpenedItem,
+    ) -> Result<crate::people::PersonPlace, &'static str> {
+        let library = self.library.as_mut().ok_or("No game data")?;
+        let definitions = library.dungeons();
+        let definition = match dungeon {
+            OpenedItem::DaggerfallDungeon(index) => definitions.get(*index),
+            OpenedItem::Project(id) => {
+                let project_dungeon = self.project.dungeon(*id).ok_or("No such dungeon")?;
+                let replaced = project_dungeon.location.replaces.as_ref().ok_or(
+                    "Made up where the person stands: a new dungeon's place in its region is given when \
+                     Daggerfall Unity loads it",
+                )?;
+                definitions.iter().find(|definition| replaced.is(definition))
+            }
+            _ => None,
+        };
+        let definition = definition.ok_or(room_editor::NO_DUNGEON_FOR_NAMES)?;
+        let classic = definition.classic.ok_or(room_editor::NO_DUNGEON_FOR_NAMES)?;
+        Ok(crate::people::PersonPlace {
+            region_index: definition.region_index,
+            index_in_region: classic.location_index,
+            building_key: 0,
+        })
     }
 
     /// The rooms of `dungeon`, in layout order.
@@ -1132,7 +1425,7 @@ impl DungeonMakerApp {
                 editor.set_cell_category(category);
                 editor.set_status_message(message);
             }
-            Workspace::Dungeon(_) | Workspace::Exterior(_) | Workspace::Empty => {}
+            Workspace::Dungeon(_) | Workspace::Exterior(_) | Workspace::Interior(_) | Workspace::Empty => {}
         }
         // Titles and names follow the copy from the next frame on.
         self.show_current_names();
@@ -1424,6 +1717,7 @@ impl DungeonMakerApp {
             Workspace::Room(editor) => editor.handle_shortcuts(context, library),
             Workspace::Dungeon(view) => view.handle_shortcuts(context, library),
             Workspace::Exterior(view) => view.handle_shortcuts(context, library),
+            Workspace::Interior(view) => view.handle_shortcuts(context, library),
             Workspace::Empty => {}
         }
     }
@@ -1455,6 +1749,10 @@ impl DungeonMakerApp {
                             view.view_menu(ui, library);
                         }
                         (Workspace::Exterior(view), Some(library)) => {
+                            ui.separator();
+                            view.view_menu(ui, library);
+                        }
+                        (Workspace::Interior(view), Some(library)) => {
                             ui.separator();
                             view.view_menu(ui, library);
                         }
@@ -1955,6 +2253,18 @@ impl DungeonMakerApp {
             self.arena2_prompt.open(None);
             ui.close_menu();
         }
+        let unity_hint = match &self.unity_folder {
+            Some(folder) if self.unity_text.is_some() => {
+                format!("Building names come from Daggerfall Unity in {}", folder.display())
+            }
+            _ => "Choose where Daggerfall Unity is installed: its word lists name the buildings of settlements \
+                  (shops, taverns, banks)"
+                .to_string(),
+        };
+        if ui.button("Set Daggerfall Unity folder…").on_hover_text(unity_hint).clicked() {
+            ui.close_menu();
+            self.choose_unity_folder();
+        }
         ui.separator();
         if ui.button("Exit").clicked() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1970,9 +2280,15 @@ impl DungeonMakerApp {
                 Some(library) => view.status_text(&self.custom_names, &library_locations(library)),
                 None => self.status_message.clone(),
             },
+            Workspace::Interior(view) => view.status_text(),
             Workspace::Empty => self.status_message.clone(),
         };
-        egui::TopBottomPanel::bottom("status_bar").show(context, |ui| ui.label(status));
+        egui::TopBottomPanel::bottom("status_bar").show(context, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(status);
+                self.show_test_button(ui);
+            });
+        });
     }
 
     /// Draws the project panel and carries out what the user asks for in it.
@@ -1998,6 +2314,10 @@ impl DungeonMakerApp {
             Workspace::Room(editor) => editor.context_dungeon().cloned(),
             _ => None,
         };
+        let person_place = match &shown_dungeon {
+            Some(dungeon) => self.dungeon_person_place(dungeon),
+            None => Err(room_editor::NO_DUNGEON_FOR_NAMES),
+        };
         let identity = shown_dungeon.and_then(|dungeon| self.dungeon_identity(&dungeon));
         let mut main_used_in = self.main_used_in();
         let mut open_request = None;
@@ -2021,6 +2341,7 @@ impl DungeonMakerApp {
             custom_models: &self.custom_models,
             texture_setting: &mut self.texture_setting,
             game_texture_mode: self.game_texture_mode,
+            unity: self.unity_text.as_deref(),
         };
 
         let mut room_to_open = None;
@@ -2030,11 +2351,13 @@ impl DungeonMakerApp {
         let mut moved_room = None;
         let mut merged_rooms: Option<Vec<usize>> = None;
         let mut exterior_action = None;
+        let mut interior_action = None;
         let mut custom_model_request = None;
         match &mut self.workspace {
             Workspace::Room(editor) => {
                 editor.set_used_in(std::mem::take(&mut main_used_in));
                 editor.set_dungeon_identity(identity);
+                editor.set_person_place(person_place);
                 editor.show(context, &mut resources);
                 open_request = editor.take_open_request();
                 context_request =
@@ -2080,6 +2403,22 @@ impl DungeonMakerApp {
                     let classic = definition.classic?;
                     Some(crate::music::song_for_seed(classic.dungeon_music_seed, definition.region_index))
                 });
+                // What the game knows the location by: Daggerfall's (or the replaced
+                // dungeon's) own ids, or those an export gives a new dungeon.
+                let ids = match game_definition.and_then(|definition| definition.classic) {
+                    Some(classic) => Some(DungeonIds {
+                        map_id: classic.map_id,
+                        location_id: classic.location_id,
+                        dungeon_location_id: classic.dungeon_location_id,
+                        index_in_region: Some(classic.location_index),
+                    }),
+                    None => identity.map(|identity| DungeonIds {
+                        map_id: identity.map_id,
+                        location_id: identity.dungeon_location_id.wrapping_sub(1),
+                        dungeon_location_id: identity.dungeon_location_id,
+                        index_in_region: None,
+                    }),
+                };
                 let details = DungeonDetails {
                     read_only: open_dungeon.is_none(),
                     based_on: open_dungeon.and_then(|dungeon| dungeon.based_on.as_deref()),
@@ -2090,6 +2429,7 @@ impl DungeonMakerApp {
                     other_dungeons: &other_dungeons,
                     daggerfall_dungeons,
                     game_song,
+                    ids,
                 };
                 properties_action = view.show_properties(context, &details);
                 let windows_request = LocationWindowsRequest {
@@ -2125,6 +2465,21 @@ impl DungeonMakerApp {
                     moved_room = Some(request);
                 }
             }
+            Workspace::Interior(view) => {
+                let locations = resources.library.locations();
+                let references = resources.library.references();
+                egui::SidePanel::right("interior_properties").resizable(true).default_width(300.0).show(
+                    context,
+                    |ui| {
+                        ui.heading("Properties");
+                        ui.separator();
+                        interior_action = view.show_properties(ui, &locations, &references);
+                    },
+                );
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none())
+                    .show(context, |ui| view.show_viewport(ui, &mut resources));
+            }
             Workspace::Exterior(view) => {
                 let locations = resources.library.locations();
                 let (dungeon, used_in) = match &view.subject {
@@ -2137,11 +2492,23 @@ impl DungeonMakerApp {
                     ExteriorSubject::Cell(name) => (None, self.outdoor_usage.get(name).cloned().unwrap_or_default()),
                 };
                 let dungeons = resources.library.dungeons();
+                let references = resources.library.references();
+                // The dungeons under the locations built with the cell shown.
+                let cell_dungeons: Vec<(usize, &str)> = used_in
+                    .iter()
+                    .filter_map(|&location| {
+                        let location = locations.get(location)?;
+                        let index = *self.dungeon_under.get(&(location.region_index, location.location_id))?;
+                        Some((index, dungeons.get(index)?.name.as_str()))
+                    })
+                    .collect();
                 let details = ExteriorDetails {
                     locations: &locations,
                     dungeon: dungeon
                         .and_then(|index| Some((index, dungeons.get(index)?.name.as_str()))),
                     used_in: &used_in,
+                    cell_dungeons: &cell_dungeons,
+                    references: &references,
                 };
                 exterior_action =
                     view.show_properties(context, &details, resources.custom_names, resources.library);
@@ -2163,6 +2530,27 @@ impl DungeonMakerApp {
             Some(ExteriorOpen::Cell(name)) => self.open_outdoor_cell(&name),
             Some(ExteriorOpen::Settlement(index)) => self.open_settlement(index),
             Some(ExteriorOpen::Dungeon(index)) => self.open_dungeon(index),
+            Some(ExteriorOpen::DungeonUnder(location_index)) => {
+                let locations = self.library.as_mut().map(|library| library.locations());
+                let dungeon = locations.as_ref().and_then(|locations| {
+                    let location = locations.get(location_index)?;
+                    self.dungeon_under.get(&(location.region_index, location.location_id)).copied()
+                });
+                match dungeon {
+                    Some(index) => self.open_dungeon(index),
+                    None => {
+                        self.status_message = "This location's dungeon is not in the dungeon list".to_string()
+                    }
+                }
+            }
+            Some(ExteriorOpen::Interior { key, place, climate }) => {
+                self.open_interior_window(key, place, climate)
+            }
+            None => {}
+        }
+        match interior_action {
+            Some(InteriorOpen::Settlement(index)) => self.open_settlement(index),
+            Some(InteriorOpen::Cell(name)) => self.open_outdoor_cell(&name),
             None => {}
         }
         if let Some(room_index) = room_to_open {
@@ -2554,12 +2942,20 @@ impl DungeonMakerApp {
         // The dungeon selected around each window's cell, whose textures it is drawn with.
         let shown_dungeons: Vec<Option<OpenedItem>> =
             self.room_windows.iter().map(|window| window.editor.context_dungeon().cloned()).collect();
+        let places: Vec<_> = shown_dungeons
+            .iter()
+            .map(|dungeon| match dungeon {
+                Some(dungeon) => self.dungeon_person_place(dungeon),
+                None => Err(room_editor::NO_DUNGEON_FOR_NAMES),
+            })
+            .collect();
         let identities: Vec<Option<DungeonIdentity>> = shown_dungeons
             .into_iter()
             .map(|dungeon| dungeon.and_then(|dungeon| self.dungeon_identity(&dungeon)))
             .collect();
-        for (window, identity) in self.room_windows.iter_mut().zip(identities) {
+        for ((window, identity), place) in self.room_windows.iter_mut().zip(identities).zip(places) {
             window.editor.set_dungeon_identity(identity);
+            window.editor.set_person_place(place);
         }
         let Some(library) = self.library.as_mut() else { return };
         let mut resources = EditorResources {
@@ -2572,6 +2968,7 @@ impl DungeonMakerApp {
             custom_models: &self.custom_models,
             texture_setting: &mut self.texture_setting,
             game_texture_mode: self.game_texture_mode,
+            unity: self.unity_text.as_deref(),
         };
 
         let prompt = self.copy_prompt;
@@ -2840,6 +3237,7 @@ impl DungeonMakerApp {
                     self.library.as_ref().map(library_locations).unwrap_or_else(|| std::sync::Arc::new([]));
                 Some(view.description(&locations))
             }
+            Workspace::Interior(view) => Some(format!("Inside {}", view.description())),
             Workspace::Empty => None,
         };
         let project_mark = if self.has_unsaved_changes() { "*" } else { "" };
@@ -2857,6 +3255,8 @@ impl DungeonMakerApp {
 
 impl eframe::App for DungeonMakerApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        // Images dropped last frame are freed now that no frame draws them.
+        kept_texture::free_put_aside();
         self.handle_close_request(context);
         self.poll_openings_job(context);
         self.poll_blend_conversion(context);
@@ -2884,9 +3284,11 @@ impl eframe::App for DungeonMakerApp {
         self.show_export_window(context);
         show_controls_window(context, &mut self.show_controls_window);
         self.show_room_windows(context);
+        self.show_interior_window(context);
         self.show_main_copy_prompt(context);
         self.show_delete_prompt(context);
         self.show_unsaved_changes_prompt(context);
+        self.show_test_prompts(context);
         self.show_error_window(context);
         self.update_window_title(context);
     }
@@ -2906,6 +3308,8 @@ impl eframe::App for DungeonMakerApp {
         let blender =
             self.blender_program.as_ref().map(|path| path.display().to_string()).unwrap_or_default();
         storage.set_string(BLENDER_STORAGE_KEY, blender);
+        let unity = self.unity_folder.as_ref().map(|path| path.display().to_string()).unwrap_or_default();
+        storage.set_string(UNITY_FOLDER_STORAGE_KEY, unity);
         if let Some(openings) = &self.stored_openings {
             eframe::set_value(storage, OPENINGS_STORAGE_KEY, openings);
         }

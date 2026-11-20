@@ -110,7 +110,7 @@ pub struct WorldMapPicker {
     zoom: f32,
     /// Map pixel at the centre of the view.
     center: egui::Vec2,
-    texture: Option<egui::TextureHandle>,
+    texture: Option<super::kept_texture::KeptTexture>,
     /// Text typed in the search field.
     search: String,
     /// The location last found with the search field, ringed on the map.
@@ -165,12 +165,13 @@ impl WorldMapPicker {
             return None;
         }
         // Textures are shared by every window of the application.
-        let texture = self
-            .texture
-            .get_or_insert_with(|| {
-                context.load_texture("world_map", map_image(request.world), egui::TextureOptions::NEAREST)
-            })
-            .clone();
+        let texture = egui::TextureHandle::clone(self.texture.get_or_insert_with(|| {
+            super::kept_texture::KeptTexture::new(context.load_texture(
+                "world_map",
+                map_image(request.world),
+                egui::TextureOptions::NEAREST,
+            ))
+        }));
         let mut action = None;
         let title = match request.read_only {
             true => format!("{} on the world map", request.dungeon_name),

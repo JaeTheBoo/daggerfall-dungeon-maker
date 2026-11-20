@@ -334,6 +334,19 @@ fn object_lists_are_the_quarters_of_a_cell() {
     let mut checked = 0;
     for name in library.rdb_block_names() {
         let block = library.rdb_block(&name).unwrap();
+        // Daggerfall Unity's corrections move some objects into other squares
+        // (the exit of W0000009, for one) without moving them to other lists.
+        if daggerfall_dungeon_maker::arena2::unity_fix_description(&name).is_some() {
+            let scene = Scene::from_rdb_block(&block);
+            for object in &scene.objects {
+                assert_eq!(
+                    object.group_index,
+                    quarter_of(object.position),
+                    "{name}: objects go by their square"
+                );
+            }
+            continue;
+        }
         let mut quarter_of_list = std::collections::BTreeMap::new();
         for object in &block.objects {
             let quarter = quarter_of(native_to_world(object.position));
@@ -459,6 +472,7 @@ fn dungeons_sit_on_the_world_map_in_their_region() {
 #[test]
 fn dungeon_entrances_load_and_have_an_entrance_door() {
     use daggerfall_dungeon_maker::arena2::DoorKind;
+    use daggerfall_dungeon_maker::buildings::door_boxes;
     use std::collections::BTreeMap;
     let Some(mut library) = open_library() else { return };
 
@@ -474,13 +488,24 @@ fn dungeon_entrances_load_and_have_an_entrance_door() {
     }
     println!("{} dungeons have {} different entrances", dungeons.len(), designs.len());
     let mut without_door = Vec::new();
+    let mut boxed_doors = 0;
     for ((width, height, block_names), users) in &designs {
         let mut has_entrance = false;
         for name in block_names {
             let block = library.rmb_block(name).unwrap_or_else(|error| panic!("{name}: {error}"));
             for model in &block.models {
-                let mesh = library.model(model.model_id);
-                has_entrance |= mesh.and_then(|mesh| mesh.door_kind()) == Some(DoorKind::DungeonEntrance);
+                let Some(mesh) = library.model(model.model_id) else { continue };
+                // The red boxes the views draw round dungeon doors.
+                let doors = door_boxes(&mesh, DoorKind::DungeonEntrance).len();
+                boxed_doors += doors;
+                has_entrance |= doors > 0;
+                assert_eq!(
+                    doors > 0,
+                    mesh.submeshes
+                        .iter()
+                        .any(|submesh| DoorKind::from_texture(submesh.texture)
+                            == Some(DoorKind::DungeonEntrance))
+                );
             }
         }
         if !has_entrance {
@@ -488,7 +513,7 @@ fn dungeon_entrances_load_and_have_an_entrance_door() {
         }
     }
     println!(
-        "{} entrances without an entrance door: {:?}",
+        "{boxed_doors} dungeon doors; {} entrances without one: {:?}",
         without_door.len(),
         without_door.iter().take(10).collect::<Vec<_>>()
     );
@@ -1174,4 +1199,914 @@ fn reads_daggerfalls_dungeon_songs() {
     }
     println!("{played:?}");
     assert_eq!(played.len(), DUNGEON_SONGS.len());
+}
+
+#[test]
+fn corrects_the_cells_daggerfall_unity_corrects() {
+    use daggerfall_dungeon_maker::arena2::{unity_fix_description, RdbObject};
+    let Some(library) = open_library() else { return };
+    let block = |name: &str| library.rdb_block(name).expect("the cell reads");
+    let in_list = |objects: &[RdbObject], list: usize| -> Vec<RdbObject> {
+        objects.iter().filter(|object| object.group_index == list).cloned().collect()
+    };
+    let is_model_at = |object: &RdbObject, x: i32, y: i32, z: i32| {
+        matches!(object.kind, RdbObjectKind::Model(_)) && object.position == glam::IVec3::new(x, y, z)
+    };
+    let marker = |object: &RdbObject, record: u8| matches!(&object.kind, RdbObjectKind::Flat(flat) if flat.texture.archive == 199 && flat.texture.record == record);
+
+    for name in ["N0000022.RDB", "N0000023.RDB"] {
+        assert!(in_list(&block(name).objects, 2).is_empty(), "{name} loses its bad door");
+    }
+    // The door and the lever that are moved.
+    let door = in_list(&block("N0000035.RDB").objects, 0)
+        .into_iter()
+        .filter(|object| object.position.y == -300)
+        .count();
+    assert_eq!(door, 1, "N0000035.RDB has its door at the corrected height");
+    let lever = in_list(&block("N0000052.RDB").objects, 0)
+        .into_iter()
+        .find(|object| object.position.x == 543)
+        .expect("N0000052.RDB has its lever in its corrected place");
+    assert!(
+        matches!(&lever.kind, RdbObjectKind::Model(model) if model.action.is_some()),
+        "the lever has an action"
+    );
+    assert!(in_list(&block("N0000071.RDB").objects, 4).iter().any(|object| object.position.x == 640));
+
+    // W0000009: the exit, the start marker and the new wall all move to the corner.
+    let w9 = block("W0000009.RDB");
+    let wall = in_list(&w9.objects, 8)
+        .into_iter()
+        .find(|object| matches!(&object.kind, RdbObjectKind::Model(model) if model.model_id == 72100))
+        .expect("W0000009.RDB gets a brick wall");
+    let start =
+        in_list(&w9.objects, 4).into_iter().find(|object| marker(object, 10)).expect("a start marker");
+    assert_eq!((start.position.x, start.position.z + 128), (wall.position.x, wall.position.z));
+    let exit = in_list(&w9.objects, 8).into_iter().next().expect("the exit");
+    assert_eq!((exit.position.x, exit.position.z + 2), (wall.position.x, wall.position.z));
+    println!("W0000009 corner {:?}, exit {:?}", start.position, exit.position);
+
+    assert!(in_list(&block("W0000018.RDB").objects, 6)
+        .iter()
+        .any(|object| is_model_at(object, 1152, -1792, 1920)));
+    assert!(in_list(&block("W0000020.RDB").objects, 5)
+        .iter()
+        .any(|object| is_model_at(object, 1152, -384, 1408)));
+
+    assert!(unity_fix_description("w0000020.rdb").is_some());
+    assert!(unity_fix_description("N0000004.RDB").is_none());
+}
+
+#[test]
+fn names_the_sounds_texts_spells_and_factions_cells_refer_to() {
+    use std::collections::BTreeMap;
+    let Some(library) = open_library() else { return };
+    let references = library.references();
+    let sounds = references.sounds.as_ref().expect("DAGGER.SND reads");
+    let texts = references.texts.as_ref().expect("TEXT.RSC reads");
+    assert!(texts.get(8605).is_some_and(|text| text.contains("Blind God")));
+    assert_eq!(references.spells.get(&1).map(String::as_str), Some("Fenrik's Door Jam"));
+    assert!(references.factions.len() > 300, "{} factions", references.factions.len());
+
+    // What Daggerfall's own cells refer to.
+    let mut sound_uses: BTreeMap<u8, usize> = BTreeMap::new();
+    let (mut texts_shown, mut texts_missing, mut spells_cast, mut spells_missing) = (0, 0, 0, 0);
+    let (mut faction_people, mut faction_missing) = (0, Vec::new());
+    for name in library.rdb_block_names() {
+        let Ok(block) = library.rdb_block(&name) else { continue };
+        for object in &block.objects {
+            match &object.kind {
+                RdbObjectKind::Model(model) => {
+                    let Some(action) = model.action else { continue };
+                    if model.sound > 0 {
+                        *sound_uses.entry(model.sound).or_default() += 1;
+                    }
+                    match action.action_type {
+                        0x0B => match texts.get(8600 + u16::from(model.sound)) {
+                            Some(_) => texts_shown += 1,
+                            None => texts_missing += 1,
+                        },
+                        0x09 => match references.spells.get(&model.sound) {
+                            Some(_) => spells_cast += 1,
+                            None => spells_missing += 1,
+                        },
+                        _ => {}
+                    }
+                }
+                RdbObjectKind::Flat(flat)
+                    if daggerfall_dungeon_maker::catalog::PEOPLE_FLAT_ARCHIVES
+                        .contains(&flat.texture.archive)
+                        && flat.faction_or_mobile_id != 0 =>
+                {
+                    match references.factions.get(&flat.faction_or_mobile_id) {
+                        Some(_) => faction_people += 1,
+                        None => faction_missing.push(flat.faction_or_mobile_id),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let unnamed: Vec<u8> =
+        sound_uses.keys().copied().filter(|&id| sounds.name(u32::from(id)).is_none()).collect();
+    for (id, uses) in &sound_uses {
+        println!("sound {id}: {uses} uses, {:?}", sounds.name(u32::from(*id)));
+    }
+    println!("sounds with no sound data: {unnamed:?}");
+    println!("show text: {texts_shown} found, {texts_missing} missing; cast spell: {spells_cast} found, {spells_missing} missing");
+    println!("people with factions: {faction_people} found, missing {faction_missing:?}");
+    assert!(texts_shown > 0 && spells_cast > 0 && faction_people > 0);
+}
+
+#[test]
+fn export_check_needs_a_marker_to_arrive_at_and_notes_missing_quest_markers() {
+    use daggerfall_dungeon_maker::arena2::MapPixel;
+    use daggerfall_dungeon_maker::export::check_project;
+    use daggerfall_dungeon_maker::project::{
+        CellCategory, DungeonLocation, Project, ProjectDungeonRoom, ProjectEntry, ProjectRoom,
+    };
+    use daggerfall_dungeon_maker::scene::{
+        Scene, ENTER_MARKER_RECORD, QUEST_ITEM_MARKER_RECORD, QUEST_MARKER_RECORD, START_MARKER_RECORD,
+    };
+    let Some(mut library) = open_library() else { return };
+
+    let dungeons = library.dungeons();
+    let original =
+        dungeons.iter().find(|dungeon| dungeon.name == "Privateer's Hold").expect("Privateer's Hold");
+    let world = library.world_map().unwrap();
+    let home = original.map_pixel.unwrap();
+    let pixel = (-20..=20)
+        .flat_map(|dx| (-20..=20).map(move |dy| MapPixel::new(home.x + dx, home.y + dy)))
+        .find(|&pixel| {
+            world.region_at(pixel) == Some(original.region_index)
+                && world.locations_at(pixel).next().is_none()
+        })
+        .expect("a free spot nearby");
+    let start = original.blocks.iter().find(|block| block.is_starting_block).unwrap();
+    let objects = Scene::from_rdb_block(&library.rdb_block(&start.block_name).unwrap()).objects;
+    let check = |keep: &dyn Fn(&daggerfall_dungeon_maker::scene::SceneObject) -> bool,
+                 library: &mut daggerfall_dungeon_maker::arena2::Arena2Library| {
+        let mut project = Project::default();
+        let room_id = project.new_id();
+        let objects = objects.iter().filter(|object| keep(object)).cloned().collect();
+        let room = ProjectRoom {
+            id: room_id,
+            name: "Start".to_string(),
+            based_on: None,
+            category: CellCategory::Interior,
+            objects,
+        };
+        project.add(ProjectEntry::Room(room), None);
+        let dungeon_id = project.add_empty_dungeon("Test Hold of Markers");
+        let dungeon = project.dungeon_mut(dungeon_id).unwrap();
+        dungeon.dungeon_type = original.dungeon_type;
+        dungeon.rooms = vec![ProjectDungeonRoom {
+            block_name: String::new(),
+            grid_x: 0,
+            grid_z: 0,
+            is_starting_block: true,
+            room: Some(room_id),
+        }];
+        dungeon.location =
+            DungeonLocation { map_pixel: Some(pixel), ..DungeonLocation::copied_from(original) };
+        check_project(&project, library).remove(0)
+    };
+    let mentions = |lines: &[String], text: &str| lines.iter().any(|line| line.contains(text));
+
+    let has_quest_markers = objects.iter().any(|object| {
+        object.is_marker_record(QUEST_MARKER_RECORD) || object.is_marker_record(QUEST_ITEM_MARKER_RECORD)
+    });
+    assert!(has_quest_markers, "Privateer's Hold's start cell has quest markers");
+    let whole = check(&|_| true, &mut library);
+    assert!(whole.is_ready(), "{:?}", whole.problems);
+    assert!(!mentions(&whole.notes, "quest marker"), "{:?}", whole.notes);
+
+    // Without its quest markers quests skip it, which is a note, not a problem.
+    let no_quests = check(
+        &|object| {
+            !object.is_marker_record(QUEST_MARKER_RECORD)
+                && !object.is_marker_record(QUEST_ITEM_MARKER_RECORD)
+        },
+        &mut library,
+    );
+    assert!(no_quests.is_ready(), "{:?}", no_quests.problems);
+    assert!(mentions(&no_quests.notes, "quest marker"), "{:?}", no_quests.notes);
+
+    // Without a start or an enter marker the game cannot load it.
+    let nowhere = check(
+        &|object| {
+            !object.is_marker_record(START_MARKER_RECORD) && !object.is_marker_record(ENTER_MARKER_RECORD)
+        },
+        &mut library,
+    );
+    assert!(mentions(&nowhere.problems, "no start marker or enter marker"), "{:?}", nowhere.problems);
+}
+
+#[test]
+fn reads_every_buildings_inside_and_entrances() {
+    use daggerfall_dungeon_maker::arena2::DoorKind;
+    use daggerfall_dungeon_maker::buildings::{
+        arrival_exit, door_boxes, dungeon_textured_entrances, entrance_centers, interior_exits,
+        interior_layout, landing_markers,
+    };
+    let Some(mut library) = open_library() else { return };
+    let (mut buildings, mut with_inside, mut models, mut people, mut doors) = (0, 0, 0, 0, 0);
+    let mut without_entrance = Vec::new();
+    for name in library.rmb_block_names() {
+        let block = library.rmb_block(&name).expect("the outdoor cell reads");
+        for (record, building) in block.buildings.iter().enumerate() {
+            buildings += 1;
+            models += building.interior.models.len();
+            people += building.interior.people.len();
+            doors += building.interior.doors.len();
+            if !building.has_interior() {
+                continue;
+            }
+            with_inside += 1;
+            let entrances: usize = building
+                .models
+                .clone()
+                .filter_map(|model| library.model(block.models[model].model_id))
+                .map(|mesh| door_boxes(&mesh, DoorKind::Building).len())
+                .sum();
+            if entrances == 0 {
+                without_entrance.push(format!("{name} #{record}"));
+            }
+        }
+    }
+    println!(
+        "{buildings} buildings, {with_inside} with an inside: {models} models, {people} people, {doors} doors; \
+         {} without an entrance: {:?}",
+        without_entrance.len(),
+        &without_entrance[..without_entrance.len().min(10)]
+    );
+    // As counted straight from BLOCKS.BSA.
+    assert_eq!((buildings, models, people, doors), (9005, 226_268, 14_174, 25_922));
+    assert!(without_entrance.len() * 100 < with_inside, "almost every inside has an entrance");
+
+    // Every inside has exits. Walking in, Daggerfall Unity stands the inside in
+    // the space of the door's model, so each door lands on an exit there.
+    let (mut exits, mut without_exit, mut doors_in, mut far_doors) = (0, Vec::new(), 0, Vec::new());
+    let (mut raised, mut rerouted) = (Vec::new(), Vec::new());
+    for name in library.rmb_block_names() {
+        let block = library.rmb_block(&name).expect("the outdoor cell reads");
+        for (record, building) in block.buildings.iter().enumerate() {
+            if !building.has_interior() {
+                continue;
+            }
+            let layout = interior_layout(&block, record, &mut library);
+            if layout.raised {
+                raised.push(format!("{name} #{}", record + 1));
+            }
+            let inside_exits = interior_exits(&layout.scene, &mut library);
+            rerouted.extend(
+                dungeon_textured_entrances(&block, record, &mut library)
+                    .iter()
+                    .map(|door| format!("{name} #{}: {:.1?}", record + 1, door.center())),
+            );
+            exits += inside_exits.len();
+            if inside_exits.is_empty() {
+                without_exit.push(format!("{name} #{record}"));
+            }
+            let markers = landing_markers(&building.interior);
+            for door in entrance_centers(&block, record, &mut library) {
+                doors_in += 1;
+                let nearest = inside_exits
+                    .iter()
+                    .map(|exit| exit.center().distance(door))
+                    .fold(f32::INFINITY, f32::min);
+                assert!(arrival_exit(door, &markers, &inside_exits).is_some() || inside_exits.is_empty());
+                // Most are within a metre; some insides' doors are set back a little.
+                if nearest > 5.0 {
+                    far_doors.push(format!("{name} #{record}: {nearest:.1} m"));
+                }
+            }
+        }
+    }
+    println!(
+        "{exits} exits; {} insides without one: {:?}; {} of {doors_in} doors more than 5 m from an exit: {:?}",
+        without_exit.len(),
+        &without_exit[..without_exit.len().min(10)],
+        far_doors.len(),
+        &far_doors[..far_doors.len().min(20)]
+    );
+    assert!(without_exit.is_empty(), "every inside has an exit");
+
+    // The insides that store their rooms by their floor, raised to fit.
+    println!("raised: {raised:?}");
+    assert_eq!(
+        raised,
+        [
+            "BOOKAS00.RMB #9",
+            "CUSTAA05.RMB #1",
+            "CUSTAA05.RMB #2",
+            "CUSTAA05.RMB #5",
+            "CUSTAA05.RMB #6",
+            "CUSTAA05.RMB #7",
+            "LIBRAM00.RMB #8"
+        ]
+    );
+    // Doors drawn as dungeon doors that lead into their building's inside:
+    // the tops of Castle Daggerfall's two big towers and the three small towers' doors.
+    println!("dungeon-textured entrances: {rerouted:?}");
+    assert_eq!(rerouted.len(), 8);
+    assert!(rerouted.iter().all(|door| door.starts_with("CUSTAA05.RMB")));
+    assert!(far_doors.len() * 100 < doors_in, "doors land on an exit inside");
+
+    // A tavern's inside: its people and markers, laid out.
+    let block = library.rmb_block("TVRNAL01.RMB").unwrap();
+    let (record, tavern) =
+        block.buildings.iter().enumerate().find(|(_, building)| building.data.building_type == 15).unwrap();
+    let scene = interior_layout(&block, record, &mut library).scene;
+    assert_eq!(
+        scene.objects.len(),
+        tavern.interior.models.len()
+            + tavern.interior.doors.len()
+            + tavern.interior.flats.len()
+            + tavern.interior.people.len()
+    );
+    assert!(!tavern.interior.people.is_empty(), "the tavern has people");
+    let (minimum, maximum) = scene.bounds(&mut library).unwrap();
+    println!("tavern inside: {} objects, {:?} to {:?}", scene.objects.len(), minimum, maximum);
+    assert!((maximum - minimum).max_element() < 120.0, "the inside is the size of a building");
+}
+
+#[test]
+fn names_settlements_buildings_as_daggerfall_unity_does() {
+    use daggerfall_dungeon_maker::buildings::{
+        settlement_buildings, BuildingNamer, BANK, GUILD_HALL, PALACE, TEMPLE,
+    };
+    use daggerfall_dungeon_maker::unity_install::{find_install_folder, UnityText};
+    let Some(mut library) = open_library() else { return };
+    let locations = library.locations();
+    let daggerfall = locations.iter().find(|location| location.name == "Daggerfall").expect("Daggerfall");
+    assert!(daggerfall.exterior.port_town, "Daggerfall is a port");
+    let blocks: Vec<_> =
+        daggerfall.exterior.block_names.iter().map(|name| library.rmb_block(name).ok()).collect();
+    let cells: Vec<_> = blocks.iter().map(Option::as_ref).collect();
+    let buildings: Vec<_> = settlement_buildings(daggerfall, &cells).into_iter().flatten().collect();
+    // Every named building of the city's list goes to a building of its cells.
+    let named =
+        daggerfall.exterior.buildings.iter().filter(|building| {
+            daggerfall_dungeon_maker::buildings::is_named_building(building.building_type)
+        });
+    for listed in named {
+        assert!(buildings.iter().any(|building| building.name_seed == listed.name_seed
+            && building.building_type == listed.building_type));
+    }
+
+    // Names need Daggerfall Unity's word lists: from DAGGERFALL_UNITY, or found where it is usually unzipped.
+    let hints: Vec<std::path::PathBuf> =
+        std::env::var_os("DAGGERFALL_UNITY").map(Into::into).into_iter().collect();
+    let Some(unity) = find_install_folder(&hints).and_then(|folder| UnityText::load(&folder).ok()) else {
+        println!("Daggerfall Unity not found; names not checked");
+        return;
+    };
+    let references = library.references();
+    let namer = BuildingNamer { unity: Some(&unity), references: &references };
+    let name_of = |building_type: u8| {
+        buildings
+            .iter()
+            .filter(|building| building.building_type == building_type)
+            .filter_map(|building| namer.name(building, &daggerfall.name, daggerfall.region_index))
+            .collect::<Vec<_>>()
+    };
+    println!(
+        "palace {:?}, banks {:?}, guilds {:?}, temples {:?}",
+        name_of(PALACE),
+        name_of(BANK),
+        name_of(GUILD_HALL),
+        name_of(TEMPLE)
+    );
+    assert!(name_of(PALACE).iter().any(|name| name == "Castle Daggerfall"));
+    assert!(name_of(BANK).iter().all(|name| name == "The Bank of Daggerfall"));
+    assert!(name_of(GUILD_HALL).iter().any(|name| name == "The Mages Guild"));
+    assert!(name_of(TEMPLE).iter().any(|name| name.starts_with("The Temple of")));
+    let unnamed = buildings
+        .iter()
+        .filter(|building| daggerfall_dungeon_maker::buildings::is_named_building(building.building_type))
+        .filter(|building| namer.name(building, &daggerfall.name, daggerfall.region_index).is_none())
+        .count();
+    assert_eq!(unnamed, 0, "every named building of Daggerfall gets a name");
+}
+
+#[test]
+fn tells_furniture_town_maps_and_who_people_are() {
+    use daggerfall_dungeon_maker::arena2::{AUTOMAP_SIDE, WORLD_SCALE};
+    use daggerfall_dungeon_maker::buildings::{furniture_use, interior_layout, FurnitureUse};
+    use daggerfall_dungeon_maker::people::{outdoor_gender, person_details, PersonName, PersonPlace};
+    use daggerfall_dungeon_maker::scene::SceneObjectKind;
+    use daggerfall_dungeon_maker::unity_install::{find_install_folder, UnityText};
+    use std::collections::BTreeMap;
+    let Some(mut library) = open_library() else { return };
+    let references = library.references();
+    assert!(references.flats.len() > 200, "FLATS.CFG reads: {} images", references.flats.len());
+
+    // Furniture of every inside, and every cell's town map, north up: a
+    // building's first model stands on a pixel of its type (plus 1) in most cells.
+    let (mut furniture, mut on_its_pixel, mut buildings) = (BTreeMap::new(), 0, 0);
+    for name in library.rmb_block_names() {
+        let block = library.rmb_block(&name).expect("the outdoor cell reads");
+        assert_eq!(block.automap.len(), AUTOMAP_SIDE * AUTOMAP_SIDE, "{name} has its town map");
+        for (record, building) in block.buildings.iter().enumerate() {
+            if let Some(model) = block.models.get(building.models.start) {
+                let pixel = |value: f32| (value / WORLD_SCALE / 64.0).floor() as usize;
+                let (x, z) = (pixel(model.position.x), pixel(model.position.z));
+                if x < AUTOMAP_SIDE && z < AUTOMAP_SIDE {
+                    buildings += 1;
+                    let byte = block.automap[(AUTOMAP_SIDE - 1 - z) * AUTOMAP_SIDE + x];
+                    on_its_pixel += usize::from(byte == building.data.building_type + 1);
+                }
+            }
+            if !building.has_interior() {
+                continue;
+            }
+            let layout = interior_layout(&block, record, &mut library);
+            for &index in &layout.props {
+                let SceneObjectKind::Model { model_id, .. } = layout.scene.objects[index].kind else {
+                    continue;
+                };
+                if let Some(kind) = furniture_use(model_id, building.data.building_type) {
+                    *furniture.entry(kind.name()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    println!("furniture {furniture:?}; {on_its_pixel} of {buildings} buildings on their town map pixel");
+    for kind in
+        [FurnitureUse::ShopShelf, FurnitureUse::Bookshelf, FurnitureUse::Container, FurnitureUse::Ladder]
+    {
+        assert!(furniture.get(kind.name()).is_some_and(|&count| count > 0), "some {}", kind.name());
+    }
+    assert!(on_its_pixel * 4 > buildings * 3, "town maps are north up");
+
+    // People outdoors: their genders from FLATS.CFG, and their names in a
+    // settlement with some when Daggerfall Unity's word lists are found.
+    let hints: Vec<std::path::PathBuf> =
+        std::env::var_os("DAGGERFALL_UNITY").map(Into::into).into_iter().collect();
+    let unity = find_install_folder(&hints).and_then(|folder| UnityText::load(&folder).ok());
+    let is_person = |flat: &&daggerfall_dungeon_maker::arena2::RmbFlat| {
+        flat.faction_id != 0 && flat.texture.archive != 199
+    };
+    let mut with_people = std::collections::HashSet::new();
+    for name in library.rmb_block_names() {
+        let block = library.rmb_block(&name).expect("the outdoor cell reads");
+        if block.flats.iter().any(|flat| is_person(&flat)) {
+            with_people.insert(name.to_uppercase());
+        }
+    }
+    let locations = library.locations();
+    let settlement = locations
+        .iter()
+        .find(|location| {
+            location.exterior.block_names.iter().any(|name| with_people.contains(&name.to_uppercase()))
+        })
+        .expect("a settlement has people outdoors");
+    let place = PersonPlace {
+        region_index: settlement.region_index,
+        index_in_region: settlement.index_in_region,
+        building_key: 0,
+    };
+    let (mut genders, mut names) = (BTreeMap::new(), Vec::new());
+    for name in &settlement.exterior.block_names {
+        let block = library.rmb_block(name).expect("the settlement's cells read");
+        for flat in block.flats.iter().filter(is_person) {
+            let gender = outdoor_gender(flat.texture, flat.flags, &references.flats);
+            *genders.entry(gender.name()).or_insert(0) += 1;
+            let person = person_details(
+                flat.texture,
+                flat.faction_id,
+                gender,
+                flat.record_offset,
+                Ok(place),
+                unity.as_ref(),
+                &references,
+            );
+            names.push(person.name);
+        }
+    }
+    println!(
+        "{} cells have people outdoors; in {}: {genders:?}; {:?}",
+        with_people.len(),
+        settlement.name,
+        &names[..names.len().min(8)]
+    );
+    assert!(!genders.is_empty());
+
+    // The people inside Daggerfall's buildings, named for where they stand.
+    let daggerfall = locations.iter().find(|location| location.name == "Daggerfall").expect("Daggerfall");
+    let width = daggerfall.exterior.width.max(1);
+    let mut inside = Vec::new();
+    for (cell, name) in daggerfall.exterior.block_names.iter().enumerate() {
+        let block = library.rmb_block(name).expect("Daggerfall's cells read");
+        for (record, building) in block.buildings.iter().enumerate() {
+            let place = PersonPlace {
+                region_index: daggerfall.region_index,
+                index_in_region: daggerfall.index_in_region,
+                building_key: daggerfall_dungeon_maker::people::building_key(
+                    cell % width,
+                    cell / width,
+                    record,
+                ),
+            };
+            for person in &building.interior.people {
+                let gender = daggerfall_dungeon_maker::people::Gender::from_flags(person.flags);
+                let details = person_details(
+                    person.texture,
+                    person.faction_id,
+                    gender,
+                    person.record_offset,
+                    Ok(place),
+                    unity.as_ref(),
+                    &references,
+                );
+                inside.push((gender.name(), details.name));
+            }
+        }
+    }
+    println!("{} people inside Daggerfall's buildings: {:?}", inside.len(), &inside[..inside.len().min(6)]);
+    assert!(inside.len() > 100);
+    if unity.is_some() {
+        assert!(inside.iter().all(|(_, name)| matches!(name, PersonName::Named(_) | PersonName::MadeUp(_))));
+    }
+    if unity.is_some() {
+        assert!(names.iter().all(|name| matches!(name, PersonName::Named(_) | PersonName::MadeUp(_))));
+    }
+}
+
+#[test]
+fn knows_factions_groups_rulers_and_dungeon_people() {
+    use daggerfall_dungeon_maker::arena2::{
+        guild_group_name, ruler_title_name, social_group_name, INDIVIDUAL_FACTION_KIND, PROVINCE_FACTION_KIND,
+    };
+    use daggerfall_dungeon_maker::people::{
+        is_dungeon_person, person_details, Gender, PersonName, PersonPlace, PersonRace, Race,
+    };
+    use daggerfall_dungeon_maker::unity_install::{find_install_folder, UnityText};
+    let Some(mut library) = open_library() else { return };
+    let references = library.references();
+
+    // Daggerfall's province: its ruler's title, groups, race and court.
+    let daggerfall = references
+        .factions
+        .values()
+        .find(|faction| faction.kind == PROVINCE_FACTION_KIND && faction.name == "Daggerfall")
+        .expect("Daggerfall's province");
+    assert_eq!(ruler_title_name(daggerfall.ruler), "King");
+    assert_eq!(social_group_name(daggerfall.social_group), "Nobility");
+    assert_eq!(guild_group_name(daggerfall.guild_group), "Region");
+    assert_eq!(daggerfall.race, 3, "Breton");
+    let court: Vec<&str> = daggerfall
+        .children
+        .iter()
+        .filter_map(|child| references.factions.get(child))
+        .filter(|child| child.kind == INDIVIDUAL_FACTION_KIND)
+        .map(|child| child.name.as_str())
+        .collect();
+    assert!(court.contains(&"King Gothryd"), "{court:?}");
+
+    // The people of Daggerfall's dungeons: who they are, named for where they stand.
+    let hints: Vec<std::path::PathBuf> =
+        std::env::var_os("DAGGERFALL_UNITY").map(Into::into).into_iter().collect();
+    let unity = find_install_folder(&hints).and_then(|folder| UnityText::load(&folder).ok());
+    let dungeons = library.dungeons();
+    let (mut people, mut named, mut made_up) = (0, Vec::new(), Vec::new());
+    let mut by_race = std::collections::BTreeMap::new();
+    for dungeon in dungeons.iter().filter(|dungeon| dungeon.classic.is_some()) {
+        let classic = dungeon.classic.unwrap();
+        let place = PersonPlace {
+            region_index: dungeon.region_index,
+            index_in_region: classic.location_index,
+            building_key: 0,
+        };
+        for placement in &dungeon.blocks {
+            let Ok(block) = library.rdb_block(&placement.block_name) else { continue };
+            for object in &block.objects {
+                let daggerfall_dungeon_maker::arena2::RdbObjectKind::Flat(flat) = &object.kind else {
+                    continue;
+                };
+                if !is_dungeon_person(flat.texture) {
+                    continue;
+                }
+                people += 1;
+                assert!(flat.resource_offset > 0);
+                let person = person_details(
+                    flat.texture,
+                    flat.faction_or_mobile_id,
+                    Gender::from_flags(flat.flags as u8),
+                    flat.resource_offset,
+                    Ok(place),
+                    unity.as_ref(),
+                    &references,
+                );
+                let race = match person.race {
+                    PersonRace::Faction(race) | PersonRace::Region(race) => race.name(),
+                    PersonRace::RegionUnknown => "unknown",
+                };
+                *by_race.entry(race).or_insert(0) += 1;
+                match person.name {
+                    PersonName::Named(name) => named.push(name),
+                    PersonName::MadeUp(name) => made_up.push(name),
+                    PersonName::Unknown(_) => {}
+                }
+            }
+        }
+    }
+    named.sort();
+    named.dedup();
+    println!(
+        "{people} people in Daggerfall's dungeons; races {by_race:?}; named {:?}; made up {:?}",
+        &named[..named.len().min(10)],
+        &made_up[..made_up.len().min(6)]
+    );
+    assert!(named.iter().any(|name| name == "King Eadwyre"), "Wayrest's king stands in its castle");
+    assert!(by_race.contains_key(Race::Breton.name()));
+    if unity.is_some() {
+        assert!(!made_up.is_empty());
+    }
+}
+
+#[test]
+fn lights_gates_and_treasure_as_the_game_has_them() {
+    use daggerfall_dungeon_maker::buildings::interior_layout;
+    use daggerfall_dungeon_maker::encounters::DungeonType;
+    use daggerfall_dungeon_maker::lighting::{scene_lights, GameLighting, LIGHTS_ARCHIVE};
+    use daggerfall_dungeon_maker::loot::loot_table;
+    use daggerfall_dungeon_maker::scene::{Scene, SceneObjectKind};
+    let Some(mut library) = open_library() else { return };
+
+    // Settlements' gates: models 446 (open) and 447 (shut).
+    let mut gates = std::collections::BTreeMap::new();
+    let mut lamps_outdoors = 0;
+    for name in library.rmb_block_names() {
+        let block = library.rmb_block(&name).expect("the outdoor cell reads");
+        for model in block.models.iter().filter(|model| matches!(model.model_id, 446 | 447)) {
+            *gates.entry(model.model_id).or_insert(0) += 1;
+        }
+        lamps_outdoors += block.flats.iter().filter(|flat| flat.texture.archive == LIGHTS_ARCHIVE).count();
+    }
+    println!("gates {gates:?}; {lamps_outdoors} lamps outdoors");
+    assert!(gates.values().sum::<usize>() > 0, "settlements have gates");
+    assert!(lamps_outdoors > 0);
+
+    // A tavern's lamps light its inside, each one a light.
+    let block = library.rmb_block("TVRNAL01.RMB").unwrap();
+    let (record, _) =
+        block.buildings.iter().enumerate().find(|(_, building)| building.data.building_type == 15).unwrap();
+    let scene = interior_layout(&block, record, &mut library).scene;
+    let lamps = scene
+        .objects
+        .iter()
+        .filter(|object| matches!(object.kind, SceneObjectKind::Flat { texture, .. } if texture.archive == LIGHTS_ARCHIVE))
+        .count();
+    let lights = scene_lights(&scene, GameLighting::Interior, &mut library);
+    println!(
+        "the tavern's {lamps} lamps: {:?}",
+        lights.iter().map(|light| (light.range, light.intensity)).collect::<Vec<_>>()
+    );
+    assert!(lamps > 0 && lights.len() == lamps);
+    assert!(scene_lights(&scene, GameLighting::Off, &mut library).is_empty());
+
+    // A dungeon cell's lights, each reaching three times its radius.
+    let cell = library.rdb_block("S0000160.RDB").unwrap();
+    let scene = Scene::from_rdb_block(&cell);
+    let radii: Vec<f32> = scene
+        .objects
+        .iter()
+        .filter_map(|object| match object.kind {
+            SceneObjectKind::Light { radius, .. } => Some(radius),
+            _ => None,
+        })
+        .collect();
+    let lights = scene_lights(&scene, GameLighting::Dungeon, &mut library);
+    assert!(!radii.is_empty() && lights.len() == radii.len());
+    assert!(lights.iter().zip(&radii).all(|(light, radius)| (light.range - radius * 3.0).abs() < 1e-4));
+
+    // Every dungeon of the game has a treasure table.
+    for dungeon in library.dungeons().iter() {
+        if let Some(dungeon_type) = dungeon.dungeon_type {
+            assert!(loot_table(dungeon_type).is_some(), "{}", dungeon.name);
+        }
+    }
+    println!(
+        "Daggerfall's dungeon: {}",
+        loot_table(DungeonType::from_name("Human Stronghold").unwrap()).unwrap().describe()
+    );
+}
+
+#[test]
+fn plans_tests_on_empty_spots_and_where_things_are() {
+    use daggerfall_dungeon_maker::arena2::{Climate, LocationType};
+    use daggerfall_dungeon_maker::playtest::{self, places, Arrival, Setting};
+    use daggerfall_dungeon_maker::project::CellCategory;
+    use daggerfall_dungeon_maker::scene::Scene;
+
+    let Some(mut library) = open_library() else { return };
+    let world = library.world_map().expect("MAPS.BSA");
+    let clear_of_locations = |pixel: daggerfall_dungeon_maker::arena2::MapPixel| {
+        world.locations.iter().all(|location| {
+            (location.pixel.x - pixel.x).abs() > places::CLEAR_RADIUS
+                || (location.pixel.y - pixel.y).abs() > places::CLEAR_RADIUS
+        })
+    };
+
+    // An outdoor cell on its own: a one-cell location in the climate asked for, on flat land.
+    let woodlands = Climate::DEFAULT.value;
+    let plan =
+        playtest::outdoor_cell("CUSTAA05.RMB", woodlands, glam::Vec2::new(51.2, 55.2), &mut library).unwrap();
+    assert!(plan.flat_land && clear_of_locations(plan.map_pixel), "{}", plan.map_pixel);
+    assert_eq!(world.climate_at(plan.map_pixel), Some(woodlands));
+    assert_eq!(plan.arrival, Arrival::Spot(glam::Vec2::new(51.2, 55.2)));
+    let (name, location) = &plan.world_data[0];
+    assert!(
+        name.starts_with("locationnew-CUSTAA05-") && location.contains("\"HasDungeon\": false"),
+        "{name}"
+    );
+
+    // A dungeon cell on its own without anywhere to put the player gets a start marker.
+    let cell = library.rdb_block("N0000004.RDB").unwrap();
+    let mut objects = Scene::from_rdb_block(&cell).objects;
+    objects.retain(|object| !object.is_marker_record(8) && !object.is_marker_record(10));
+    let plan = playtest::dungeon_cell(
+        "N0000004.RDB",
+        &objects,
+        CellCategory::Interior,
+        Some("N0000004.RDB"),
+        &mut library,
+    )
+    .unwrap();
+    assert_eq!(plan.arrival, Arrival::InsideDungeon);
+    assert!(clear_of_locations(plan.map_pixel));
+    assert!(plan.notes.iter().any(|note| note.contains("start marker")), "{:?}", plan.notes);
+    assert!(plan.world_data.iter().any(|(name, _)| name == "N9999900.RDB.json"));
+
+    // Daggerfall's own dungeons need no world data where they are, and a copy on their own.
+    let dungeons = library.dungeons();
+    let hold = dungeons.iter().find(|dungeon| dungeon.name == "Privateer's Hold").unwrap().clone();
+    let plan = playtest::daggerfall_dungeon(&hold, Setting::WhereItIs, &mut library).unwrap();
+    assert!(plan.world_data.is_empty() && !plan.flat_land && plan.arrival == Arrival::DungeonEntrance);
+    let plan = playtest::daggerfall_dungeon(&hold, Setting::OnItsOwn, &mut library).unwrap();
+    assert!(plan.world_data.len() == 1 && plan.flat_land && clear_of_locations(plan.map_pixel));
+
+    // A settlement where it is arrives as travel does; on its own it keeps its kind.
+    let locations = library.locations();
+    let city = locations
+        .iter()
+        .filter(|location| location.name == "Daggerfall")
+        .max_by_key(|location| location.exterior.block_names.len())
+        .unwrap()
+        .clone();
+    let plan =
+        playtest::settlement(&city, None, Setting::WhereItIs, woodlands, glam::Vec2::ZERO, &mut library)
+            .unwrap();
+    assert_eq!((plan.map_pixel, plan.arrival), (city.map_pixel, Arrival::Travel));
+    let plan =
+        playtest::settlement(&city, None, Setting::OnItsOwn, woodlands, glam::Vec2::ZERO, &mut library)
+            .unwrap();
+    assert_eq!(city.location_type, Some(LocationType::City));
+    assert!(plan.world_data[0].1.contains("\"LocationType\": \"TownCity\""));
+    println!("{}", plan.plan_file());
+}
+
+#[test]
+fn tests_carry_imported_models_music_skies_and_scaled_objects() {
+    use daggerfall_dungeon_maker::arena2::MapPixel;
+    use daggerfall_dungeon_maker::custom_models::CustomModelLibrary;
+    use daggerfall_dungeon_maker::music::{song_for_seed, DUNGEON_SONGS};
+    use daggerfall_dungeon_maker::playtest::{self, Setting};
+    use daggerfall_dungeon_maker::project::{
+        CellCategory, DungeonLocation, Project, ProjectDungeonRoom, ProjectEntry, ProjectRoom,
+    };
+    use daggerfall_dungeon_maker::scene::{ModelData, Scene, SceneObjectKind};
+
+    let Some(mut library) = open_library() else { return };
+    let tags = library.model_tags();
+    let folder = std::env::temp_dir().join(format!("ddm-test-content-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    std::fs::create_dir_all(&folder).unwrap();
+    let obj = folder.join("pillar.obj");
+    std::fs::write(&obj, "v 0 0 0\nv 1 0 0\nv 0 2 0\nf 1 2 3\n").unwrap();
+    let (mut custom_models, _) = CustomModelLibrary::open(folder.join("store"));
+    let model_id = custom_models.import(&obj).expect("the model imports").model.id;
+    custom_models.register(&mut library);
+
+    // A dungeon cell with an imported model and a scaled plain model: the
+    // model stays in the cell and its files go into the test's content mod,
+    // whose script puts the scaled model in place.
+    let mut objects = Scene::from_rdb_block(&library.rdb_block("N0000004.RDB").unwrap()).objects;
+    let scaled = (0..objects.len())
+        .find(|&index| {
+            matches!(objects[index].kind, SceneObjectKind::Model { .. })
+                && Scene::scale_blocker(&objects, index, &tags).is_none()
+        })
+        .expect("a plain model");
+    objects[scaled].scale = Some(glam::Vec3::splat(2.0));
+    let mut pillar = objects[scaled].clone();
+    pillar.kind = SceneObjectKind::Model { model_id, data: ModelData::default() };
+    pillar.scale = None;
+    pillar.id = objects.iter().map(|object| object.id).max().unwrap() + 1;
+    pillar.next = None;
+    objects.push(pillar);
+    let plan = playtest::dungeon_cell(
+        "N0000004.RDB",
+        &objects,
+        CellCategory::Interior,
+        Some("N0000004.RDB"),
+        &mut library,
+    )
+    .unwrap();
+    let content = plan.content.as_ref().expect("a content mod");
+    let copied: Vec<&str> = content.copied_files.iter().map(|file| file.path.as_str()).collect();
+    assert!(copied.contains(&format!("Models/{model_id}_model.json").as_str()), "{copied:?}");
+    let script = content.files.iter().find(|file| file.path.ends_with("ScaledObjects.cs.txt")).unwrap();
+    assert!(script.contents.contains("\"Test of N0000004\"") && script.contents.contains("\"N9999900.RDB\""));
+    let manifest = content.files.iter().find(|file| file.path == content.manifest_path()).unwrap();
+    assert!(manifest.contents.contains(&format!("Models/{model_id}_model.json")));
+    assert!(!manifest.contents.contains("WorldData"), "the world data stays loose");
+    let (_, block) = plan.world_data.iter().find(|(name, _)| name == "N9999900.RDB.json").unwrap();
+    assert!(block.contains(&format!("\"{model_id}\"")), "the imported model is in the cell");
+    assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+
+    // A project dungeon on its own with its own music and sky and a chosen
+    // song: the content mod plays and shows them there, and the song plays.
+    let music = folder.join("theme.ogg");
+    std::fs::write(&music, b"OggS").unwrap();
+    let sky = folder.join("sky.png");
+    std::fs::write(&sky, b"\x89PNG").unwrap();
+    let dungeons = library.dungeons();
+    let original = dungeons.iter().find(|dungeon| dungeon.name == "Privateer's Hold").unwrap();
+    let start = original.blocks.iter().find(|block| block.is_starting_block).unwrap();
+    let mut project = Project::default();
+    let room_id = project.new_id();
+    project.add(
+        ProjectEntry::Room(ProjectRoom {
+            id: room_id,
+            name: "Start".to_string(),
+            based_on: Some(start.block_name.clone()),
+            category: CellCategory::Interior,
+            objects: Scene::from_rdb_block(&library.rdb_block(&start.block_name).unwrap()).objects,
+        }),
+        None,
+    );
+    let dungeon_id = project.add_empty_dungeon("Hold of Tests");
+    let song = DUNGEON_SONGS[3];
+    let dungeon = project.dungeon_mut(dungeon_id).unwrap();
+    dungeon.dungeon_type = original.dungeon_type;
+    dungeon.rooms = ProjectDungeonRoom::layout_of(original);
+    for room in &mut dungeon.rooms {
+        if room.is_starting_block {
+            room.room = Some(room_id);
+        }
+    }
+    dungeon.location = DungeonLocation {
+        music: Some(song),
+        custom_music: true,
+        custom_music_file: music.display().to_string(),
+        skybox: true,
+        skybox_file: sky.display().to_string(),
+        ..DungeonLocation::copied_from(original)
+    };
+    let plan = playtest::project_dungeon(&project, dungeon_id, Setting::OnItsOwn, &mut library).unwrap();
+    let content = plan.content.as_ref().expect("a content mod");
+    let paths: Vec<&str> = content.files.iter().map(|file| file.path.as_str()).collect();
+    let copied: Vec<&str> = content.copied_files.iter().map(|file| file.path.as_str()).collect();
+    assert!(paths.iter().any(|path| path.ends_with("DungeonMusic.cs.txt")), "{paths:?}");
+    assert!(paths.iter().any(|path| path.ends_with("DungeonSky.cs.txt")), "{paths:?}");
+    assert!(copied.contains(&"Music/dungeon_maker_test_content_music_0.ogg"), "{copied:?}");
+    assert!(copied.contains(&"Sky/dungeon_maker_test_content_sky_0.png"), "{copied:?}");
+    assert!(content
+        .files
+        .iter()
+        .all(|file| !file.path.ends_with(".cs.txt") || file.contents.contains("\"Hold of Tests\"")));
+    let (_, location) = plan.world_data.iter().find(|(name, _)| name.starts_with("locationnew-")).unwrap();
+    let location: serde_json::Value = serde_json::from_str(location).unwrap();
+    let seed = location["Dungeon"]["RecordElement"]["Header"]["Unknown2"].as_u64().unwrap() as u32;
+    let region = location["RegionIndex"].as_u64().unwrap() as usize;
+    assert_eq!(song_for_seed(seed, region), song);
+
+    // Without its music file, the test goes without it and says so.
+    std::fs::remove_file(&music).unwrap();
+    let plan = playtest::project_dungeon(&project, dungeon_id, Setting::OnItsOwn, &mut library).unwrap();
+    assert!(plan.notes.iter().any(|note| note.contains("was not found")), "{:?}", plan.notes);
+    let content = plan.content.as_ref().expect("the sky still needs a content mod");
+    assert!(!content.files.iter().any(|file| file.path.ends_with("DungeonMusic.cs.txt")));
+    project.dungeon_mut(dungeon_id).unwrap().location.custom_music = false;
+
+    // Where it is, the export's scripts and files come too, without its world data.
+    let world = library.world_map().unwrap();
+    let home = original.map_pixel.unwrap();
+    let pixel = (-20..=20)
+        .flat_map(|dx| (-20..=20).map(move |dy| MapPixel::new(home.x + dx, home.y + dy)))
+        .find(|&pixel| {
+            world.region_at(pixel) == Some(original.region_index)
+                && world.locations_at(pixel).next().is_none()
+        })
+        .expect("a free spot nearby");
+    project.dungeon_mut(dungeon_id).unwrap().location.map_pixel = Some(pixel);
+    let plan = playtest::project_dungeon(&project, dungeon_id, Setting::WhereItIs, &mut library).unwrap();
+    let content = plan.content.as_ref().expect("a content mod");
+    assert!(content.files.iter().any(|file| file.path.ends_with("DungeonSky.cs.txt")));
+    assert!(content.files.iter().all(|file| !file.path.starts_with("WorldData/")));
+    assert!(plan.world_data.iter().any(|(name, _)| name.starts_with("locationnew-Hold_of_Tests-")));
+    std::fs::remove_dir_all(&folder).unwrap();
 }

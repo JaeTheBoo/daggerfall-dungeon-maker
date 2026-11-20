@@ -38,6 +38,8 @@ pub struct EditorResources<'resources> {
     pub texture_setting: &'resources mut TextureSetting,
     /// The texture mode in Daggerfall Unity's own settings, if they were found.
     pub game_texture_mode: Option<TextureMode>,
+    /// Daggerfall Unity's word lists, which people's names are made from, if found.
+    pub unity: Option<&'resources crate::unity_install::UnityText>,
 }
 
 impl EditorResources<'_> {

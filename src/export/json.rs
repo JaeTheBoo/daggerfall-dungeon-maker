@@ -334,7 +334,8 @@ impl Block {
 // Locations
 // ---------------------------------------------------------------------------
 
-/// A `DFLocation`: a location with a dungeon.
+/// A `DFLocation`: a location with a dungeon (or, for a test, one without:
+/// see [`Location::new_dungeon`]).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct Location {
@@ -487,12 +488,15 @@ pub struct NewDungeon<'a> {
     pub climate: Option<u8>,
     /// The entrance above ground, copied from a Daggerfall dungeon.
     pub exterior: &'a LocationExterior,
+    /// The dungeon's blocks. Without any, the location has no dungeon (only
+    /// tests make such locations: see [`crate::playtest`]).
     pub blocks: Vec<DungeonBlock>,
 }
 
 impl Location {
     /// A location holding a dungeon: a new one, or one replacing a location
-    /// of the game, which keeps what identifies it.
+    /// of the game, which keeps what identifies it. (A location without
+    /// dungeon blocks has no dungeon.)
     pub fn new_dungeon(dungeon: NewDungeon<'_>) -> Self {
         let NewDungeon {
             name,
@@ -560,7 +564,7 @@ impl Location {
             loaded: true,
             name: name.to_string(),
             region_name: canonical_region_name(region_index).to_string(),
-            has_dungeon: true,
+            has_dungeon: !blocks.is_empty(),
             map_table_data: MapTableData {
                 map_id,
                 latitude,
@@ -858,6 +862,7 @@ mod tests {
             height: 1,
             block_names: vec!["RUINAA24.RMB".to_string()],
             buildings: Vec::new(),
+            port_town: false,
         };
         let location = Location::new_dungeon(NewDungeon {
             name: "Test Hold",
@@ -906,6 +911,7 @@ mod tests {
             height: 1,
             block_names: vec!["RUINAA24.RMB".to_string()],
             buildings: Vec::new(),
+            port_town: false,
         };
         // The numbers of Daggerfall's own "Ruins of The Caorchom Farmstead".
         let classic = ClassicLocation {

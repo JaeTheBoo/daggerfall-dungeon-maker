@@ -27,6 +27,7 @@ use glam::{Vec2, Vec3, Vec4};
 
 use crate::arena2::{Arena2Library, TextureKey, RDB_BLOCK_SIDE};
 use crate::camera::OrbitCamera;
+use crate::lighting::GameLighting;
 use crate::picking::LIGHT_PICK_RADIUS;
 use crate::scene::{box_corners, Scene, SceneObject, SceneObjectKind};
 use gpu_types::{BillboardInstance, CameraUniform, LineBatch, LineVertex, ModelInstance, ModelVertex};
@@ -66,6 +67,15 @@ const ROOM_OUTLINE_COLOR: Vec4 = Vec4::new(0.75, 0.6, 0.2, 1.0);
 const HIGHLIGHTED_ROOM_OUTLINE_COLOR: Vec4 = Vec4::new(0.45, 0.8, 1.0, 1.0);
 /// Colour of the lines drawn for a light about to be placed.
 const PLACEMENT_PREVIEW_LINE_COLOR: Vec4 = Vec4::new(0.35, 1.0, 0.55, 1.0);
+/// Colour of the boxes round buildings' entrances, and of the highlighted ones.
+const ENTRANCE_BOX_COLOR: Vec4 = Vec4::new(0.2, 0.85, 0.35, 1.0);
+const HIGHLIGHTED_ENTRANCE_BOX_COLOR: Vec4 = Vec4::new(0.65, 1.0, 0.7, 1.0);
+/// Colour of the boxes round the exits inside a building, and of the highlighted ones.
+const EXIT_BOX_COLOR: Vec4 = Vec4::new(1.0, 0.5, 0.1, 1.0);
+const HIGHLIGHTED_EXIT_BOX_COLOR: Vec4 = Vec4::new(1.0, 0.85, 0.55, 1.0);
+/// Colour of the boxes round dungeons' entrances, and of the highlighted ones.
+const DUNGEON_ENTRANCE_BOX_COLOR: Vec4 = Vec4::new(0.95, 0.15, 0.15, 1.0);
+const HIGHLIGHTED_DUNGEON_ENTRANCE_BOX_COLOR: Vec4 = Vec4::new(1.0, 0.6, 0.6, 1.0);
 /// Spacing of the floor grid, in world units (128 native units).
 const GRID_SPACING: f32 = RDB_BLOCK_SIDE / 16.0;
 /// How far the grid extends beyond the room on every side, in grid cells.
@@ -86,6 +96,9 @@ pub struct ViewSettings {
     pub show_action_links: bool,
     /// Doors the game switches off because they overlap another door, tinted red.
     pub show_switched_off_doors: bool,
+    /// Draw with the game's lighting: dungeons dark but for their lights,
+    /// insides lit by their lamps, settlements at night.
+    pub game_lighting: bool,
 }
 
 impl Default for ViewSettings {
@@ -100,6 +113,7 @@ impl Default for ViewSettings {
             show_lights: true,
             show_action_links: true,
             show_switched_off_doors: true,
+            game_lighting: false,
         }
     }
 }
@@ -183,6 +197,33 @@ pub struct FrameRequest<'frame> {
     /// Objects of the scene tinted red as a warning, such as doors the game
     /// switches off (when [`ViewSettings::show_switched_off_doors`] is on).
     pub warned_objects: &'frame [usize],
+    /// Boxes round the entrances of buildings that can be entered (green),
+    /// round the exits inside a building (orange) and round dungeons'
+    /// entrances (red).
+    pub entrance_boxes: &'frame [EntranceBox],
+    /// Whether to draw with the game's lighting, and which.
+    pub lighting: GameLighting,
+}
+
+/// A box drawn round a way into or out of a building.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntranceBox {
+    /// Its corners, as [`crate::scene::box_corners`] orders them.
+    pub corners: [Vec3; 8],
+    /// Drawn brighter, for the one under the pointer or selected.
+    pub highlighted: bool,
+    pub kind: EntranceKind,
+}
+
+/// Which way an [`EntranceBox`] leads, which gives its colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntranceKind {
+    /// Into a building, seen from outside: green.
+    Entrance,
+    /// Out of a building, seen from inside: orange.
+    Exit,
+    /// Into a dungeon: red.
+    DungeonEntrance,
 }
 
 /// Whose textures a model is drawn with.
@@ -362,7 +403,7 @@ impl SceneRenderer {
             label: Some("camera layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -545,8 +586,18 @@ impl SceneRenderer {
         let aspect_ratio = width as f32 / height.max(1) as f32;
         let camera = request.camera;
         let billboard_right = Vec3::new(camera.right().x, 0.0, camera.right().z).normalize_or_zero();
-        let camera_uniform =
+        let mut camera_uniform =
             CameraUniform::new(camera.view_projection(aspect_ratio), camera.eye_position(), billboard_right);
+        // The game's lighting: its ambient light, and the lights nearest what the camera looks at.
+        if let (Some(ambient), Some(scene)) = (request.lighting.ambient(), request.scene) {
+            let mut lights = crate::lighting::scene_lights(scene, request.lighting, library);
+            // The cells around a cell light it too.
+            if let Some(context) = request.context_scene {
+                lights.extend(crate::lighting::scene_lights(context, request.lighting, library));
+            }
+            let lights = crate::lighting::nearest_lights(lights, camera.target, crate::lighting::MAX_LIGHTS);
+            camera_uniform = camera_uniform.with_lighting(ambient, &lights);
+        }
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
         let view_projection = camera.view_projection(aspect_ratio);
         let sky = request.sky.filter(|path| self.sky.prepare(device, queue, path, view_projection));
@@ -853,6 +904,21 @@ fn build_helper_lines(library: &mut Arena2Library, request: &FrameRequest<'_>) -
                 lines.add_line(corners[side], corners[(side + 1) % 4], color);
             }
         }
+    }
+
+    // Highlighted entrances last, so they show over the others.
+    let entrances = request.entrance_boxes.iter().filter(|entrance| !entrance.highlighted);
+    let highlighted = request.entrance_boxes.iter().filter(|entrance| entrance.highlighted);
+    for entrance in entrances.chain(highlighted) {
+        let color = match (entrance.kind, entrance.highlighted) {
+            (EntranceKind::Entrance, false) => ENTRANCE_BOX_COLOR,
+            (EntranceKind::Entrance, true) => HIGHLIGHTED_ENTRANCE_BOX_COLOR,
+            (EntranceKind::Exit, false) => EXIT_BOX_COLOR,
+            (EntranceKind::Exit, true) => HIGHLIGHTED_EXIT_BOX_COLOR,
+            (EntranceKind::DungeonEntrance, false) => DUNGEON_ENTRANCE_BOX_COLOR,
+            (EntranceKind::DungeonEntrance, true) => HIGHLIGHTED_DUNGEON_ENTRANCE_BOX_COLOR,
+        };
+        lines.add_box(&entrance.corners, color);
     }
 
     for object in request.placement_preview {

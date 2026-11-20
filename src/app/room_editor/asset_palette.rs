@@ -21,7 +21,7 @@ use glam::Vec3;
 
 use crate::app::viewport_tools::EditorResources;
 use crate::arena2::{Arena2Library, TextureKey};
-use crate::catalog::{flat_description, AssetCatalog};
+use crate::catalog::{flat_description, AssetCatalog, FlatAsset};
 use crate::custom_models::CustomModelLibrary;
 use crate::custom_names::{CustomNames, Favorite};
 use crate::prefabs::{PrefabId, PrefabLibrary};
@@ -193,19 +193,21 @@ enum PaletteTab {
     ExteriorModels,
     AllModels,
     Flats,
+    AllFlats,
     Markers,
     Lights,
     CustomModels,
 }
 
 impl PaletteTab {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Favorites,
         Self::Prefabs,
         Self::DungeonModels,
         Self::ExteriorModels,
         Self::AllModels,
         Self::Flats,
+        Self::AllFlats,
         Self::Markers,
         Self::Lights,
         Self::CustomModels,
@@ -219,6 +221,7 @@ impl PaletteTab {
             Self::ExteriorModels => "Exterior Models",
             Self::AllModels => "All Models",
             Self::Flats => "Flats",
+            Self::AllFlats => "All Flats",
             Self::Markers => "Markers",
             Self::Lights => "Lights",
             Self::CustomModels => "Custom Models",
@@ -238,6 +241,10 @@ impl PaletteTab {
             }
             Self::AllModels => "Every model in ARCH3D.BSA",
             Self::Flats => "Billboard sprites used in dungeon cells: torches, furniture, people, treasure",
+            Self::AllFlats => {
+                "Every image of Daggerfall's flat archives, also those no dungeon cell uses: people, \
+                 furniture, plants, statues, crops and trees. Search by archive name, for example Plants"
+            }
             Self::Markers => {
                 "Editor markers: start and enter points, enemy spawns, quest and treasure markers"
             }
@@ -287,7 +294,7 @@ pub struct AssetPalette {
     /// Edge length of each tile, in points.
     tile_size: f32,
     /// egui textures for flat thumbnails; `None` marks textures that failed to load.
-    flat_thumbnails: HashMap<TextureKey, Option<egui::TextureHandle>>,
+    flat_thumbnails: HashMap<TextureKey, Option<crate::app::kept_texture::KeptTexture>>,
     /// What the user asked to do with one of their imported models, for the application to do.
     model_request: Option<CustomModelRequest>,
 }
@@ -573,15 +580,18 @@ impl AssetPalette {
                         model_matches(model_id).then(|| entry(asset, model_usage(model_id)))
                     }
                     PlaceableAsset::Flat { texture } => {
-                        let flat =
-                            catalog.flats.iter().chain(&catalog.markers).find(|flat| flat.texture == texture);
-                        let description =
-                            flat.map_or_else(|| flat_description(texture), |flat| flat.description());
-                        let usage = match flat {
-                            Some(flat) => format!("{texture}\nUsed in {} cells", flat.room_count),
-                            None => texture.to_string(),
+                        let flat = catalog
+                            .flats
+                            .iter()
+                            .chain(&catalog.all_flats)
+                            .chain(&catalog.markers)
+                            .find(|flat| flat.texture == texture);
+                        let usage = flat.map_or_else(|| texture.to_string(), FlatAsset::usage);
+                        let found = match flat {
+                            Some(flat) => flat.matches(&search),
+                            None => matches(&flat_description(texture)),
                         };
-                        matches(&description).then(|| entry(asset, usage))
+                        found.then(|| entry(asset, usage))
                     }
                     PlaceableAsset::Light => matches("light").then(|| {
                         entry(
@@ -643,15 +653,16 @@ impl AssetPalette {
                 .filter(|&&model_id| model_matches(model_id))
                 .map(|&model_id| entry(PlaceableAsset::Model { model_id }, model_usage(model_id)))
                 .collect(),
-            PaletteTab::Flats | PaletteTab::Markers => {
-                let flats = if self.tab == PaletteTab::Flats { &catalog.flats } else { &catalog.markers };
+            PaletteTab::Flats | PaletteTab::AllFlats | PaletteTab::Markers => {
+                let flats = match self.tab {
+                    PaletteTab::Flats => &catalog.flats,
+                    PaletteTab::AllFlats => &catalog.all_flats,
+                    _ => &catalog.markers,
+                };
                 flats
                     .iter()
-                    .filter(|flat| matches(&flat.description()))
-                    .map(|flat| {
-                        let usage = format!("{}\nUsed in {} cells", flat.texture, flat.room_count);
-                        entry(PlaceableAsset::Flat { texture: flat.texture }, usage)
-                    })
+                    .filter(|flat| flat.matches(&search))
+                    .map(|flat| entry(PlaceableAsset::Flat { texture: flat.texture }, flat.usage()))
                     .collect()
             }
             PaletteTab::Lights => vec![entry(
@@ -719,11 +730,11 @@ impl AssetPalette {
                                 [image.width as usize, image.height as usize],
                                 &image.pixels,
                             );
-                            context.load_texture(
+                            crate::app::kept_texture::KeptTexture::new(context.load_texture(
                                 texture.to_string(),
                                 color_image,
                                 egui::TextureOptions::NEAREST,
-                            )
+                            ))
                         }))
                     }
                 };

@@ -70,8 +70,8 @@ const NEW_BLOCK_NUMBERS: u64 = 1_000_000;
 /// Daggerfall Unity identifies saved objects (opened doors, killed enemies)
 /// by their block's position plus their own. Daggerfall's blocks sit below
 /// 30 million; new blocks are spaced from here so none overlap.
-const NEW_BLOCK_POSITION_BASE: i64 = 10_000_000_000;
-const NEW_BLOCK_POSITION_STRIDE: i64 = 1_000_000;
+pub(crate) const NEW_BLOCK_POSITION_BASE: i64 = 10_000_000_000;
+pub(crate) const NEW_BLOCK_POSITION_STRIDE: i64 = 1_000_000;
 /// Gap between the positions of objects in a new block.
 const OBJECT_POSITION_STRIDE: i32 = 16;
 /// Location ids for new locations are picked from this range (two each:
@@ -291,7 +291,8 @@ fn dungeon_notes(
             .collect();
         cell_names.dedup();
         notes.push(format!(
-            "Daggerfall Unity switches off {} door(s) within {} m of another door, as it does in Daggerfall's              own dungeons (in {}); the dungeon view tints them red",
+            "Daggerfall Unity switches off {} door(s) within {} m of another door, as it does in Daggerfall's \
+             own dungeons (in {}); the dungeon view tints them red",
             off.len(),
             crate::doors::OVERLAP_DISTANCE,
             cell_names.join(", ")
@@ -299,6 +300,13 @@ fn dungeon_notes(
     }
     if let FoyerDoors::Lost(reason) = foyer_doors(project, dungeon, library, definitions) {
         notes.push(reason);
+    }
+    if !cells.is_empty() && !has_quest_marker(&cells) {
+        notes.push(
+            "No cell has a quest marker or a quest item marker, so quests never send the player here: when \
+             a quest picks a dungeon, Daggerfall Unity skips one without them"
+                .to_string(),
+        );
     }
     notes
 }
@@ -588,14 +596,25 @@ fn dungeon_problems(
     match starts.as_slice() {
         [] if !dungeon.rooms.is_empty() => problems.push("No cell is the start cell".to_string()),
         [start] => {
-            let has_exit = match start.room {
-                Some(room_id) => project.room(room_id).is_some_and(|room| has_exit_door(&room.objects)),
+            let objects = match start.room {
+                Some(room_id) => project.room(room_id).map(|room| room.objects.clone()),
                 None => library
                     .rdb_block(&start.block_name)
-                    .is_ok_and(|block| has_exit_door(&Scene::from_rdb_block(&block).objects)),
+                    .ok()
+                    .map(|block| Scene::from_rdb_block(&block).objects),
             };
-            if !has_exit {
-                problems.push("Its start cell has no exit door".to_string());
+            // A missing cell is reported below.
+            if let Some(objects) = objects {
+                if !has_exit_door(&objects) {
+                    problems.push("Its start cell has no exit door".to_string());
+                }
+                if !has_arrival_marker(&objects) {
+                    problems.push(
+                        "Its start cell has no start marker or enter marker, so Daggerfall Unity has nowhere \
+                         to put the player and does not load the dungeon"
+                            .to_string(),
+                    );
+                }
             }
         }
         [_, ..] => problems.push("More than one cell is the start cell".to_string()),
@@ -666,6 +685,24 @@ fn name_problems(
 /// Whether `objects` include the door that leads out of a dungeon.
 fn has_exit_door(objects: &[SceneObject]) -> bool {
     objects.iter().any(SceneObject::is_exit_door)
+}
+
+/// Whether `objects` have a marker Daggerfall Unity can put the player at
+/// when they enter: an enter marker, or else a start marker.
+fn has_arrival_marker(objects: &[SceneObject]) -> bool {
+    objects.iter().any(|object| {
+        object.is_marker_record(crate::scene::ENTER_MARKER_RECORD)
+            || object.is_marker_record(crate::scene::START_MARKER_RECORD)
+    })
+}
+
+/// Whether any of the dungeon's `cells` has a quest marker or a quest item
+/// marker. Quests that pick a dungeon at random skip one without either.
+fn has_quest_marker(cells: &[(&ProjectDungeonRoom, Vec<SceneObject>)]) -> bool {
+    cells.iter().flat_map(|(_, objects)| objects).any(|object| {
+        object.is_marker_record(crate::scene::QUEST_MARKER_RECORD)
+            || object.is_marker_record(crate::scene::QUEST_ITEM_MARKER_RECORD)
+    })
 }
 
 /// How many different models `objects` use.
@@ -785,25 +822,13 @@ pub fn build_mod(
 
     let mut exported = Vec::new();
     let mut taken_location_files = HashSet::new();
-    let mut copied_files = Vec::new();
+    let mut extras = ModExtras::default();
     // The user's models the cells use go into the mod, for its build to make prefabs of.
     if for_dfmod {
         let used: std::collections::BTreeSet<u32> =
             ready.iter().flat_map(|dungeon| custom_models_used(project, dungeon)).collect();
-        for model_id in used {
-            let files = library.custom_model_files(model_id).ok_or("a custom model is no longer imported")?;
-            for source in files {
-                let name =
-                    source.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
-                copied_files
-                    .push(CopiedFile { path: format!("{MODELS_FOLDER}/{name}"), source: source.clone() });
-            }
-        }
+        extras.add_custom_models(used, library)?;
     }
-    let mut music_entries = Vec::new();
-    let mut sky_entries = Vec::new();
-    let mut scaled_dungeons = Vec::new();
-    let mut scaled_entries = Vec::new();
     for dungeon in &ready {
         let pixel = dungeon.location.map_pixel.ok_or("a dungeon lost its place")?;
         let replaced = match &dungeon.location.replaces {
@@ -898,68 +923,28 @@ pub fn build_mod(
         let custom_music =
             dungeon.location.custom_music.then(|| PathBuf::from(dungeon.location.custom_music_file.trim()));
         if let Some(source) = &custom_music {
-            let extension =
-                source.extension().and_then(|extension| extension.to_str()).unwrap_or("ogg").to_lowercase();
-            let asset_name =
-                format!("{}_music_{}.{extension}", file_name.to_lowercase(), music_entries.len());
-            copied_files
-                .push(CopiedFile { path: format!("{MUSIC_FOLDER}/{asset_name}"), source: source.clone() });
-            music_entries.push(music_script::DungeonMusic {
-                region_index,
-                location_name: name.to_string(),
-                asset_name,
-            });
+            extras.add_music(&file_name, region_index, name, source);
         }
         // Its sky: the image goes into the mod, and the script shows it here.
         let skybox = dungeon.location.skybox.then(|| PathBuf::from(dungeon.location.skybox_file.trim()));
         if let Some(source) = &skybox {
-            let extension =
-                source.extension().and_then(|extension| extension.to_str()).unwrap_or("png").to_lowercase();
-            let stem = format!("{}_sky_{}", file_name.to_lowercase(), sky_entries.len());
-            copied_files.push(CopiedFile {
-                path: format!("{SKY_FOLDER}/{stem}.{extension}"),
-                source: source.clone(),
-            });
-            sky_entries.push(sky_script::DungeonSky {
-                region_index,
-                location_name: name.to_string(),
-                material_name: format!("{stem}.mat"),
-                image_name: format!("{stem}.{extension}"),
-            });
+            extras.add_sky(&file_name, region_index, name, source);
         }
         // Its scaled objects, which the script puts in each cell they belong to.
-        let scaled_before = scaled_entries.len();
-        for placement in &dungeon.rooms {
-            let Some(room_id) = placement.room else { continue };
-            let (Some(objects), Some(block_name)) = (scaled_by_room.get(&room_id), block_names.get(&room_id))
-            else {
-                continue;
-            };
-            scaled_entries.extend(objects.iter().filter_map(|object| {
-                let shape = match object.kind {
-                    SceneObjectKind::Model { model_id, .. } => scale_script::ScaledShape::Model(model_id),
-                    SceneObjectKind::Flat { texture, .. } => {
-                        scale_script::ScaledShape::Flat { archive: texture.archive, record: texture.record }
-                    }
-                    SceneObjectKind::Light { .. } => return None,
-                };
-                Some(scale_script::ScaledObject {
-                    dungeon: scaled_dungeons.len(),
-                    block_name: block_name.clone(),
+        let scaled_cells: Vec<ScaledCell<'_>> = dungeon
+            .rooms
+            .iter()
+            .filter_map(|placement| {
+                let room_id = placement.room?;
+                Some(ScaledCell {
+                    block_name: block_names.get(&room_id)?,
                     grid_x: placement.grid_x,
                     grid_z: placement.grid_z,
-                    shape,
-                    position: object.position,
-                    rotation: object.rotation(),
-                    scale: object.scale_or_one(),
+                    objects: scaled_by_room.get(&room_id)?,
                 })
-            }));
-        }
-        let scaled_count = scaled_entries.len() - scaled_before;
-        if scaled_count > 0 {
-            scaled_dungeons
-                .push(scale_script::ScaledDungeon { region_index, location_name: name.to_string() });
-        }
+            })
+            .collect();
+        let scaled_count = extras.add_scaled(region_index, name, &scaled_cells);
         exported.push(ExportedDungeon {
             name: dungeon.name.clone(),
             region_index,
@@ -970,26 +955,179 @@ pub fn build_mod(
             scaled_objects: scaled_count,
         });
     }
-    if !music_entries.is_empty() {
-        files.push(ExportedFile {
-            path: format!("{file_name}DungeonMusic.cs.txt"),
-            contents: music_script::music_script(&file_name, &music_entries),
-        });
+    files.extend(extras.scripts(&file_name));
+    files.sort_by(|first, second| first.path.cmp(&second.path));
+    let copied_files = extras.copied_files;
+    files.push(manifest_file(&title, &file_name, details, &files, &copied_files));
+
+    Ok(ModFiles { title, file_name, files, copied_files, dungeons: exported, cells })
+}
+
+/// What a mod carries that only a `.dfmod` can, besides its world data: the
+/// user's models, the dungeons' music and skies, and the scripts that play
+/// that music, show those skies and put the scaled objects in place.
+#[derive(Debug, Default)]
+pub(crate) struct ModExtras {
+    /// The models', music and skies' files.
+    pub(crate) copied_files: Vec<CopiedFile>,
+    music: Vec<music_script::DungeonMusic>,
+    skies: Vec<sky_script::DungeonSky>,
+    scaled_dungeons: Vec<scale_script::ScaledDungeon>,
+    scaled: Vec<scale_script::ScaledObject>,
+}
+
+/// A cell of a dungeon, with the scaled objects left out of it for a mod's
+/// script to put in place (see [`scaled_objects`]).
+pub(crate) struct ScaledCell<'objects> {
+    /// Its block's name, as the dungeon names it.
+    pub(crate) block_name: &'objects str,
+    pub(crate) grid_x: i32,
+    pub(crate) grid_z: i32,
+    pub(crate) objects: &'objects [SceneObject],
+}
+
+impl ModExtras {
+    /// Whether there is nothing that needs a `.dfmod`.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.copied_files.is_empty() && self.scaled.is_empty()
     }
-    if !sky_entries.is_empty() {
-        files.push(ExportedFile {
-            path: format!("{file_name}DungeonSky.cs.txt"),
-            contents: sky_script::sky_script(&file_name, &sky_entries),
-        });
+
+    /// Adds the files of the user's models `model_ids`.
+    pub(crate) fn add_custom_models(
+        &mut self,
+        model_ids: impl IntoIterator<Item = u32>,
+        library: &Arena2Library,
+    ) -> Result<(), String> {
+        for model_id in model_ids {
+            let files = library.custom_model_files(model_id).ok_or("a custom model is no longer imported")?;
+            for source in files {
+                let name =
+                    source.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+                self.copied_files
+                    .push(CopiedFile { path: format!("{MODELS_FOLDER}/{name}"), source: source.clone() });
+            }
+        }
+        Ok(())
     }
-    if !scaled_entries.is_empty() {
-        files.push(ExportedFile {
-            path: format!("{file_name}ScaledObjects.cs.txt"),
-            contents: scale_script::scale_script(&file_name, &scaled_dungeons, &scaled_entries),
+
+    /// Adds `source` as the music of the dungeon `location_name` of region
+    /// `region_index`, in the mod `file_name`.
+    pub(crate) fn add_music(
+        &mut self,
+        file_name: &str,
+        region_index: usize,
+        location_name: &str,
+        source: &Path,
+    ) {
+        let extension =
+            source.extension().and_then(|extension| extension.to_str()).unwrap_or("ogg").to_lowercase();
+        let asset_name = format!("{}_music_{}.{extension}", file_name.to_lowercase(), self.music.len());
+        self.copied_files
+            .push(CopiedFile { path: format!("{MUSIC_FOLDER}/{asset_name}"), source: source.to_path_buf() });
+        self.music.push(music_script::DungeonMusic {
+            region_index,
+            location_name: location_name.to_string(),
+            asset_name,
         });
     }
 
-    files.sort_by(|first, second| first.path.cmp(&second.path));
+    /// Adds the image `source` as the sky of the dungeon `location_name` of
+    /// region `region_index`, in the mod `file_name`.
+    pub(crate) fn add_sky(
+        &mut self,
+        file_name: &str,
+        region_index: usize,
+        location_name: &str,
+        source: &Path,
+    ) {
+        let extension =
+            source.extension().and_then(|extension| extension.to_str()).unwrap_or("png").to_lowercase();
+        let stem = format!("{}_sky_{}", file_name.to_lowercase(), self.skies.len());
+        self.copied_files.push(CopiedFile {
+            path: format!("{SKY_FOLDER}/{stem}.{extension}"),
+            source: source.to_path_buf(),
+        });
+        self.skies.push(sky_script::DungeonSky {
+            region_index,
+            location_name: location_name.to_string(),
+            material_name: format!("{stem}.mat"),
+            image_name: format!("{stem}.{extension}"),
+        });
+    }
+
+    /// Adds the scaled objects of `cells` of the dungeon `location_name` of
+    /// region `region_index`. Returns how many there are.
+    pub(crate) fn add_scaled(
+        &mut self,
+        region_index: usize,
+        location_name: &str,
+        cells: &[ScaledCell<'_>],
+    ) -> usize {
+        let before = self.scaled.len();
+        let dungeon = self.scaled_dungeons.len();
+        for cell in cells {
+            self.scaled.extend(cell.objects.iter().filter_map(|object| {
+                let shape = match object.kind {
+                    SceneObjectKind::Model { model_id, .. } => scale_script::ScaledShape::Model(model_id),
+                    SceneObjectKind::Flat { texture, .. } => {
+                        scale_script::ScaledShape::Flat { archive: texture.archive, record: texture.record }
+                    }
+                    SceneObjectKind::Light { .. } => return None,
+                };
+                Some(scale_script::ScaledObject {
+                    dungeon,
+                    block_name: cell.block_name.to_string(),
+                    grid_x: cell.grid_x,
+                    grid_z: cell.grid_z,
+                    shape,
+                    position: object.position,
+                    rotation: object.rotation(),
+                    scale: object.scale_or_one(),
+                })
+            }));
+        }
+        let count = self.scaled.len() - before;
+        if count > 0 {
+            self.scaled_dungeons
+                .push(scale_script::ScaledDungeon { region_index, location_name: location_name.to_string() });
+        }
+        count
+    }
+
+    /// The scripts of the mod `file_name` for what was added.
+    pub(crate) fn scripts(&self, file_name: &str) -> Vec<ExportedFile> {
+        let mut scripts = Vec::new();
+        if !self.music.is_empty() {
+            scripts.push(ExportedFile {
+                path: format!("{file_name}DungeonMusic.cs.txt"),
+                contents: music_script::music_script(file_name, &self.music),
+            });
+        }
+        if !self.skies.is_empty() {
+            scripts.push(ExportedFile {
+                path: format!("{file_name}DungeonSky.cs.txt"),
+                contents: sky_script::sky_script(file_name, &self.skies),
+            });
+        }
+        if !self.scaled.is_empty() {
+            scripts.push(ExportedFile {
+                path: format!("{file_name}ScaledObjects.cs.txt"),
+                contents: scale_script::scale_script(file_name, &self.scaled_dungeons, &self.scaled),
+            });
+        }
+        scripts
+    }
+}
+
+/// The manifest of the mod `title` (file name `file_name`), listing `files`
+/// and `copied_files` and itself.
+pub(crate) fn manifest_file(
+    title: &str,
+    file_name: &str,
+    details: &ModDetails,
+    files: &[ExportedFile],
+    copied_files: &[CopiedFile],
+) -> ExportedFile {
     let asset_folder = format!("{MOD_ASSET_ROOT}/{file_name}");
     let mut asset_paths: Vec<String> = files
         .iter()
@@ -999,7 +1137,7 @@ pub fn build_mod(
         .collect();
     asset_paths.push(format!("{asset_folder}/{file_name}{MANIFEST_EXTENSION}"));
     let manifest = json::Manifest {
-        mod_title: title.clone(),
+        mod_title: title.to_string(),
         mod_version: if details.version.trim().is_empty() {
             "1.0".to_string()
         } else {
@@ -1009,16 +1147,11 @@ pub fn build_mod(
         contact_info: details.contact.trim().to_string(),
         dfunity_version: DAGGERFALL_UNITY_VERSION.to_string(),
         mod_description: details.description.trim().to_string(),
-        guid: if details.guid.is_empty() { new_guid(&title) } else { details.guid.clone() },
+        guid: if details.guid.is_empty() { new_guid(title) } else { details.guid.clone() },
         files: asset_paths,
         dependencies: Vec::new(),
     };
-    files.push(ExportedFile {
-        path: format!("{file_name}{MANIFEST_EXTENSION}"),
-        contents: to_json(&manifest),
-    });
-
-    Ok(ModFiles { title, file_name, files, copied_files, dungeons: exported, cells })
+    ExportedFile { path: format!("{file_name}{MANIFEST_EXTENSION}"), contents: to_json(&manifest) }
 }
 
 /// Writes `mod_files` into a folder named after the mod inside `folder`,
@@ -1145,7 +1278,7 @@ fn block_position(room_id: ItemId) -> i64 {
 /// A location id for a new location at `pixel`, with the id after it free
 /// for its dungeon; both are marked used. Made from the pixel, so it stays
 /// the same from one export to the next.
-fn new_location_id(pixel: MapPixel, used: &mut HashSet<u16>) -> Option<u16> {
+pub(crate) fn new_location_id(pixel: MapPixel, used: &mut HashSet<u16>) -> Option<u16> {
     let slots = (NEW_LOCATION_IDS.end - NEW_LOCATION_IDS.start) / 2;
     let pixel_id = (pixel.y * 1000 + pixel.x).unsigned_abs();
     for step in 0..slots {
@@ -1198,7 +1331,7 @@ pub fn new_guid(seed: &str) -> String {
 }
 
 /// `value` as indented JSON.
-fn to_json(value: &impl serde::Serialize) -> String {
+pub(crate) fn to_json(value: &impl serde::Serialize) -> String {
     serde_json::to_string_pretty(value).expect("export data always serialises")
 }
 

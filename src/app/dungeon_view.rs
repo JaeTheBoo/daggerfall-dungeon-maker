@@ -72,6 +72,23 @@ pub struct DungeonDetails<'details> {
     /// The song the game plays in the dungeon when none is chosen, if known:
     /// a Daggerfall dungeon's own, or that of the dungeon a project dungeon replaces.
     pub game_song: Option<DungeonSong>,
+    /// What the game knows the dungeon's location by, if it is placed.
+    pub ids: Option<DungeonIds>,
+}
+
+/// What the game knows a dungeon's location by: a Daggerfall dungeon's own,
+/// the replaced dungeon's for a replacement, the ones an export gives a new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DungeonIds {
+    /// The location's map id (`MapTableData.MapId`).
+    pub map_id: i32,
+    /// The id of the location's record.
+    pub location_id: u16,
+    /// The id of the dungeon's own record.
+    pub dungeon_location_id: u16,
+    /// Its place in its region's list; `None` for a new location, which
+    /// Daggerfall Unity puts at the next free place when it loads it.
+    pub index_in_region: Option<usize>,
 }
 
 /// Colour of warnings in the properties panel.
@@ -786,6 +803,17 @@ impl DungeonView {
                     self.show_type_field(ui, details.read_only, &mut action);
                     ui.end_row();
 
+                    if let Some(table) = self.dungeon_type.and_then(crate::loot::loot_table) {
+                        ui.label("Treasure").on_hover_text(
+                            "What the loot piles at treasure markers and fixed treasure hold, from the loot \
+                             table of the dungeon's type (LootTables.GenerateLoot). Each kind of item is added \
+                             on a roll of its chance in 100, then rolled again at half the chance until a roll \
+                             fails.",
+                        );
+                        ui.add(egui::Label::new(table.describe()).wrap());
+                        ui.end_row();
+                    }
+
                     ui.label("Source").on_hover_text("Where the dungeon comes from: Daggerfall's own data (read-only), or a copy in your project.");
                     match (details.read_only, details.based_on) {
                         (true, _) => ui.label("Daggerfall (read-only)"),
@@ -1054,6 +1082,33 @@ impl DungeonView {
             );
             ui.label(&self.region_name);
             ui.end_row();
+
+            if let Some(ids) = details.ids {
+                ui.label("Map id").on_hover_text(
+                    "The location's map id (MapTableData.MapId), which quests and Daggerfall Unity's location \
+                     files refer to it by",
+                );
+                ui.label(ids.map_id.to_string());
+                ui.end_row();
+                ui.label("Location id").on_hover_text(
+                    "The ids of the location's record and of its dungeon's record (which picks the dungeon's \
+                     textures in Daggerfall Unity)",
+                );
+                ui.label(format!("{} (dungeon {})", ids.location_id, ids.dungeon_location_id));
+                ui.end_row();
+                ui.label("Index").on_hover_text(
+                    "Its place in its region's list of locations (LocationIndex): with the region, how Daggerfall \
+                     Unity's location files name it; it also seeds the names of the people in it",
+                );
+                match ids.index_in_region {
+                    Some(index) => ui.label(index.to_string()),
+                    None => ui.add(
+                        egui::Label::new("The next free place in the region's list, when Daggerfall Unity loads it")
+                            .wrap(),
+                    ),
+                };
+                ui.end_row();
+            }
 
             ui.label("Location type").on_hover_text("Decides the dungeon's icon on the travel map.");
             if details.read_only {
@@ -1356,6 +1411,11 @@ impl DungeonView {
             dungeon_textures: self.textures,
             climate_textures: None,
             warned_objects: &self.switched_off_doors,
+            entrance_boxes: &[],
+            lighting: match self.view_settings.game_lighting {
+                true => crate::lighting::GameLighting::Dungeon,
+                false => crate::lighting::GameLighting::Off,
+            },
         };
         paint_scene(ui, rect, resources, &mut self.target, &request);
         if let Some(start) = self.selection_box_start {

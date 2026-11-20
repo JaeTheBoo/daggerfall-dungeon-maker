@@ -102,6 +102,9 @@ pub struct RdbFlat {
     pub faction_or_mobile_id: u16,
     /// Action byte; 99 makes a fixed enemy passive.
     pub action: u8,
+    /// Where its resource record is in the block's data, which seeds the
+    /// name the game makes up for a person.
+    pub resource_offset: u32,
     /// Offset of the object this flat's action triggers next, or negative for none.
     pub next_offset: i32,
 }
@@ -124,6 +127,9 @@ struct ObjectHeader {
 }
 
 /// Parses the RDB block called `name` from its raw bytes.
+///
+/// The eight cells Daggerfall Unity corrects when it reads them (see
+/// [`unity_fix_description`]) come back corrected, as the game shows them.
 pub fn parse_rdb_block(name: &str, data: &[u8]) -> Arena2Result<RdbBlock> {
     let mut header = ByteReader::new(data);
     let _unknown = header.read_u32()?;
@@ -134,16 +140,159 @@ pub fn parse_rdb_block(name: &str, data: &[u8]) -> Arena2Result<RdbBlock> {
     let model_ids = read_model_reference_table(data)?;
 
     let mut root_reader = ByteReader::at(data, object_root_offset);
-    let mut objects = Vec::new();
+    let mut lists = Vec::with_capacity(width * height);
     for group_index in 0..width * height {
         let root_offset = root_reader.read_i32()?;
-        let Ok(root_offset) = usize::try_from(root_offset) else {
-            continue; // A negative root marks an empty group.
+        let list = match usize::try_from(root_offset) {
+            Ok(root_offset) => read_object_list(data, root_offset, group_index, &model_ids)?,
+            Err(_) => Vec::new(), // A negative root marks an empty group.
         };
-        read_object_list(data, root_offset, group_index, &model_ids, &mut objects)?;
+        lists.push(list);
     }
 
+    let mut lists = ObjectLists { lists, model_ids, next_added_offset: data.len() as i32 };
+    lists.fix_like_daggerfall_unity(name);
+    let objects = lists.lists.into_iter().flatten().flatten().collect();
     Ok(RdbBlock { name: name.to_string(), objects })
+}
+
+/// What Daggerfall Unity corrects in the cell called `name` when it reads
+/// it, or `None` if it reads the cell as it is. The editor shows these cells
+/// corrected too, and a copy of one keeps the corrections (Daggerfall Unity
+/// does not correct a cell a mod replaces).
+pub fn unity_fix_description(name: &str) -> Option<&'static str> {
+    UNITY_FIXES.iter().find(|(cell, _)| cell.eq_ignore_ascii_case(name)).map(|(_, description)| *description)
+}
+
+/// The cells Daggerfall Unity corrects (`BlocksFile.FixRdbData`), and what it corrects in them.
+const UNITY_FIXES: [(&str, &str); 8] = [
+    ("N0000022.RDB", "removes a door that stands in the wrong place"),
+    ("N0000023.RDB", "removes a door that stands in the wrong place"),
+    ("N0000035.RDB", "puts a door at the right height"),
+    ("N0000052.RDB", "moves a lever to its proper place"),
+    ("N0000071.RDB", "joins the western dead end to the rest of the cell with a long corridor"),
+    (
+        "W0000009.RDB",
+        "moves the exit to another corner, with a wall to close it when the cell is not the start",
+    ),
+    ("W0000018.RDB", "joins the upper rooms together and swaps a wrong door model"),
+    ("W0000020.RDB", "replaces the lower western dead end with a corridor and stairs that join the rest"),
+];
+
+/// The red brick wall door Daggerfall Unity adds to `W0000009.RDB`.
+const BRICK_WALL_DOOR_MODEL_ID: u32 = 72100;
+
+/// A block's object lists while it is read. Each list keeps an entry for
+/// every object in the file, in file order, with `None` for objects that are
+/// skipped, so objects can be found by their place in the list as Daggerfall
+/// Unity counts them.
+struct ObjectLists {
+    lists: Vec<Vec<Option<RdbObject>>>,
+    model_ids: Vec<Option<u32>>,
+    /// Offset for the next object added by a correction: past the end of the
+    /// block, so it is never another object's.
+    next_added_offset: i32,
+}
+
+impl ObjectLists {
+    /// Makes the corrections Daggerfall Unity makes to the cell `name`.
+    fn fix_like_daggerfall_unity(&mut self, name: &str) {
+        match name.to_ascii_uppercase().as_str() {
+            "N0000071.RDB" => {
+                self.set_model(4, 18, 10, None);
+                self.move_to(4, 18, Some(640), None, None);
+                self.set_model(5, 8, 11, None);
+            }
+            "N0000022.RDB" | "N0000023.RDB" => {
+                if let Some(list) = self.lists.get_mut(2) {
+                    list.clear();
+                }
+            }
+            "N0000035.RDB" => self.move_to(0, 36, None, Some(-300), None),
+            "N0000052.RDB" => self.move_to(0, 24, Some(543), None, None),
+            "W0000009.RDB" => {
+                // The wall takes the first empty slot of the model table.
+                let wall_slot = self.model_ids.iter().position(Option::is_none);
+                if let Some(slot) = wall_slot {
+                    self.model_ids[slot] = Some(BRICK_WALL_DOOR_MODEL_ID);
+                }
+                let Some(corner) = self.object(5, 39).map(|object| object.position) else { return };
+                let (x, y, z) = (corner.x + 64, corner.y, corner.z - 64);
+                self.move_to(5, 39, Some(x), None, Some(z));
+                self.set_model(5, 39, 35, Some(-512));
+                self.move_to(8, 0, Some(x), None, Some(z + 126)); // The exit.
+                self.move_to(4, 5, Some(x), None, Some(z)); // The start marker.
+                if let Some(slot) = wall_slot {
+                    self.add_model(8, IVec3::new(x, y, z + 128), slot, -512);
+                }
+            }
+            "W0000018.RDB" => {
+                self.set_model(4, 38, 10, Some(-512));
+                self.set_model(5, 40, 10, Some(-2560));
+                self.add_model(6, IVec3::new(1152, -1792, 1920), 11, -512);
+                self.set_model(2, 0, 23, None);
+            }
+            "W0000020.RDB" => {
+                self.set_model(4, 15, 5, None);
+                self.set_model(5, 34, 7, Some(-512));
+                self.add_model(5, IVec3::new(1152, -384, 1408), 4, 512);
+            }
+            _ => {}
+        }
+    }
+
+    /// The object at place `index` of list `list`, if it is there and was read.
+    fn object(&mut self, list: usize, index: usize) -> Option<&mut RdbObject> {
+        let object = self.lists.get_mut(list)?.get_mut(index)?.as_mut();
+        if object.is_none() {
+            log::warn!("cannot correct object {index} of list {list}: it is not in the cell");
+        }
+        object
+    }
+
+    /// Moves an object along the axes given (native units).
+    fn move_to(&mut self, list: usize, index: usize, x: Option<i32>, y: Option<i32>, z: Option<i32>) {
+        if let Some(object) = self.object(list, index) {
+            let position = &mut object.position;
+            position.x = x.unwrap_or(position.x);
+            position.y = y.unwrap_or(position.y);
+            position.z = z.unwrap_or(position.z);
+        }
+    }
+
+    /// Makes a model object show the model in slot `slot` of the model
+    /// table, and turns it to `y_rotation` (native units) if one is given.
+    fn set_model(&mut self, list: usize, index: usize, slot: usize, y_rotation: Option<i32>) {
+        let Some(model_id) = self.model_ids.get(slot).copied().flatten() else {
+            log::warn!("cannot correct object {index} of list {list}: model slot {slot} is empty");
+            return;
+        };
+        if let Some(RdbObject { kind: RdbObjectKind::Model(model), .. }) = self.object(list, index) {
+            model.model_id = model_id;
+            if let Some(y_rotation) = y_rotation {
+                model.rotation.y = y_rotation;
+            }
+        }
+    }
+
+    /// Adds a model with no action to the end of list `list`.
+    fn add_model(&mut self, list: usize, position: IVec3, slot: usize, y_rotation: i32) {
+        let Some(model_id) = self.model_ids.get(slot).copied().flatten() else { return };
+        let Some(objects) = self.lists.get_mut(list) else { return };
+        objects.push(Some(RdbObject {
+            offset: self.next_added_offset,
+            group_index: list,
+            position,
+            kind: RdbObjectKind::Model(RdbModel {
+                model_id,
+                rotation: IVec3::new(0, y_rotation, 0),
+                trigger_and_lock: 0,
+                sound: 0,
+                action: None,
+            }),
+        }));
+        self.next_added_offset += 1;
+    }
 }
 
 /// Reads the model reference table of an RDB block: each `ARCH3D.BSA` model
@@ -178,14 +327,15 @@ fn read_model_reference_table(data: &[u8]) -> Arena2Result<Vec<Option<u32>>> {
         .collect()
 }
 
-/// Walks one linked list of objects, appending every recognised object to `objects`.
+/// Walks one linked list of objects. Returns an entry for every object in
+/// the list, in order: `None` for objects that are skipped.
 fn read_object_list(
     data: &[u8],
     root_offset: usize,
     group_index: usize,
     model_ids: &[Option<u32>],
-    objects: &mut Vec<RdbObject>,
-) -> Arena2Result<()> {
+) -> Arena2Result<Vec<Option<RdbObject>>> {
+    let mut objects = Vec::new();
     let mut visited_offsets = HashSet::new();
     let mut next_offset = Some(root_offset);
 
@@ -203,18 +353,17 @@ fn read_object_list(
             resource_offset: reader.read_u32()? as usize,
         };
 
-        if let Some(kind) = read_object_resource(data, &object_header, model_ids)? {
-            objects.push(RdbObject {
-                offset: offset as i32,
-                group_index,
-                position: object_header.position,
-                kind,
-            });
-        }
+        let kind = read_object_resource(data, &object_header, model_ids)?;
+        objects.push(kind.map(|kind| RdbObject {
+            offset: offset as i32,
+            group_index,
+            position: object_header.position,
+            kind,
+        }));
 
         next_offset = usize::try_from(next).ok();
     }
-    Ok(())
+    Ok(objects)
 }
 
 /// Reads the type specific resource data of an object.
@@ -256,12 +405,20 @@ fn read_object_resource(
             RdbObjectKind::Model(RdbModel { model_id, rotation, trigger_and_lock, sound, action })
         }
         RESOURCE_TYPE_FLAT => {
+            let resource_offset = reader.position() as u32;
             let texture = TextureKey::from_bitfield(reader.read_u16()?);
             let flags = reader.read_u16()?;
             let faction_or_mobile_id = reader.read_u16()?;
             let next_offset = reader.read_i32()?;
             let action = reader.read_u8()?;
-            RdbObjectKind::Flat(RdbFlat { texture, flags, faction_or_mobile_id, action, next_offset })
+            RdbObjectKind::Flat(RdbFlat {
+                texture,
+                flags,
+                faction_or_mobile_id,
+                action,
+                next_offset,
+                resource_offset,
+            })
         }
         RESOURCE_TYPE_LIGHT => {
             let unknown_1 = reader.read_u32()?;

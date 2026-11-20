@@ -275,6 +275,11 @@ impl RoomEditor {
             dungeon_textures,
             climate_textures: None,
             warned_objects: &self.switched_off_doors,
+            entrance_boxes: &[],
+            lighting: match self.view_settings.game_lighting {
+                true => crate::lighting::GameLighting::Dungeon,
+                false => crate::lighting::GameLighting::Off,
+            },
         };
         paint_scene(ui, rect, resources, &mut self.target, &request);
 

@@ -133,6 +133,11 @@ impl BsaArchive {
         Some(self.record_data(&self.entries[index]))
     }
 
+    /// Where the record with numeric identifier `id` is in the directory.
+    pub fn index_of_id(&self, id: u32) -> Option<usize> {
+        self.index_by_id.get(&id).copied()
+    }
+
     /// Returns the bytes belonging to `entry`.
     fn record_data(&self, entry: &BsaEntry) -> &[u8] {
         &self.data[entry.offset..entry.offset + entry.size]

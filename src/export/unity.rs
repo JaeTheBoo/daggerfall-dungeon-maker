@@ -307,7 +307,7 @@ impl BuildJob {
 }
 
 /// Runs the whole build, reporting each step to `step`.
-fn build(request: &BuildRequest, step: &dyn Fn(String)) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn build(request: &BuildRequest, step: &dyn Fn(String)) -> Result<Vec<PathBuf>, String> {
     if request.targets.is_empty() {
         return Err("Choose at least one platform to build for".to_string());
     }

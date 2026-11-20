@@ -38,6 +38,8 @@ const ANIMAL_FLAT_ARCHIVE: u16 = 201;
 const TREASURE_FLAT_ARCHIVE: u16 = 216;
 /// Texture archives holding people (NPC) flats.
 pub const PEOPLE_FLAT_ARCHIVES: [u16; 13] = [175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 334, 346, 357];
+/// Texture archives holding the trees, rocks and plants of each climate.
+const NATURE_FLAT_ARCHIVES: std::ops::RangeInclusive<u16> = 500..=511;
 
 /// Known editor marker records in archive 199 and what the game uses them for.
 const MARKER_NAMES: [(u8, &str); 8] = [
@@ -188,12 +190,32 @@ pub struct FlatAsset {
     pub texture: TextureKey,
     /// Number of different rooms that use the flat.
     pub room_count: usize,
+    /// Name of the texture archive the flat is in, for example "Plants".
+    pub set_name: Option<String>,
 }
 
 impl FlatAsset {
     /// Short human readable description of the flat.
     pub fn description(&self) -> String {
         flat_description(self.texture)
+    }
+
+    /// Whether the flat's description or texture set name contains `lowercase_search`.
+    pub fn matches(&self, lowercase_search: &str) -> bool {
+        self.description().to_lowercase().contains(lowercase_search)
+            || self.set_name.as_ref().is_some_and(|name| name.to_lowercase().contains(lowercase_search))
+    }
+
+    /// The flat's texture and set name, and how many dungeon cells use it, for a tooltip.
+    pub fn usage(&self) -> String {
+        let texture = match &self.set_name {
+            Some(name) => format!("{} · {name}", self.texture),
+            None => self.texture.to_string(),
+        };
+        match self.room_count {
+            0 => format!("{texture}\nNot used in any dungeon cell"),
+            count => format!("{texture}\nUsed in {count} cells"),
+        }
     }
 }
 
@@ -209,6 +231,9 @@ pub struct AssetCatalog {
     pub all_model_ids: Vec<u32>,
     /// Non-marker flats used in at least one dungeon room, most widely used first.
     pub flats: Vec<FlatAsset>,
+    /// Every image of every flat archive (but the markers'), by archive and
+    /// record: also those no dungeon cell uses.
+    pub all_flats: Vec<FlatAsset>,
     /// Every editor marker record.
     pub markers: Vec<FlatAsset>,
     /// Position of each model in [`Self::room_models`], by model id.
@@ -271,29 +296,54 @@ impl AssetCatalog {
         let room_model_positions =
             room_models.iter().enumerate().map(|(position, model)| (model.model_id, position)).collect();
 
+        let (exterior_models, outdoor_flat_archives) = exterior_assets(library);
+        // Every archive Daggerfall's cells use flats from, with the people and
+        // nature archives they leave out; all of their images are listed.
+        let flat_archives: BTreeSet<u16> = flat_usage
+            .keys()
+            .map(|texture| texture.archive)
+            .chain(outdoor_flat_archives)
+            .chain(PEOPLE_FLAT_ARCHIVES)
+            .chain(NATURE_FLAT_ARCHIVES)
+            .filter(|archive| *archive != MARKER_TEXTURE_ARCHIVE && !SOLID_COLOR_ARCHIVES.contains(archive))
+            .collect();
+        let all_flat_textures: Vec<TextureKey> = flat_archives
+            .into_iter()
+            .flat_map(|archive| {
+                let count = library.texture_record_count_in_header(archive).min(128);
+                (0..count as u8).map(move |record| TextureKey::new(archive, record))
+            })
+            .collect();
+
+        let marker_record_count = library.texture_record_count_in_header(MARKER_TEXTURE_ARCHIVE);
+        let mut set_names: HashMap<u16, Option<String>> = HashMap::new();
+        let mut flat_asset = |texture: TextureKey| FlatAsset {
+            texture,
+            room_count: flat_usage.get(&texture).map_or(0, BTreeSet::len),
+            set_name: set_names
+                .entry(texture.archive)
+                .or_insert_with(|| library.texture_archive_name(texture.archive).map(str::to_string))
+                .clone(),
+        };
         let mut flats: Vec<FlatAsset> = flat_usage
-            .iter()
-            .filter(|(texture, _)| texture.archive != MARKER_TEXTURE_ARCHIVE)
-            .map(|(&texture, rooms)| FlatAsset { texture, room_count: rooms.len() })
+            .keys()
+            .filter(|texture| texture.archive != MARKER_TEXTURE_ARCHIVE)
+            .map(|&texture| flat_asset(texture))
             .collect();
         flats.sort_by(|first, second| {
             second.room_count.cmp(&first.room_count).then(first.texture.cmp(&second.texture))
         });
-
-        let marker_record_count = library.texture_record_count(MARKER_TEXTURE_ARCHIVE);
+        let all_flats = all_flat_textures.into_iter().map(&mut flat_asset).collect();
         let markers = (0..marker_record_count.min(128) as u8)
-            .map(|record| {
-                let texture = TextureKey::new(MARKER_TEXTURE_ARCHIVE, record);
-                let room_count = flat_usage.get(&texture).map_or(0, BTreeSet::len);
-                FlatAsset { texture, room_count }
-            })
+            .map(|record| flat_asset(TextureKey::new(MARKER_TEXTURE_ARCHIVE, record)))
             .collect();
 
         let mut catalog = Self {
             room_models,
-            exterior_models: exterior_models(library),
+            exterior_models,
             all_model_ids: library.model_ids(),
             flats,
+            all_flats,
             markers,
             room_model_positions,
             model_descriptions: HashMap::new(),
@@ -342,10 +392,11 @@ fn most_used_first(usage: BTreeMap<u32, ModelUsageCounter>) -> Vec<ModelAsset> {
 }
 
 /// The models Daggerfall uses outdoors: those of every RMB block's
-/// buildings (seen from outside) and its loose models. Blocks that fail to
-/// parse are skipped and logged.
-fn exterior_models(library: &Arena2Library) -> Vec<ModelAsset> {
+/// buildings (seen from outside) and its loose models. Also the texture
+/// archives of the flats outdoors. Blocks that fail to parse are skipped and logged.
+fn exterior_assets(library: &Arena2Library) -> (Vec<ModelAsset>, BTreeSet<u16>) {
     let mut usage: BTreeMap<u32, ModelUsageCounter> = BTreeMap::new();
+    let mut flat_archives = BTreeSet::new();
     for (block_index, name) in library.rmb_block_names().iter().enumerate() {
         let block = match library.rmb_block(name) {
             Ok(block) => block,
@@ -359,8 +410,9 @@ fn exterior_models(library: &Arena2Library) -> Vec<ModelAsset> {
             counter.rooms.insert(block_index);
             counter.placement_count += 1;
         }
+        flat_archives.extend(block.flats.iter().map(|flat| flat.texture.archive));
     }
-    most_used_first(usage)
+    (most_used_first(usage), flat_archives)
 }
 
 /// Short human readable description of a flat texture.

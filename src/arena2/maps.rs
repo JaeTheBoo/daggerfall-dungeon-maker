@@ -181,7 +181,7 @@ pub struct ClassicLocation {
 }
 
 /// The above-ground part of a location: a grid of RMB blocks.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct LocationExterior {
     /// Blocks from west to east.
     pub width: usize,
@@ -193,10 +193,13 @@ pub struct LocationExterior {
     pub block_names: Vec<String>,
     /// The location's buildings (most dungeon entrances have none).
     pub buildings: Vec<LocationBuilding>,
+    /// Whether it is a port town, whose bank sells ships.
+    pub port_town: bool,
 }
 
-/// One building of a location, as its `MAPPITEM` record lists it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// One building of a location, as its `MAPPITEM` record lists it (or an
+/// RMB block's header, for the block's own buildings).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct LocationBuilding {
     /// Seed for the building's name.
     pub name_seed: u16,
@@ -223,6 +226,10 @@ pub struct LocationDefinition {
     pub map_pixel: MapPixel,
     /// Id of the location's record, which a dungeon under it names as its exterior.
     pub location_id: u16,
+    /// Its place in its region's list of locations (Daggerfall Unity's `LocationIndex`).
+    pub index_in_region: usize,
+    /// Its map id as stored (Daggerfall Unity's `MapTableData.MapId`).
+    pub map_id: i32,
     /// What stands above ground.
     pub exterior: LocationExterior,
     /// Whether a dungeon lies under the location.
@@ -335,6 +342,8 @@ fn read_region_locations(
                 location_type: entry.location_type,
                 map_pixel: entry.pixel,
                 location_id,
+                index_in_region: location_index,
+                map_id: entry.map_id,
                 exterior: read_exterior(items, location_start)?,
                 has_dungeon: with_dungeon.contains(&location_id),
                 discovered: entry.discovered,
@@ -413,7 +422,7 @@ pub fn building_type_name(value: u8) -> String {
         "House for sale",
         "Armorer",
         "Bank",
-        "Town building (4)",
+        "Town building 4",
         "Bookseller",
         "Clothing store",
         "Furniture store",
@@ -426,13 +435,13 @@ pub fn building_type_name(value: u8) -> String {
         "Temple",
         "Tavern",
         "Palace",
-        "House",
-        "House",
-        "House",
-        "House",
-        "House",
-        "House",
-        "Town building (23)",
+        "House 1",
+        "House 2",
+        "House 3",
+        "House 4",
+        "House 5",
+        "House 6",
+        "City wall",
         "Ship",
     ];
     match value {
@@ -620,7 +629,10 @@ fn read_exterior(record: &[u8], position: usize) -> Arena2Result<LocationExterio
     let mut reader = ByteReader::at(record, exterior + EXTERIOR_WIDTH_OFFSET);
     let width = usize::from(reader.read_u8()?);
     let height = usize::from(reader.read_u8()?);
-    let first_letter = char::from(ByteReader::at(record, exterior + EXTERIOR_LETTER_OFFSET).read_u8()?);
+    let mut letter_and_port = ByteReader::at(record, exterior + EXTERIOR_LETTER_OFFSET);
+    let first_letter = char::from(letter_and_port.read_u8()?);
+    // Daggerfall Unity treats any value but 0 as a port town.
+    let port_town = letter_and_port.read_u8()? != 0;
     let mut tables = ByteReader::at(record, exterior + EXTERIOR_BLOCK_INDEX_OFFSET);
     let indices = tables.read_bytes(EXTERIOR_BLOCK_TABLE_LENGTH)?;
     let numbers = tables.read_bytes(EXTERIOR_BLOCK_TABLE_LENGTH)?;
@@ -631,7 +643,7 @@ fn read_exterior(record: &[u8], position: usize) -> Arena2Result<LocationExterio
     let block_names = (0..width * height)
         .map(|block| rmb_block_name(indices[block], numbers[block], characters[block], first_letter))
         .collect::<Arena2Result<_>>()?;
-    Ok(LocationExterior { width, height, block_names, buildings })
+    Ok(LocationExterior { width, height, block_names, buildings, port_town })
 }
 
 /// Reads one building entry of a location's building list.
@@ -722,7 +734,8 @@ mod tests {
         assert_eq!(rmb_block_kind("kowlaa01.rmb"), "Knightly order (Owl)");
         assert_eq!(rmb_block_kind("XYZ.RMB"), "Other");
         assert_eq!(building_type_name(15), "Tavern");
-        assert_eq!(building_type_name(0x13), "House");
+        assert_eq!(building_type_name(0x13), "House 3");
+        assert_eq!(building_type_name(23), "City wall");
         assert_eq!(building_type_name(0xf9), "Special building");
         assert_eq!(building_type_name(99), "Building type 99");
     }

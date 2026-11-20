@@ -169,6 +169,9 @@ pub struct RoomEditor {
     dungeon_context: Option<DungeonContext>,
     /// What the game picks the selected dungeon's textures from, if known.
     dungeon_identity: Option<DungeonIdentity>,
+    /// Where the dungeon the cell is shown in stands, which its people's
+    /// names are made from, or why it is not known.
+    person_place: Result<crate::people::PersonPlace, &'static str>,
     /// The cell's doors (object indexes) the game switches off, refreshed every frame.
     switched_off_doors: Vec<usize>,
     /// What is typed in the open right-click menu.
@@ -196,6 +199,10 @@ pub(super) enum OutlinerSection {
 }
 
 /// The cells around the edited one in a dungeon, shown faded for context.
+/// Why a cell's people have no names when it is shown in no dungeon.
+pub const NO_DUNGEON_FOR_NAMES: &str =
+    "Made up where the person stands: select a dungeon under Used in to see the cell in it";
+
 pub struct DungeonContext {
     /// The dungeon they belong to.
     pub dungeon: OpenedItem,
@@ -538,6 +545,7 @@ impl RoomEditor {
             context_request: None,
             dungeon_context: None,
             dungeon_identity: None,
+            person_place: Err(NO_DUNGEON_FOR_NAMES),
             switched_off_doors: Vec::new(),
             menu_text: ObjectMenuText::default(),
             rename_recorded: false,
@@ -732,6 +740,30 @@ impl RoomEditor {
     /// The dungeon whose cells are shown around this one, if any.
     pub fn context_dungeon(&self) -> Option<&OpenedItem> {
         self.dungeon_context.as_ref().map(|context| &context.dungeon)
+    }
+
+    /// Sets where the dungeon the cell is shown in stands, which its people's
+    /// names are made from, or why it is not known.
+    pub fn set_person_place(&mut self, place: Result<crate::people::PersonPlace, &'static str>) {
+        self.person_place = place;
+    }
+
+    /// Where the record of flat `object_id` is in the cell as Daggerfall
+    /// stores it: known for Daggerfall's own cells, shown as they are.
+    fn stored_flat_offset(
+        &self,
+        object_id: crate::scene::ObjectId,
+        library: &mut Arena2Library,
+    ) -> Option<u32> {
+        if !self.read_only {
+            return None;
+        }
+        let block = library.rdb_block(&self.scene.block_name).ok()?;
+        // Daggerfall's cells number their objects from 1, in the block's order.
+        match &block.objects.get(usize::try_from(object_id).ok()?.checked_sub(1)?)?.kind {
+            crate::arena2::RdbObjectKind::Flat(flat) => Some(flat.resource_offset),
+            _ => None,
+        }
     }
 
     /// Sets what the game picks the textures of the dungeon around the cell
@@ -1953,6 +1985,9 @@ pub fn view_settings_menu(ui: &mut egui::Ui, settings: &mut ViewSettings) {
     ui.checkbox(&mut settings.show_flats, "Flats");
     ui.checkbox(&mut settings.show_markers, "Editor markers");
     ui.checkbox(&mut settings.show_lights, "Lights");
+    ui.checkbox(&mut settings.game_lighting, "Game lighting").on_hover_text(
+        "Draws with the lights as Daggerfall Unity places them: a dungeon dark but for its lights, a          building's inside lit by its lamps, a settlement at night by its street lamps (its gates shut)",
+    );
     ui.checkbox(&mut settings.show_action_links, "Action links")
         .on_hover_text("Red lines from each object to the object its action triggers");
     ui.checkbox(&mut settings.show_switched_off_doors, "Switched-off doors").on_hover_text(

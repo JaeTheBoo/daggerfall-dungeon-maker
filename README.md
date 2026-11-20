@@ -28,8 +28,22 @@ the program asks for your Daggerfall `ARENA2` folder (for example
 `.../steamapps/common/The Elder Scrolls Daggerfall/DF/DAGGER/ARENA2`) and reads
 `ARCH3D.BSA`, `BLOCKS.BSA`, `MAPS.BSA` (optional, for dungeons and the world
 map), `POLITIC.PAK` (optional, for the regions on the world map), `ART_PAL.COL`
-and the `TEXTURE.###` files from it at run time. File names may be upper or
-lower case. Common Steam and GOG install locations are detected automatically.
+and the `TEXTURE.###` files from it at run time. `DAGGER.SND`, `TEXT.RSC`,
+`SPELLS.STD` and `FACTION.TXT` are optional too: they name (and play) the
+sounds, messages, spells and factions that objects refer to by number, and
+`FLATS.CFG` tells what each image of a person shows and the gender of people
+outdoors. File
+names may be upper or lower case. Common Steam and GOG install locations are
+detected automatically.
+
+The names of the shops, taverns and banks of settlements are made from word
+lists that Daggerfall Unity keeps in its own folder
+(`DaggerfallUnity_Data/StreamingAssets/Text/Master Localization CSV Files`:
+`Internal_Strings.csv` and `NameGen.txt`). They are read from your Daggerfall
+Unity install, which is found where it is usually unzipped (`Daggerfall Unity`
+on any drive, in your home folder, Games, Desktop or Downloads, or above the
+export's Mods folder); **File > Set Daggerfall Unity folder…** chooses it
+otherwise. Without it, those buildings show their type only.
 
 Only the folder path is remembered between runs, in the app's settings
 (`%APPDATA%\Daggerfall Dungeon Maker` on Windows,
@@ -74,11 +88,13 @@ Optional command line arguments:
 
 ```text
 daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB or name.RMB>]
-                         [--dungeon <name>] [--settlement <name>]
+                         [--dungeon <name>] [--settlement <name>] [--interior <name.RMB>:<building>]
 ```
 
 `--cell` opens a dungeon cell (`.RDB`) or an outdoor cell (`.RMB`);
-`--settlement` opens the largest location of that name.
+`--settlement` opens the largest location of that name; `--interior` opens the
+inside of a building of an outdoor cell, counting the cell's buildings from 1
+(for example `TVRNAL01.RMB:2`).
 
 ## Using the viewer
 
@@ -100,6 +116,13 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB or 
 * **File > Open cell…** (Ctrl+O) lists all 187 RDB blocks, filterable by type:
   `N` interior, `W` interior with water, `M` interior variant, `S` special
   (quest) and `B` border caps.
+* Eight of Daggerfall's cells are shown as Daggerfall Unity corrects them when
+  it reads them (`N0000022`, `N0000023`, `N0000035`, `N0000052`, `N0000071`,
+  `W0000009`, `W0000018` and `W0000020`): dead ends joined to the rest, a bad
+  door removed, a door and a lever put in place, an exit moved. The cell's
+  properties say what was corrected (**Corrected**). A copy keeps the
+  corrections, which matters because Daggerfall Unity does not correct a cell
+  that a mod replaces.
 * **File > Open dungeon…** (Ctrl+Shift+O) lists every pre-built dungeon in
   `MAPS.BSA`, searchable and filterable by region. The dungeon is shown with
   all of its cells in place. Hovering a cell highlights the whole cell and its
@@ -161,7 +184,14 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB or 
 * The dungeon view's properties panel (right) shows the dungeon's name, type,
   location (including its region) and cells. Hovering a cell in its list highlights it, and
   double-clicking opens it. The name and type of a project dungeon can be
-  changed there; the type decides which enemies its random enemy markers become.
+  changed there; the type decides which enemies its random enemy markers become,
+  and what its **treasure** holds: Daggerfall Unity fills the loot piles at
+  treasure markers and fixed treasure from one of 21 loot tables, picked by the
+  type (`LootTables.GenerateLoot`). The properties show the table: its gold
+  (times the player's level) and the chance of each kind of item (an item is
+  added on a roll of its chance in 100, then rolled again at half the chance
+  until a roll fails), with the maps, potions and potion recipes of tables J to
+  O. A selected treasure marker or fixed treasure pile in a cell shows the same.
 * Under **Location** is where the dungeon is in the world. For Daggerfall's
   dungeons it shows their map position and location type; **Show map** shows
   them on the world map and **View…** their entrance. A project dungeon is meant to be added to the
@@ -198,6 +228,12 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB or 
     free spot instead.
   * **Region**: the region of its spot, set by the map position (or that of
     the dungeon it replaces).
+  * **Map id**, **location id** (with its dungeon's) and **index** in its
+    region's list: what quests and Daggerfall Unity's location files know the
+    location by. A Daggerfall dungeon shows its own, a replacement those of the
+    dungeon it replaces, a new dungeon the ids its export gives it; Daggerfall
+    Unity puts a new location at the next free place in its region's list when
+    it loads it.
   * **Location type**: its icon on the travel map (large, medium or small
     dungeon, or graveyard).
   * **Discovered**: whether the travel map shows it from the start of the game.
@@ -207,8 +243,8 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB or 
     entrance Daggerfall's dungeons have: their 4,232 dungeons share 136
     entrances, each a grid of RMB blocks. The list can be searched by kind,
     block or dungeon name. The selected entrance is drawn in 3D on a patch of
-    ground, with its dungeon door highlighted (right-drag to turn, scroll to
-    zoom); the dungeons that have it are listed above, and **Use this
+    ground, with the model holding its dungeon door highlighted and a red box
+    round the door (right-drag to turn, scroll to zoom); the dungeons that have it are listed above, and **Use this
     entrance** gives it to the dungeon. An entrance without a dungeon door
     model is flagged, since the player may not be able to go in.
   * **Music**: the song played inside. **Chosen by the game** leaves it to the
@@ -308,9 +344,24 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB or 
   and under **Game settings** lists every setting Daggerfall stores with the
   object, set or not: for models the trigger, starting lock, sound, action
   (type, axis, duration, magnitude) and the object the action triggers next
-  (with **Go to**, which selects and frames it); for flats their flags, action, magnitude, sound and link;
-  for lights two values of unknown meaning. All of them can be changed in
-  project cells. Action links are kept by object id, so they survive edits and
+  (with **Go to**, which selects and frames it); for flats their flags, action,
+  magnitude, sound, faction and link; for lights two values of unknown meaning.
+  All of them can be changed in project cells. The numbers are named from the
+  game data:
+  * **Sound** is a sound of `DAGGER.SND`, by number, named as Daggerfall Unity
+    names it and chosen from a list; **▶** plays it. (On Linux this needs
+    `pw-play`, `paplay` or `aplay`.)
+  * Some actions also read the sound number as something else, as Daggerfall
+    Unity does, shown below the action: **Spell** for "Cast spell" (a spell of
+    `SPELLS.STD`), **Message** for "Show text" (text record 8600 + the number),
+    **Question** for "Show text and ask" (record 5400 + the number, with the
+    answer the game accepts), **Door message** for door text (record 7700 + the
+    number, warning when the door's axis makes opening it trespassing) and
+    **Damage** for "Hurt (random)". Each is chosen from a list of what the game
+    data has, with the text shown.
+  * **Faction**, for flats, is the magnitude and sound read together: a
+    faction of `FACTION.TXT`, chosen from a list. One of the individual kind
+    (Gortwog, Prince Lhotun…) makes the flat that person, whom quests use. Action links are kept by object id, so they survive edits and
   are saved in project files. In the viewport each link is a red line, drawn
   over walls, from the object to the one it triggers, with an arrowhead at the
   target (**View > Action links** turns them off). Links stay within one cell.
@@ -438,6 +489,14 @@ daggerfall-dungeon-maker [project.ddm] [--arena2 <folder>] [--cell <name.RDB or 
   double-clicking it opens that cell instead, with the same dungeon still
   selected and shown around it (in a cell window of the open dungeon, the cell
   opens in a cell window as if double-clicked in the dungeon view).
+* **View > Game lighting** draws with the lights as Daggerfall Unity places
+  them, in place of the editor's even light: a dungeon dark (its ambient light)
+  but for its light objects, each reaching three times its stored radius; a
+  building's inside dim but for its lamps (the flats of archive 210), each with
+  the reach, brightness and colour Daggerfall Unity gives its image; a
+  settlement or outdoor cell at night, lit by its street lamps, with its gates
+  shut. The lights nearest what the camera looks at are used (up to 128), and
+  their fall-off approximates Unity's.
 * **View** toggles back-face hiding (to look into cells from outside), the grid,
   the block outline, the asset palette, models, flats, editor markers, lights,
   action links and the red tint of doors the game switches off, and chooses
@@ -456,6 +515,11 @@ settlements and outdoor cells of your own is not supported yet.
 * **Cells** lists the outdoor cells (RMB blocks) locations are built from, by
   kind (taverns, residences, city walls, guild halls and so on). They can be
   given names of your own, as dungeon cells can. Double-click one to open it.
+* **Interiors** lists the insides of the outdoor cells' buildings (6 832 of
+  them), by building type and then by cell kind: each by its cell and its place
+  there, for example "TVRNAL01.RMB, building 2". The search box finds them by
+  cell, building type or cell kind. Double-click one to open it (see
+  [Buildings and their insides](#buildings-and-their-insides) below).
 
 A settlement is shown with all of its cells on their grid: their buildings,
 scenery, flats and trees, standing on their ground, drawn as Daggerfall Unity
@@ -478,20 +542,159 @@ They are drawn as the climate's plain ground. Hovering a cell highlights it and
 its outline; double-clicking it opens that cell on its own. **View > Frame
 settlement** (Home) shows it all again.
 
-Its properties (right) show its name, region, type, place on the world map,
-whether the travel map shows it from the start, its climate, its size in cells,
-the dungeon under it (click to open the dungeon), its buildings by type, and its
-cells (hover to highlight one, double-click to open it). The **Climate** list
+Its properties (right) show its name, region, the region's **ruler** (the
+title of its province's ruler in `FACTION.TXT`, such as "King of Daggerfall")
+and **court** (the province's named people), type, place on the world map,
+its **map id**, **location id** and **index** in its region's list (what
+Daggerfall Unity's location files and quests know it by), whether the travel
+map shows it from the start, its climate, its size in cells,
+whether it is a **port** (its bank sells ships), its **arrival points** (the
+start markers among its cells' loose flats: fast travel puts the player at the
+one nearest to where they come in), the dungeon under it (click to open the
+dungeon), its **town map** (the map the player sees in town, drawn from its
+cells' own maps in the colours the game gives temples and guild halls, shops,
+taverns and houses; hover it to see what stands where), its buildings by type,
+its **named buildings** by name (click one to select it and point the camera at
+it, double-click to look inside), and its cells (hover to highlight one,
+double-click to open it). The **Climate** list
 draws it in another climate, to see how it would look there, and the **Season**
 list in summer or winter; these change the view only.
 
 An outdoor cell opened on its own shows its kind, its objects and buildings,
-your name for it, and **Used in**: every location built with it (click one to
+its town map, your name for it, and **Used in**: every location built with it (click one to
 open it). It is drawn in the woodlands climate, in summer, unless others are
 chosen.
 
 The entrance window of a dungeon draws each entrance the same way, in the
 climate of the dungeon's spot on the world map.
+
+#### Buildings and their insides
+
+Clicking an object in a settlement or outdoor cell selects it, and the
+properties then tell what it is: a person outdoors shows who they are (see
+[People](#people) below), a start marker that it is an arrival point. A model
+that is part of a building shows the building, as the game sees it in that
+settlement:
+
+* its **name**, as Daggerfall Unity names it: a location's own list gives each
+  shop, tavern, bank, temple, guild hall and palace of its cells (in order, each
+  to the next of its type) a name seed, a faction and a quality, and the name
+  comes from them (`RMBLayout.GetLocationBuildingData` and
+  `FormulaHelper.GenerateBuildingName`): "The Bank of Daggerfall", "Castle
+  Daggerfall", "The Mages Guild", "Daggerfall Mail";
+* its type, its **quality** (1 to 20), its **faction** and the faction's
+  **groups** (see [People](#people));
+* its cell and place there, and its **building key**: how quests and saved
+  games refer to it (`BuildingDirectory.MakeBuildingKey`: its cell's column and
+  row on the settlement's grid, and its place in the cell);
+* when it is **open**, as Daggerfall Unity decides it
+  (`PlayerActivate.BuildingIsUnlocked`): shops, banks, libraries and palaces by
+  the hour (shops never on Sun's Rest), taverns and temples at all hours, guild
+  halls by the hour and at any time to members ranked high enough, Thieves Guild
+  and Dark Brotherhood houses to members only, houses 2 to 4 from 6:00 to 18:00,
+  and never House 1, House 5 or House 6 (the lock must be picked); and whether
+  its **people** are away while it is closed, as they are from closed shops;
+* for a shop, what it **sells**, as Daggerfall Unity stocks its shelves
+  (`DaggerfallLoot.StockShopShelf`): an armorer's armor and weapons, an
+  alchemist's gems and ingredients (and now and then a potion recipe), a general
+  store's weapons, clothing, books and odds and ends (and a horse and a small
+  cart), and so on, each item no rarer than the shop's quality; a furniture
+  store sells nothing, having no stock in Daggerfall Unity;
+* what is inside.
+
+A settlement's gate (model 446) says so when selected: Daggerfall Unity opens it
+from 6:00 to 18:00 and shuts it at night, drawing model 447 instead
+(`DaggerfallCityGate`); with **View > Game lighting** it is drawn shut.
+
+Buildings that can be entered show a green box round each entrance (the faces
+of their models drawn with door textures), brighter for the one under the
+pointer or selected; **View > Building entrances** hides them. Double-clicking
+such a building, or **Look inside** in its properties, opens its inside in a
+window of its own. Opened from the Interiors list, an inside shows in the main
+window instead.
+
+The doors into a dungeon (faces drawn with dungeon door textures, which
+Daggerfall Unity makes the way into the location's dungeon) show a red box,
+brighter for the model or building under the pointer or selected; **View >
+Dungeon entrances** hides them. Only the cells of locations with a dungeon have
+them: castles, ruins, crypts, graveyards and the like. A selected model with
+one says so under **Dungeon entrance**, with the dungeon it leads into: the
+settlement's, or for a cell opened on its own, those of the locations built
+with it (click one to open it). Double-clicking such a model in a settlement
+opens its dungeon.
+
+A few doors drawn as dungeon doors stand exactly where an exit of their own
+building's inside is, so the data means them as doors into the building: the
+tops of Castle Daggerfall's two big towers and the doors of its three small
+ones. They show a green box like other entrances, and a selected tower says
+so under **Doors into its rooms**: Daggerfall Unity goes by the texture alone
+and takes the player into the castle's dungeon through them instead.
+
+An inside is laid out as Daggerfall Unity lays it out (`DaggerfallInterior`):
+its rooms and furniture (props standing on their stored bottom), its doors,
+lights and clutter, its people (shopkeepers, guild members, quest givers) and
+its markers, in the climate of the settlement it stands in (always as in
+summer), leaving out the stair-blocking model 31000 the game leaves out of 60
+buildings in 27 cells. Seven insides (Castle Daggerfall's five towers, and one
+building each of BOOKAS00.RMB and LIBRAM00.RMB) store their rooms and doors by
+their floor rather than their middle: laid out as stored, as Daggerfall Unity
+lays them out, they sit half a storey (1.6 m) too low, under floating
+furniture and under the doors outside. They are told by their exits standing
+half a storey under the doors outside, shown raised to fit, and marked
+**Corrected** in their properties. Clicking an object shows what it is: a person's faction, a marker's
+use. The properties tell the building's name, type, quality and faction in the
+settlement it was opened from (click the settlement or the cell to open it),
+let you see it in another climate, and count what it holds: models, flats,
+people, inside doors (the doors between rooms, which open and close; none of
+them leads out), exits, enter markers (where the player appears on walking in),
+quest markers and quest item markers (where quests put the people and items
+they place there), treasure markers and spawn points. **Furniture** lists what
+the player can use (`DaggerfallInterior.AddFurnitureAction`): a shop's shelves
+hold its wares, a library's, guild hall's or temple's shelves are bookshelves,
+chests, wardrobes and drawers are containers to search in any building, and
+ladders can be climbed; a selected piece says what it is for. **People** and
+**Markers** list them to select. **Used in** lists every settlement built with
+the building's cell, with what the building is called there (click one to open
+it).
+
+#### People
+
+A person (a flat with a faction, inside or outdoors) shows who Daggerfall Unity
+makes of them (`StaticNPC`): their faction; their **gender**, from their flags
+inside (bit 32 makes a woman) and from their image's record in `FLATS.CFG`
+outdoors; what their image shows (`FLATS.CFG`, for example "beautiful maiden");
+whether they are a **child** (a child's image, or the children's faction);
+their **race** (their faction's, or else the region's people's); their
+faction's **social group** (commoners, merchants, scholars, nobility,
+underworld…: how they talk and react to the player) and **guild group** (Mages
+Guild, Fighters Guild, Dark Brotherhood…: which guild's services and quests
+they give); and their **name**. A person of an individual faction is that named person, whom
+quests use, and has the faction's name. Anyone else gets a name made up from
+the name bank of the region (with Daggerfall Unity's word lists), seeded by
+where their record is in the cell, the building's key and the settlement's
+index in its region, so a person has a name only in a settlement, inside a
+building opened from one. Daggerfall Unity's own code calls this seed its best
+guess at the original game's, so the names are Daggerfall Unity's.
+
+People stand in dungeons too: Daggerfall Unity makes a person of every flat of
+the people archives there (the courts of the great castles among them: King
+Gothryd, King Eadwyre, Gortwog…). Selected in a cell, such a flat shows the same
+details under its faction. Its name is made from where its record is in the
+cell and the dungeon's index in its region, so it shows for Daggerfall's own
+cells seen in a Daggerfall dungeon (or one a project dungeon replaces) selected
+under **Used in**.
+
+The **exits**, the ways back outdoors, are not objects of their own: like the
+entrances outside, they are faces of the building's own walls drawn with door
+textures. An orange box shows round each (**View > Exits**, or **Show exit
+boxes** in the properties, hides them), brighter for the one under the pointer
+or selected. Click one, or pick it from the **Exits** list, to select it and
+point the camera at it; a selected wall lists the exits it holds. Using an exit
+takes the player out of the building's door nearest to them. Walking in by a
+door, Daggerfall Unity lands the player in front of the exit nearest to the
+enter (or rest) marker nearest to that door (`PlayerEnterExit.TransitionInterior`):
+that exit is marked **arrival** in the list, and its properties say by which of
+the building's doors.
 
 Dungeons are drawn with the wall and floor textures Daggerfall Unity gives them
 where they are (see **View > Dungeon textures**): picked from the dungeon's ids
@@ -546,11 +749,15 @@ dungeons you choose to the game as new locations. The window has:
   the mod. Only dungeons placed on the world map can be ticked (placed ones start
   ticked). A ticked dungeon also needs an entrance, a dungeon type, one start cell
   with an exit door, a free spot in a region, and a name no other location of its
-  region has. Anything missing is listed under it, and the export waits until it
+  region has. The start cell also needs a start marker or an enter marker, or
+  Daggerfall Unity has nowhere to put the player and does not load the dungeon.
+  Anything missing is listed under it, and the export waits until it
   is fixed or the dungeon is unticked. **Check again** re-checks after changes.
   Notes in yellow under a dungeon say what the game does differently from the
-  editor without stopping the export: the doors it switches off, and (for a
-  dungeon replacing Castle Daggerfall) whether its foyer doors fix still works.
+  editor without stopping the export: the doors it switches off, (for a
+  dungeon replacing Castle Daggerfall) whether its foyer doors fix still works,
+  and a dungeon with no quest marker or quest item marker, which quests never
+  choose.
 * **Output**: the folder to export into. A folder named after the mod is made
   there, holding:
   * `WorldData/location-<region>-<index>.json` for each dungeon that replaces
@@ -613,6 +820,52 @@ original offsets, so the fix still works. If the doors were moved or removed,
 or the copy has more objects than fit under the original cell's ids, the
 export window says the fix will not work.
 
+### Testing in Daggerfall Unity
+
+**▶ Test**, at the right of the bar along the bottom of the window, plays
+the cell, dungeon or settlement that is open in Daggerfall Unity, starting at
+its entrance with no-clip on (the console's `tcl` turns it off). It needs
+Daggerfall Unity's folder (**File > Set Daggerfall Unity folder…**).
+
+With no-clip you fly where you look with the mouse, three times as fast as
+the game's own levitating. The mouse wheel makes flying faster or slower, and
+holding Run (Shift) flies three times as fast again. Jump and Crouch (or Page
+Up and Page Down) go straight up and down.
+
+* A **dungeon cell** becomes a dungeon of that one cell, of the kind of the
+  first of Daggerfall's dungeons that uses it, and you start inside it. A cell
+  with no start or enter marker gets a start marker for the test.
+* An **outdoor cell** stands on its own on flat, bare land, and you start at
+  the clear spot nearest its middle.
+* A **dungeon** asks first. *On its own* puts it on an empty spot of the map
+  with flat, bare land around, and you start inside at its entrance. *Where
+  it is* starts outside at its entrance where it is on the world map, to walk
+  in; a project dungeon is exported for this as an export of loose files
+  would be, so it must be placed and ready to export.
+* A **settlement** asks too. *On its own* sets it down on flat, bare land and
+  starts you at the clear spot nearest its middle; *where it is* starts you
+  where travelling there arrives.
+
+Outdoor tests start in the season the view is drawn in, with clear weather.
+
+Your own Daggerfall Unity is not changed. Tests run in a copy of it kept in
+your local application data (`DaggerfallDungeonMaker/TestGame`), made the
+first time and again when Daggerfall Unity is updated. The copy runs in
+Daggerfall Unity's portable mode, so its settings, saved games and log stay
+in its own folder; it starts from your settings and key bindings, without
+your mods. A small mod of the program's own starts the test; it is built
+with Unity 2019.4 the first time, as for exporting a `.dfmod`.
+
+A test shows everything a `.dfmod` export would: imported models, a
+dungeon's own music and sky, its chosen song, and scaled objects at their
+size. When cells or a dungeon have any of those, the test also builds a small
+mod of them with Unity, as an export does (a minute or two). The last few of
+these builds are kept (in `DaggerfallDungeonMaker/TestContent`), so testing
+again without changing them starts straight away. Moving objects needs no new
+build, but changing scaled objects, imported models, music or the sky does.
+A dungeon tested on its own stands somewhere else on the map, so the game may
+give it other wall and floor textures than where it is placed.
+
 ### Enemy markers
 
 Random enemy markers (`TEXTURE.199` record 15) do not name an enemy: the game
@@ -650,6 +903,7 @@ The **asset palette** along the bottom lists everything that can be placed:
 | Exterior Models | Every model Daggerfall uses outdoors (buildings seen from outside, walls, scenery, dungeon entrances), from its RMB blocks, most widely used first |
 | All Models | Every model in `ARCH3D.BSA` |
 | Flats | Sprites used in cells: torches, furniture, people, treasure |
+| All Flats | Every image of Daggerfall's flat archives, including the ones no cell uses (more people, furniture, plants, statues, crops, trees); search by archive name, such as "Plants" |
 | Markers | Editor markers: start/enter points, enemy spawns, quest and treasure markers |
 | Lights | A point light |
 | Custom Models | The models you imported with **Import > Import Model…** (see below) |
@@ -791,12 +1045,21 @@ implemented yet.
 
 | Path | Purpose |
 | --- | --- |
-| `src/arena2/` | Readers for BSA archives, ARCH3D models, RDB and RMB blocks, textures, palettes and the world map |
+| `src/arena2/` | Readers for BSA archives, ARCH3D models, RDB and RMB blocks, textures, palettes, the world map, and the sounds, text records, spells and factions objects refer to |
+| `src/sound_player.rs` | Playing Daggerfall's sound effects with the system's own player |
+| `src/buildings.rs` | Settlements' buildings: which of a location's own each is, their names, entrances and insides |
+| `src/unity_install.rs` | Finding Daggerfall Unity's install and reading the word lists building and people's names are made from |
+| `src/people.rs` | Who the people are: gender, children, names and the keys of the buildings they are in |
+| `src/arena2/flats_cfg.rs` | Reading `FLATS.CFG`: what each image of a person shows, and their gender outdoors |
+| `src/app/interior_view.rs` | The read-only view of a building's inside, and its properties |
 | `src/scene.rs` | Editable object list built from an RDB block |
 | `src/project.rs` | Project files (`.ddm`): the user's cells, dungeons and folders |
 | `src/encounters.rs` | Dungeon types and the enemies random enemy markers can become |
+| `src/loot.rs` | What a dungeon's treasure holds: the loot table of its type |
+| `src/lighting.rs` | The game's lights: dungeons' lights, insides' lamps and street lamps at night |
 | `src/music.rs`, `src/arena2/hmi.rs` | Dungeon music: how the game picks a song, reading Daggerfall's HMI songs, and playing them |
 | `src/export/` | Exporting the project as a Daggerfall Unity mod: world data JSON, manifest, music, skybox and scaled-object scripts, and the .dfmod built with Unity |
+| `src/playtest/` | Testing in Daggerfall Unity: the test's world data and where it starts, empty map spots and clear spots, the copy of Daggerfall Unity tests run in, and the mod that starts them |
 | `src/catalog.rs` | Placeable assets, gathered from the game data at run time |
 | `src/prefabs.rs` | The user's prefabs: saving them, and placing their objects |
 | `src/custom_models.rs` | Importing the user's own OBJ and glTF models, and keeping them |
@@ -815,6 +1078,7 @@ implemented yet.
 | `src/app/world_map.rs` | The world map window for choosing a dungeon's spot |
 | `src/app/entrance_picker.rs` | The entrance window: every dungeon entrance, with a 3D preview |
 | `src/app/export_window.rs` | The Export to Daggerfall Unity window |
+| `src/app/playtest_ui.rs` | The Test button: asking how to test, readying the test in the background |
 | `tests/real_data.rs` | Tests against a real install; set `DAGGERFALL_ARENA2` to run them |
 
 The file formats follow [Daggerfall Unity](https://github.com/Interkarma/daggerfall-unity)

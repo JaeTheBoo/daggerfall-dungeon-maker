@@ -282,20 +282,25 @@ fn climate_base_offset(climate: u8) -> u16 {
 }
 
 /// Daggerfall's random numbers (`DFRandom`).
-struct DaggerfallRandom {
+pub(crate) struct DaggerfallRandom {
     next: u64,
 }
 
 impl DaggerfallRandom {
     /// As `DFRandom.srand(int)`.
-    fn new(seed: i32) -> Self {
+    pub(crate) fn new(seed: i32) -> Self {
         Self { next: u64::from(seed as u32) }
     }
 
     /// As `DFRandom.rand()`: 0 to 32767.
-    fn next(&mut self) -> u32 {
+    pub(crate) fn next(&mut self) -> u32 {
         self.next = self.next.wrapping_mul(1_103_515_245).wrapping_add(12_345);
         ((self.next >> 16) & 0x7FFF) as u32
+    }
+
+    /// As `DFRandom.random_range(min, max)`: from `min` up to, but not including, `max`.
+    pub(crate) fn range(&mut self, min: i32, max: i32) -> i32 {
+        (self.next() as i32) % (max - min).max(1) + min
     }
 }
 

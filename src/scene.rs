@@ -20,6 +20,14 @@ pub const START_MARKER_RECORD: u8 = 10;
 /// Native units of water depth per step of the start marker's water byte.
 const WATER_LEVEL_STEP: i32 = 8;
 
+/// Record of the enter marker, where Daggerfall Unity puts the player who
+/// comes in through the entrance (the start marker when there is none).
+pub const ENTER_MARKER_RECORD: u8 = 8;
+/// Records of the quest marker and the quest item marker, where quests put
+/// the people, enemies and items they place in a dungeon.
+pub const QUEST_MARKER_RECORD: u8 = 11;
+pub const QUEST_ITEM_MARKER_RECORD: u8 = 18;
+
 /// Record of the editor marker that the game replaces with a random enemy.
 pub const RANDOM_ENEMY_MARKER_RECORD: u8 = 15;
 
@@ -500,6 +508,81 @@ pub fn axis_name(axis: u8) -> String {
         .map_or_else(|| format!("Value {axis}"), |(_, name)| (*name).to_string())
 }
 
+/// What an action reads its object's sound number as, besides the sound it
+/// plays (Daggerfall Unity's `DaggerfallAction` takes both from the same byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionNumberUse {
+    /// "Cast spell": the spell of `SPELLS.STD` with this number.
+    Spell,
+    /// "Show text": text record 8600 + the number, shown in a box.
+    Message,
+    /// "Show text and ask": text record 5400 + the number, a question the
+    /// player must answer to set the next object off.
+    Question,
+    /// Door text: text record 7700 + the number, shown the first time the
+    /// door is clicked; 0 for none.
+    DoorMessage,
+    /// "Hurt (random)": the damage is at least the magnitude and less than
+    /// this number, times the player's level.
+    MostDamage,
+}
+
+impl ActionNumberUse {
+    /// What `action_type` reads the sound number as, if anything.
+    pub fn of(action_type: u8) -> Option<Self> {
+        match action_type {
+            0x09 => Some(Self::Spell),
+            0x0B => Some(Self::Message),
+            0x0C => Some(Self::Question),
+            0x63 => Some(Self::DoorMessage),
+            0x15 => Some(Self::MostDamage),
+            _ => None,
+        }
+    }
+
+    /// The first text record of the action's messages, for those that show one.
+    pub fn first_text_record(self) -> Option<u16> {
+        match self {
+            Self::Message => Some(8600),
+            Self::Question => Some(5400),
+            Self::DoorMessage => Some(7700),
+            Self::Spell | Self::MostDamage => None,
+        }
+    }
+
+    /// The text record the action shows for `number`, as Daggerfall Unity
+    /// picks it, or `None` if it shows none. Door texts 1 to 4 all show
+    /// record 7705 (the only one spelt right), and the door texts whose
+    /// records are missing or misplaced show nothing.
+    pub fn text_record(self, number: u8) -> Option<u16> {
+        let record = self.first_text_record()? + u16::from(number);
+        match (self, record) {
+            (Self::DoorMessage, 7700 | 7706 | 7711 | 7712 | 7715 | 7717 | 7719) => None,
+            (Self::DoorMessage, 7701..=7704) => Some(7705),
+            _ => Some(record),
+        }
+    }
+}
+
+/// The answers Daggerfall Unity accepts to the questions of "Show text and
+/// ask" actions, by text record. Questions not listed have no answer.
+pub const QUESTION_ANSWERS: [(u16, &[&str]); 5] = [
+    (5404, &["bow", "bow arrow", "crossbow", "bows", "crossbows"]),
+    (5406, &["one", "1"]),
+    (5423, &["benefactor", "the benefactor"]),
+    (5424, &["shut up", "shutup", "shaddup"]),
+    (5464, &["yes", "ok", "i agree", "y", "agreed", "done", "fine", "okay", "sure", "yep"]),
+];
+
+/// The least and most damage a "Hurt (random)" action does, before it is
+/// multiplied by the player's level: Daggerfall Unity picks a whole number
+/// from the magnitude up to, but not including, the sound number.
+pub fn random_hurt_range(magnitude: u16, number: u8) -> (u16, u16) {
+    let least = magnitude.max(1);
+    let most = u16::from(number).max(1).saturating_sub(1).max(least);
+    (least, most)
+}
+
 /// What kind of thing a [`SceneObject`] represents.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SceneObjectKind {
@@ -707,6 +790,13 @@ impl SceneObject {
     /// Returns `true` for flats that use the editor marker archive.
     pub fn is_marker(&self) -> bool {
         matches!(self.kind, SceneObjectKind::Flat { texture, .. } if texture.archive == MARKER_TEXTURE_ARCHIVE)
+    }
+
+    /// Returns `true` for the editor marker with record `record`, for example
+    /// [`START_MARKER_RECORD`].
+    pub fn is_marker_record(&self, record: u8) -> bool {
+        matches!(self.kind, SceneObjectKind::Flat { texture, .. }
+            if texture.archive == MARKER_TEXTURE_ARCHIVE && texture.record == record)
     }
 
     /// Returns `true` for markers the game replaces with a random enemy chosen by dungeon type.

@@ -96,9 +96,22 @@ pub fn cell_scene(
         };
         // Flats stand on their position; the renderer centres them on it.
         let height = library.billboard_world_size(texture).map_or(0.0, |size| size.y);
+        let name = match (texture.archive, flat.faction_id) {
+            (crate::scene::MARKER_TEXTURE_ARCHIVE, _)
+                if texture.record == crate::scene::START_MARKER_RECORD =>
+            {
+                "Start marker".to_string()
+            }
+            (crate::scene::MARKER_TEXTURE_ARCHIVE, _) => format!("Marker {}", texture.record),
+            // A flat with a faction is a person the game lets the player talk to.
+            (_, 0) => format!("Flat {}.{}", texture.archive, texture.record),
+            _ => format!("Person {}.{}", texture.archive, texture.record),
+        };
+        let data =
+            FlatData { flags: u16::from(flat.flags), faction_or_mobile_id: flat.faction_id, action: 0 };
         add(
-            format!("Flat {}.{}", texture.archive, texture.record),
-            SceneObjectKind::Flat { texture, data: FlatData::default() },
+            name,
+            SceneObjectKind::Flat { texture, data },
             flat.base_position + Vec3::new(0.0, height / 2.0, 0.0),
             0.0,
         );

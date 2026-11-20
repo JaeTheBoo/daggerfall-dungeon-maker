@@ -11,18 +11,21 @@ use super::history::SceneEdit;
 use super::{OutlinerSection, RoomEditor, FOLDER_MARK};
 use crate::app::room_browser::{category_text, show_category_choice, show_room_name_field};
 use crate::app::viewport_tools::EditorResources;
-use crate::arena2::{world_to_native, RDB_BLOCK_SIDE, WORLD_SCALE};
+use crate::arena2::{
+    faction_kind_name, world_to_native, GameReferences, INDIVIDUAL_FACTION_KIND, RDB_BLOCK_SIDE, WORLD_SCALE,
+};
 use crate::catalog::{flat_description, AssetCatalog};
 use crate::custom_names::CustomNames;
 use crate::encounters::{EncounterTable, Enemy};
 use crate::project::CellCategory;
 use crate::scene::{
-    action_type_name, axis_name, group_label, trigger_name, EnemyGender, FixedEnemy, FlatData, ObjectAction,
-    ObjectId, SceneObject, SceneObjectKind, ACTION_TYPES, FIXED_ENEMY_MARKER_RECORD, NO_ENEMY_ID,
-    OUTSIDE_CELL_TOLERANCE, RANDOM_ENEMY_MARKER_RECORD, SCALE_RANGE, STARTING_LOCKS, START_MARKER_RECORD,
-    TRIGGER_TYPES,
+    action_type_name, axis_name, group_label, random_hurt_range, trigger_name, ActionNumberUse, EnemyGender,
+    FixedEnemy, FlatData, ObjectAction, ObjectId, SceneObject, SceneObjectKind, ACTION_TYPES,
+    FIXED_ENEMY_MARKER_RECORD, NO_ENEMY_ID, OUTSIDE_CELL_TOLERANCE, QUESTION_ANSWERS,
+    RANDOM_ENEMY_MARKER_RECORD, SCALE_RANGE, STARTING_LOCKS, START_MARKER_RECORD, TRIGGER_TYPES,
 };
 use crate::scene::{PrefabMember, Scene};
+use crate::sound_player::play_wav;
 
 /// What the quarters of a cell are, for the outliner and the properties panel.
 const QUARTER_HINT: &str = "Daggerfall lists a cell's objects by the quarter of the cell they are in (squares of \
@@ -354,6 +357,8 @@ impl RoomEditor {
                 let mut is_interacting = false;
                 let model_tags = resources.library.model_tags();
                 let scale_blocker = Scene::scale_blocker(&self.scene.objects, index, &model_tags);
+                let references = resources.library.references();
+                let mut sound_message = None;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, true])
                     .max_height(ui.available_height() - 40.0)
@@ -377,6 +382,10 @@ impl RoomEditor {
                             ui.add_space(8.0);
                             is_interacting |= show_marker(ui, self.id, &mut edited);
                         }
+                        if is_treasure(&edited) {
+                            ui.add_space(8.0);
+                            show_treasure(ui, self.dungeon_type);
+                        }
                         if is_random_enemy {
                             ui.add_space(8.0);
                             self.show_possible_enemies(ui, index);
@@ -389,13 +398,47 @@ impl RoomEditor {
                             }
                         }
                         ui.add_space(8.0);
-                        let (responses, link_go_to, preview) =
-                            draw_game_settings(ui, self.id, &mut edited, &targets, can_preview);
-                        preview_clicked = preview;
+                        // Daggerfall Unity makes a person of a flat of the people archives.
+                        let person = match &edited.kind {
+                            SceneObjectKind::Flat { texture, data } if crate::people::is_dungeon_person(*texture) => {
+                                let offset = self.stored_flat_offset(edited.id, resources.library);
+                                let place = match offset {
+                                    Some(_) => self.person_place,
+                                    None => Err(
+                                        "Made up from where the person's record is in the cell as the game \
+                                         stores it, known for Daggerfall's own cells",
+                                    ),
+                                };
+                                Some(crate::people::person_details(
+                                    *texture,
+                                    data.faction_or_mobile_id,
+                                    crate::people::Gender::from_flags(data.flags as u8),
+                                    offset.unwrap_or(0),
+                                    place,
+                                    resources.unity,
+                                    &references,
+                                ))
+                            }
+                            _ => None,
+                        };
+                        let outcome = draw_game_settings(
+                            ui,
+                            self.id,
+                            &mut edited,
+                            &targets,
+                            can_preview,
+                            &references,
+                            person.as_ref(),
+                        );
+                        preview_clicked = outcome.preview;
                         is_interacting |=
-                            responses.iter().any(|response| response.dragged() || response.has_focus());
-                        go_to = link_go_to;
+                            outcome.responses.iter().any(|response| response.dragged() || response.has_focus());
+                        go_to = outcome.go_to;
+                        sound_message = outcome.sound_message;
                     });
+                if let Some(message) = sound_message {
+                    self.status_message = message;
+                }
 
                 if edited != original && self.can_edit() {
                     // One undo step per continuous interaction, not one per frame of dragging.
@@ -552,6 +595,16 @@ impl RoomEditor {
                 (false, false) => ui.label("Daggerfall"),
             };
             ui.end_row();
+
+            if let Some(fix) = crate::arena2::unity_fix_description(&block_name) {
+                ui.label("Corrected").on_hover_text(
+                    "Daggerfall Unity corrects this cell of Daggerfall's when it reads it, and the editor \
+                     shows it corrected. A copy keeps the correction: Daggerfall Unity does not correct \
+                     cells a mod replaces.",
+                );
+                ui.add(egui::Label::new(format!("Daggerfall Unity {fix}")).wrap());
+                ui.end_row();
+            }
 
             ui.label("Size").on_hover_text("Every cell covers a fixed 51.2 × 51.2 m square of the dungeon grid; objects can reach past it.");
             ui.label(format!("{RDB_BLOCK_SIDE} × {RDB_BLOCK_SIDE} m"));
@@ -1146,17 +1199,20 @@ struct LinkTarget {
 /// position and rotation. Settings the object does not use show their empty
 /// value ("None", 0) so the full set is always visible.
 ///
-/// Returns the fields' responses (to tell whether one is being dragged or
-/// typed in) and, if the user asked to go to the linked object, its id.
+/// Sounds, text records, spells and factions come from `references`, to
+/// name what the object's numbers stand for.
 fn draw_game_settings(
     ui: &mut egui::Ui,
     id: egui::Id,
     object: &mut SceneObject,
     targets: &[LinkTarget],
     can_preview: bool,
-) -> (Vec<egui::Response>, Option<ObjectId>, bool) {
+    references: &GameReferences,
+    person: Option<&crate::people::PersonDetails>,
+) -> GameSettingsOutcome {
     let mut responses = Vec::new();
     let mut go_to = None;
+    let mut sound_message = None;
     let object_id = object.id;
     // Markers reuse these bytes for their own data, shown in the Marker section.
     let is_marker = object.is_marker();
@@ -1189,8 +1245,8 @@ fn draw_game_settings(
             data.set_lock_index(lock_index);
             ui.end_row();
 
-            ui.label("Sound").on_hover_text("Sound the action plays; 0 for none");
-            responses.push(ui.add(egui::DragValue::new(&mut data.sound)));
+            ui.label("Sound").on_hover_text(SOUND_HINT);
+            sound_field(ui, id, &mut data.sound, references, &mut sound_message, &mut responses);
             ui.end_row();
 
             ui.label("Action").on_hover_text("What the object does when triggered: move, rotate, open a door, teleport, hurt and so on. None if it has no action.");
@@ -1226,6 +1282,9 @@ fn draw_game_settings(
                     ui.label("Magnitude").on_hover_text("How far it moves or turns, or how strong the effect is");
                     responses.push(ui.add(egui::DragValue::new(&mut action.magnitude)));
                     ui.end_row();
+
+                    let amounts = (action.magnitude, action.axis);
+                    number_use_row(ui, id, &mut data.sound, amounts, action.action_type, references);
                     if remove {
                         data.action = None;
                     }
@@ -1264,14 +1323,33 @@ fn draw_game_settings(
             ui.label("Magnitude").on_hover_text("Strength of the flat's action; the enemy of a fixed enemy marker");
             responses.push(ui.add(egui::DragValue::new(&mut magnitude)));
             ui.end_row();
-            ui.label("Sound").on_hover_text("Sound of the flat's action; the water level on a start marker");
-            responses.push(ui.add(egui::DragValue::new(&mut sound)));
-            ui.end_row();
+            if is_marker {
+                ui.label("Sound").on_hover_text("Sound of the flat's action; the water level on a start marker");
+                responses.push(ui.add(egui::DragValue::new(&mut sound)));
+                ui.end_row();
+            } else {
+                ui.label("Sound").on_hover_text(SOUND_HINT);
+                sound_field(ui, id, &mut sound, references, &mut sound_message, &mut responses);
+                ui.end_row();
+                // A flat's action reads its magnitude as its axis too.
+                number_use_row(ui, id, &mut sound, (u16::from(magnitude), magnitude), data.action, references);
+            }
             data.faction_or_mobile_id = u16::from_le_bytes([magnitude, sound]);
 
-            ui.label("Faction").on_hover_text("Magnitude and sound read together, as a faction id for people flats");
-            ui.label(data.faction_or_mobile_id.to_string());
+            ui.label("Faction").on_hover_text(
+                "The faction a person belongs to: the magnitude and sound read together. A faction of the \
+                 individual kind (a named person of FACTION.TXT) makes this flat that person, whom quests \
+                 can use.",
+            );
+            if is_marker {
+                ui.label(data.faction_or_mobile_id.to_string());
+            } else {
+                faction_field(ui, id, &mut data.faction_or_mobile_id, references);
+            }
             ui.end_row();
+            if let Some(person) = person {
+                crate::app::interior_view::person_rows(ui, person);
+            }
 
             ui.label("Triggers next").on_hover_text("Object this flat's action sets off next");
             go_to = link_choice(ui, id, object_id, &mut object.next, targets);
@@ -1306,7 +1384,282 @@ fn draw_game_settings(
             )
             .clicked();
     }
-    (responses, go_to, preview)
+    GameSettingsOutcome { responses, go_to, preview, sound_message }
+}
+
+/// What [`draw_game_settings`] reports back.
+struct GameSettingsOutcome {
+    /// The fields' responses, to tell whether one is being dragged or typed in.
+    responses: Vec<egui::Response>,
+    /// The linked object, if the user asked to go to it.
+    go_to: Option<ObjectId>,
+    /// Whether the user asked to preview the action.
+    preview: bool,
+    /// What happened when the user played a sound, for the status bar.
+    sound_message: Option<String>,
+}
+
+/// Explains the Sound field of models and flats.
+const SOUND_HINT: &str = "The sound the object plays when its action goes off: a sound of DAGGER.SND, by \
+    number; 0 for none. Some actions also read this number as their message, spell or damage, shown \
+    below the action. ▶ plays the sound.";
+
+/// Longest part of a text record shown in a drop-down.
+const TEXT_EXCERPT_LENGTH: usize = 44;
+
+/// The first line of `text`, cut to [`TEXT_EXCERPT_LENGTH`] characters.
+fn excerpt(text: &str) -> String {
+    let line = text.lines().next().unwrap_or_default();
+    match line.chars().count() > TEXT_EXCERPT_LENGTH {
+        true => format!("{}…", line.chars().take(TEXT_EXCERPT_LENGTH).collect::<String>()),
+        false => line.to_string(),
+    }
+}
+
+/// Draws the sound an action plays: its number, a button to hear it and a
+/// drop-down of the sounds by name. Sets `message` when a sound is played.
+fn sound_field(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    sound: &mut u8,
+    references: &GameReferences,
+    message: &mut Option<String>,
+    responses: &mut Vec<egui::Response>,
+) {
+    let sounds = references.sounds.as_deref();
+    let name = |number: u8| match number {
+        0 => "None".to_string(),
+        number => sounds
+            .and_then(|sounds| sounds.name(u32::from(number)))
+            .unwrap_or_else(|| format!("No sound {number}")),
+    };
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            responses.push(ui.add(egui::DragValue::new(sound)));
+            let has_sound =
+                *sound > 0 && sounds.is_some_and(|sounds| sounds.samples(u32::from(*sound)).is_some());
+            let play = ui
+                .add_enabled(has_sound, egui::Button::new("▶").small())
+                .on_hover_text("Plays the sound")
+                .on_disabled_hover_text(match sounds {
+                    None => "DAGGER.SND was not found in the ARENA2 folder",
+                    Some(_) => "There is no sound with this number",
+                });
+            if play.clicked() {
+                if let Some(wav) = sounds.and_then(|sounds| sounds.wav(u32::from(*sound))) {
+                    *message = Some(match play_wav(&wav, &format!("sound-{sound}")) {
+                        Ok(()) => format!("Playing sound {sound}, {}", name(*sound)),
+                        Err(error) => error,
+                    });
+                }
+            }
+        });
+        if let Some(sounds) = sounds {
+            lazy_choice(ui, id.with("sound_choice"), name(*sound), sound, || {
+                let named = sounds.ids().into_iter().filter_map(|number| u8::try_from(number).ok());
+                std::iter::once(0)
+                    .chain(named)
+                    .map(|number| (number, format!("{number} · {}", name(number))))
+                    .collect()
+            });
+        }
+    });
+}
+
+/// Draws what the action of type `action_type` reads the object's sound
+/// `number` as, if anything: the spell it casts, the message it shows, or the
+/// damage it does (with the action's `magnitude`). A door's `axis` tells
+/// whether opening it is trespassing.
+fn number_use_row(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    number: &mut u8,
+    (magnitude, axis): (u16, u8),
+    action_type: u8,
+    references: &GameReferences,
+) {
+    let Some(number_use) = ActionNumberUse::of(action_type) else { return };
+    match number_use {
+        ActionNumberUse::Spell => {
+            ui.label("Spell").on_hover_text(
+                "The spell the action casts: the sound number above, read as a spell of SPELLS.STD. The \
+                 sound with that number plays too.",
+            );
+            let spells = &references.spells;
+            let name = |number: u8| {
+                spells.get(&number).map_or_else(
+                    || format!("{number} · no such spell"),
+                    |spell| format!("{number} · {spell}"),
+                )
+            };
+            lazy_choice(ui, id.with("spell"), name(*number), number, || {
+                spells.iter().map(|(&number, spell)| (number, format!("{number} · {spell}"))).collect()
+            });
+            ui.end_row();
+        }
+        ActionNumberUse::MostDamage => {
+            ui.label("Damage").on_hover_text(
+                "Hurt (random) does at least the magnitude and less than the sound number above, times \
+                 the player's level",
+            );
+            let (least, most) = random_hurt_range(magnitude, *number);
+            ui.label(format!("{least} to {most} × the player's level"));
+            ui.end_row();
+        }
+        ActionNumberUse::Message | ActionNumberUse::Question | ActionNumberUse::DoorMessage => {
+            let (label, hint) = match number_use {
+                ActionNumberUse::Message => {
+                    ("Message", "The text the action shows: text record 8600 + the sound number above")
+                }
+                ActionNumberUse::Question => (
+                    "Question",
+                    "The question the action asks: text record 5400 + the sound number above. The next \
+                     object goes off only when the player gives the answer.",
+                ),
+                _ => (
+                    "Door message",
+                    "The text shown the first time the door is clicked: text record 7700 + the sound \
+                     number above; 0 for none",
+                ),
+            };
+            ui.label(label).on_hover_text(hint);
+            ui.vertical(|ui| {
+                let Some(texts) = references.texts.as_deref() else {
+                    ui.label(egui::RichText::new("TEXT.RSC was not found in the ARENA2 folder").weak());
+                    return;
+                };
+                let text_of = |number: u8| {
+                    number_use.text_record(number).and_then(|record| Some((record, texts.get(record)?)))
+                };
+                let option = |number: u8| match text_of(number) {
+                    Some((_, text)) => format!("{number} · {}", excerpt(text)),
+                    None => format!("{number} · none"),
+                };
+                lazy_choice(ui, id.with("message"), option(*number), number, || {
+                    (0..=u8::MAX)
+                        .filter(|&number| {
+                            text_of(number).is_some()
+                                || (number == 0 && number_use == ActionNumberUse::DoorMessage)
+                        })
+                        .map(|number| (number, option(number)))
+                        .collect()
+                });
+                match text_of(*number) {
+                    Some((record, text)) => {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(format!("Text {record}: {text}")).weak())
+                                .wrap(),
+                        );
+                    }
+                    None if number_use == ActionNumberUse::DoorMessage => {
+                        ui.label(egui::RichText::new("The door shows no message").weak());
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("No text record has this number").weak());
+                    }
+                }
+                if number_use == ActionNumberUse::Question {
+                    let record = number_use.text_record(*number).unwrap_or_default();
+                    let answers = QUESTION_ANSWERS.iter().find(|(question, _)| *question == record);
+                    let text = match answers {
+                        Some((_, answers)) => format!("Answer: {}", answers.join(" / ")),
+                        None => "Daggerfall Unity knows no answer to this question".to_string(),
+                    };
+                    ui.add(egui::Label::new(egui::RichText::new(text).weak()).wrap());
+                }
+                if number_use == ActionNumberUse::DoorMessage && axis > TRESPASS_AXIS {
+                    let text = format!(
+                        "Axis {axis} is above {TRESPASS_AXIS}: opening the door is trespassing (after \
+                         its message, if it has one), and the people here turn hostile"
+                    );
+                    ui.add(egui::Label::new(egui::RichText::new(text).color(WARNING_COLOR)).wrap());
+                }
+            });
+            ui.end_row();
+        }
+    }
+}
+
+/// Doors with door text and an axis above this are guarded: Daggerfall
+/// Unity makes the people around hostile when the player opens one.
+const TRESPASS_AXIS: u8 = 5;
+
+/// The record of treasure markers among the editor's markers.
+const TREASURE_MARKER_RECORD: u8 = 19;
+
+/// Whether `object` becomes a loot pile in the game: a treasure marker or a fixed treasure pile.
+fn is_treasure(object: &SceneObject) -> bool {
+    matches!(object.kind, SceneObjectKind::Flat { texture, .. }
+        if (texture.archive == crate::scene::MARKER_TEXTURE_ARCHIVE && texture.record == TREASURE_MARKER_RECORD)
+            || texture.archive == crate::scene::FIXED_TREASURE_TEXTURE_ARCHIVE)
+}
+
+/// What a loot pile holds in a dungeon of `dungeon_type`.
+fn show_treasure(ui: &mut egui::Ui, dungeon_type: Option<crate::encounters::DungeonType>) {
+    ui.strong("Treasure").on_hover_text(
+        "Daggerfall Unity makes a loot pile of it, filled from the loot table of the dungeon's type \
+         (LootTables.GenerateLoot). Each kind of item is added on a roll of its chance in 100, then rolled \
+         again at half the chance until a roll fails.",
+    );
+    let text = match dungeon_type.and_then(crate::loot::loot_table) {
+        Some(table) => table.describe(),
+        None => {
+            "Filled from the loot table of the dungeon's type: select a dungeon under Used in".to_string()
+        }
+    };
+    ui.add(egui::Label::new(text).wrap());
+}
+
+/// Draws the faction of a flat as a drop-down of `FACTION.TXT`'s factions.
+fn faction_field(ui: &mut egui::Ui, id: egui::Id, faction_id: &mut u16, references: &GameReferences) {
+    let factions = &references.factions;
+    let name = |faction_id: u16| match (faction_id, factions.get(&faction_id)) {
+        (0, _) => "0 · None".to_string(),
+        (_, Some(faction)) => format!("{faction_id} · {}", faction.name),
+        (_, None) => format!("{faction_id} · no such faction"),
+    };
+    ui.vertical(|ui| {
+        if factions.is_empty() {
+            ui.label(faction_id.to_string());
+            ui.label(egui::RichText::new("FACTION.TXT was not found in the ARENA2 folder").weak());
+            return;
+        }
+        lazy_choice(ui, id.with("faction"), name(*faction_id), faction_id, || {
+            std::iter::once((0, name(0)))
+                .chain(factions.values().map(|faction| {
+                    (
+                        faction.id,
+                        format!("{} · {} ({})", faction.id, faction.name, faction_kind_name(faction.kind)),
+                    )
+                }))
+                .collect()
+        });
+        if let Some(faction) = factions.get(faction_id) {
+            let kind = match faction.kind {
+                INDIVIDUAL_FACTION_KIND => "Individual: this flat is that person".to_string(),
+                kind => faction_kind_name(kind).to_string(),
+            };
+            ui.label(egui::RichText::new(kind).weak());
+        }
+    });
+}
+
+/// Like [`choice`], but the options are only made while the drop-down is open.
+fn lazy_choice<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    selected_text: String,
+    value: &mut T,
+    options: impl FnOnce() -> Vec<(T, String)>,
+) {
+    egui::ComboBox::from_id_salt(id).selected_text(selected_text).width(170.0).height(320.0).show_ui(
+        ui,
+        |ui| {
+            for (option, label) in options() {
+                ui.selectable_value(value, option, label);
+            }
+        },
+    );
 }
 
 /// Draws a drop-down choosing `value` from `options`, showing `selected_text`.

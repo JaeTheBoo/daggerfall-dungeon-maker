@@ -13,25 +13,41 @@
 mod blocks;
 mod bsa;
 mod error;
+mod factions;
+mod flats_cfg;
 mod hmi;
 mod library;
 mod maps;
 mod mesh;
 mod reader;
 mod rmb;
+mod sound_names;
+mod sounds;
+mod spells;
+mod text;
 mod texture;
 mod world;
 
-pub use blocks::{RdbAction, RdbBlock, RdbObject, RdbObjectKind};
+pub use blocks::{unity_fix_description, RdbAction, RdbBlock, RdbObject, RdbObjectKind};
 pub use error::{Arena2Error, Arena2Result};
+pub use factions::{
+    faction_kind_name, faction_race_name, guild_group_name, ruler_title_name, social_group_name, Faction,
+    INDIVIDUAL_FACTION_KIND, PROVINCE_FACTION_KIND,
+};
+pub use flats_cfg::{FlatInfo, FlatsConfig};
 pub use hmi::{parse_hmi, MidiEvent, MidiSong};
-pub use library::Arena2Library;
+pub use library::{Arena2Library, GameReferences};
 pub use maps::{
     building_type_name, rmb_block_kind, ClassicLocation, DungeonBlockPlacement, DungeonDefinition,
     LocationBuilding, LocationDefinition, LocationExterior, REGION_NAMES, RMB_BLOCK_KINDS,
 };
 pub use mesh::{DoorKind, MeshVertex, ModelMesh, SubMesh};
-pub use rmb::{GroundTile, RmbBlock, RmbFlat, RmbModel, PREVIEW_NATURE_ARCHIVE, RMB_BLOCK_SIDE};
+pub use rmb::{
+    GroundTile, InteriorDoor, InteriorFlat, InteriorModel, RmbBlock, RmbBuilding, RmbFlat, RmbInterior,
+    RmbModel, AUTOMAP_SIDE, PREVIEW_NATURE_ARCHIVE, RMB_BLOCK_SIDE,
+};
+pub use sounds::SoundEffects;
+pub use text::TextRecords;
 pub use texture::RgbaImage;
 pub use world::{
     region_name, Climate, LocationType, MapPixel, Season, WorldLocation, WorldMap, MAP_HEIGHT, MAP_WIDTH,

@@ -4,6 +4,8 @@ use bytemuck::{Pod, Zeroable};
 use eframe::egui_wgpu::wgpu;
 use glam::{Mat4, Vec3, Vec4};
 
+use crate::lighting::{PointLight, MAX_LIGHTS};
+
 /// Uniform block bound at group 0, binding 0 (`Camera` in the shader).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -14,16 +16,37 @@ pub struct CameraUniform {
     pub eye_position: [f32; 4],
     /// Horizontal right vector for billboards (w unused).
     pub billboard_right: [f32; 4],
+    /// The game's lighting: ambient colour, and in w 1 when it is used.
+    pub ambient: [f32; 4],
+    /// x: how many lights follow.
+    pub light_count: [f32; 4],
+    /// Two entries per light: position and range, then colour and intensity.
+    pub lights: [[f32; 4]; 2 * MAX_LIGHTS],
 }
 
 impl CameraUniform {
-    /// Builds the uniform from camera matrices and vectors.
+    /// Builds the uniform from camera matrices and vectors, drawn without the game's lighting.
     pub fn new(view_projection: Mat4, eye_position: Vec3, billboard_right: Vec3) -> Self {
         Self {
             view_projection: view_projection.to_cols_array_2d(),
             eye_position: eye_position.extend(1.0).to_array(),
             billboard_right: billboard_right.extend(0.0).to_array(),
+            ambient: [0.0; 4],
+            light_count: [0.0; 4],
+            lights: [[0.0; 4]; 2 * MAX_LIGHTS],
         }
+    }
+
+    /// Draws with the game's lighting: `ambient` everywhere, and `lights` (at most [`MAX_LIGHTS`]).
+    pub fn with_lighting(mut self, ambient: Vec3, lights: &[PointLight]) -> Self {
+        self.ambient = ambient.extend(1.0).to_array();
+        let lights = &lights[..lights.len().min(MAX_LIGHTS)];
+        self.light_count = [lights.len() as f32, 0.0, 0.0, 0.0];
+        for (index, light) in lights.iter().enumerate() {
+            self.lights[2 * index] = light.position.extend(light.range).to_array();
+            self.lights[2 * index + 1] = light.color.extend(light.intensity).to_array();
+        }
+        self
     }
 }
 
